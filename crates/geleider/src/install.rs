@@ -263,6 +263,11 @@ fn json_remove(existing: Option<&str>, table: &[&str], ours: fn(&Value) -> bool)
 // Codex: servers live under `[mcp_servers.<name>]` in config.toml. toml_edit keeps
 // the user's comments and layout.
 
+/// Codex asks before every MCP tool call unless told otherwise, and `codex exec`
+/// cannot ask, so geleider's tools are pre-approved. They can only queue Jobs the
+/// user declared in geleider's own config, and the Session's sandbox is unchanged.
+const CODEX_APPROVAL: &str = "default_tools_approval_mode";
+
 fn codex_add(existing: Option<&str>, exe: &Path) -> Result<Merge> {
     let mut doc: toml_edit::DocumentMut = existing.unwrap_or_default().parse()?;
     let servers = doc
@@ -274,20 +279,33 @@ fn codex_add(existing: Option<&str>, exe: &Path) -> Result<Merge> {
         })
         .as_table_like_mut()
         .context("`mcp_servers` is not a table")?;
-    let mut args = toml_edit::Array::new();
-    args.push("mcp");
-    if let Some(current) = servers.get(SERVER) {
+    if let Some(current) = servers.get_mut(SERVER) {
         if !codex_is_ours(current) {
             return Ok(Merge::Foreign);
         }
-        let same_command = current.get("command").and_then(|c| c.as_str()) == Some(exe_str(exe)?);
-        if same_command {
-            return Ok(Merge::Unchanged);
+        // Update the path in place, keeping anything the user added to the entry,
+        // including their own approval mode.
+        let mut changed = false;
+        if current.get("command").and_then(|c| c.as_str()) != Some(exe_str(exe)?) {
+            current["command"] = toml_edit::value(exe_str(exe)?);
+            changed = true;
         }
+        if current.get(CODEX_APPROVAL).is_none() {
+            current[CODEX_APPROVAL] = toml_edit::value("approve");
+            changed = true;
+        }
+        return Ok(if changed {
+            Merge::Write(doc.to_string())
+        } else {
+            Merge::Unchanged
+        });
     }
+    let mut args = toml_edit::Array::new();
+    args.push("mcp");
     let mut table = toml_edit::Table::new();
     table.insert("command", toml_edit::value(exe_str(exe)?));
     table.insert("args", toml_edit::value(args));
+    table.insert(CODEX_APPROVAL, toml_edit::value("approve"));
     servers.insert(SERVER, toml_edit::Item::Table(table));
     Ok(Merge::Write(doc.to_string()))
 }
@@ -535,7 +553,8 @@ mod tests {
         assert!(text.starts_with("# my settings\nmodel = \"gpt-5\""));
         assert!(text.contains("[mcp_servers.docs]"));
         assert!(text.contains(&format!(
-            "[mcp_servers.geleider]\ncommand = \"{EXE}\"\nargs = [\"mcp\"]"
+            "[mcp_servers.geleider]\ncommand = \"{EXE}\"\nargs = [\"mcp\"]\n\
+             default_tools_approval_mode = \"approve\""
         )));
         assert_eq!(
             codex_add(Some(&text), Path::new(EXE)).unwrap(),
@@ -548,6 +567,26 @@ mod tests {
 
         let fresh = written(codex_add(None, Path::new(EXE)).unwrap());
         assert!(fresh.contains("[mcp_servers.geleider]"));
+
+        // An older entry gains the approval mode; one the user changed keeps theirs.
+        let older = "[mcp_servers.geleider]\ncommand = \"/old/geleider\"\nargs = [\"mcp\"]\n";
+        let updated = written(codex_add(Some(older), Path::new(EXE)).unwrap());
+        assert!(
+            updated.contains(&format!("command = \"{EXE}\"")),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("default_tools_approval_mode = \"approve\""),
+            "{updated}"
+        );
+        let prompting =
+            format!("{older}default_tools_approval_mode = \"prompt\"\nstartup_timeout_sec = 30\n");
+        let kept = written(codex_add(Some(&prompting), Path::new(EXE)).unwrap());
+        assert!(
+            kept.contains("default_tools_approval_mode = \"prompt\""),
+            "{kept}"
+        );
+        assert!(kept.contains("startup_timeout_sec = 30"), "{kept}");
 
         let foreign = "[mcp_servers.geleider]\ncommand = \"python\"\nargs = [\"x.py\"]\n";
         assert_eq!(

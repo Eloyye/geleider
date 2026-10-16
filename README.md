@@ -42,7 +42,7 @@ geleider queue [--all]
 geleider status                       # Resources, their holders, running and queued Runs
 ```
 
-The MCP server (`geleider mcp`) offers the same as the tools `submit_run`, `get_run`, `list_runs` and `status`.
+The MCP server (`geleider mcp`) offers the same as the tools `submit_run`, `get_run`, `list_runs` and `status`. In Codex, `geleider install` pre-approves these tools (`default_tools_approval_mode = "approve"`), since `codex exec` cannot ask. They can only queue Jobs from geleider's own config, and the Session's sandbox is unchanged. Set it to `"prompt"` in `~/.codex/config.toml` to be asked each time; reinstalling keeps your choice.
 
 When a Run finishes, geleider sends a macOS notification and, if the worktree's branch has an open PR, posts the result there through `gh`. Each Job gets one comment per PR, edited in place on later Runs. It also notifies you when a queued Run starts because a slot freed up. Set `notifications = false` or `pr_comments = false` at the top of the config to turn these off.
 
