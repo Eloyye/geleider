@@ -9,3 +9,15 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+shell-words = "1"
+toml = "0.9"
+toml_edit = "0.23"
+
+[dev-dependencies]
+tempfile = "3"
