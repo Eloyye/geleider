@@ -7,6 +7,8 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
+use crate::session::{Session, SessionKey};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
@@ -66,6 +68,7 @@ pub struct Run {
     pub branch: Option<String>,
     pub argv: Vec<String>,
     pub submitter: String,
+    pub session: Option<SessionKey>,
     pub state: RunState,
     /// Unix time in milliseconds.
     pub submitted_at: i64,
@@ -95,6 +98,7 @@ pub struct NewRun {
     pub branch: Option<String>,
     pub argv: Vec<String>,
     pub submitter: String,
+    pub session: Option<SessionKey>,
 }
 
 pub struct Store {
@@ -103,7 +107,7 @@ pub struct Store {
 }
 
 const COLUMNS: &str = "id, project, repo, job, args, resource, worktree, branch, argv, submitter, \
-     state, submitted_at, started_at, ended_at, pid, pid_started, exit_code, error, log_path";
+     state, submitted_at, started_at, ended_at, pid, pid_started, exit_code, error, log_path, session";
 
 impl Store {
     pub fn open(path: &Path, logs: PathBuf) -> Result<Self> {
@@ -130,9 +134,30 @@ impl Store {
                  pid_started  TEXT,
                  exit_code    INTEGER,
                  error        TEXT,
-                 log_path     TEXT NOT NULL DEFAULT ''
+                 log_path     TEXT NOT NULL DEFAULT '',
+                 session      TEXT,
+                 delivered    INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS runs_by_state ON runs (state, id);",
+        )?;
+        // Upgrade databases created before Session tracking without losing Runs.
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(runs)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !columns.iter().any(|c| c == "session") {
+            conn.execute_batch("ALTER TABLE runs ADD COLUMN session TEXT;")?;
+        }
+        if !columns.iter().any(|c| c == "delivered") {
+            conn.execute_batch(
+                "ALTER TABLE runs ADD COLUMN delivered INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions (
+            harness TEXT NOT NULL, id TEXT NOT NULL, updated_at INTEGER NOT NULL,
+            record TEXT NOT NULL, PRIMARY KEY (harness, id)
+        );",
         )?;
         std::fs::create_dir_all(&logs)?;
         Ok(Self { conn, logs })
@@ -141,8 +166,8 @@ impl Store {
     pub fn insert(&self, run: NewRun) -> Result<Run> {
         self.conn.execute(
             "INSERT INTO runs (project, repo, job, args, resource, worktree, branch, argv,
-                               submitter, state, submitted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10)",
+                               submitter, state, submitted_at, session)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'queued', ?10, ?11)",
             params![
                 run.project,
                 run.repo,
@@ -154,6 +179,7 @@ impl Store {
                 serde_json::to_string(&run.argv)?,
                 run.submitter,
                 now_ms(),
+                run.session.map(|s| serde_json::to_string(&s)).transpose()?,
             ],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -225,6 +251,68 @@ impl Store {
         Ok(())
     }
 
+    pub fn update_session(&self, session: &Session) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sessions (harness, id, updated_at, record) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (harness, id) DO UPDATE SET updated_at = excluded.updated_at, record = excluded.record
+             WHERE excluded.updated_at >= sessions.updated_at",
+            params![session.key.harness.as_str(), session.key.id, session.last_activity, serde_json::to_string(session)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn session(&self, key: &SessionKey) -> Result<Option<Session>> {
+        let text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT record FROM sessions WHERE harness = ?1 AND id = ?2",
+                params![key.harness.as_str(), key.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        text.map(|s| serde_json::from_str(&s).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn sessions(&self) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare("SELECT record FROM sessions")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(serde_json::from_str::<Session>(&row?)?);
+        }
+        sessions.sort_by(|a, b| {
+            a.project
+                .cmp(&b.project)
+                .then_with(|| {
+                    (a.state != crate::session::SessionState::Waiting)
+                        .cmp(&(b.state != crate::session::SessionState::Waiting))
+                })
+                .then_with(|| b.last_activity.cmp(&a.last_activity))
+                .then_with(|| a.key.id.cmp(&b.key.id))
+        });
+        Ok(sessions)
+    }
+
+    /// Results remain pending until the receiving Harness acknowledges them.
+    pub fn pending_results(&self) -> Result<Vec<Run>> {
+        self.query(
+            &format!(
+                "SELECT {COLUMNS} FROM runs WHERE json_extract(session, '$.harness') IN ('codex', 'opencode') AND delivered = 0
+            AND state NOT IN ('queued', 'running') ORDER BY id"
+            ),
+            [],
+        )
+    }
+
+    pub fn acknowledge(&self, id: i64, session: &SessionKey) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET delivered = 1 WHERE id = ?1 AND session = ?2",
+            params![id, serde_json::to_string(session)?],
+        )?;
+        Ok(())
+    }
+
     fn query(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Run>> {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params, from_row)?;
@@ -242,6 +330,7 @@ fn from_row(row: &Row<'_>) -> rusqlite::Result<Result<Run>> {
     let state: String = row.get(10)?;
     let worktree: String = row.get(6)?;
     let log_path: String = row.get(18)?;
+    let session: Option<String> = row.get(19)?;
     let id: i64 = row.get(0)?;
     let project = row.get(1)?;
     let repo = row.get(2)?;
@@ -268,6 +357,7 @@ fn from_row(row: &Row<'_>) -> rusqlite::Result<Result<Run>> {
             branch,
             argv: serde_json::from_str(&argv)?,
             submitter,
+            session: session.map(|s| serde_json::from_str(&s)).transpose()?,
             state: RunState::parse(&state)?,
             submitted_at,
             started_at,
@@ -303,7 +393,55 @@ mod tests {
             branch: Some("feat/x".into()),
             argv: vec!["/wt/test.sh".into(), "events".into()],
             submitter: "cli".into(),
+            session: None,
         }
+    }
+
+    #[test]
+    fn upgrades_old_run_history_and_preserves_session_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        let logs = dir.path().join("runs");
+        let store = Store::open(&db, logs.clone()).unwrap();
+        let first = store.insert(new_run("old-job")).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "ALTER TABLE runs DROP COLUMN session; ALTER TABLE runs DROP COLUMN delivered;",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&db, logs.clone()).unwrap();
+        assert_eq!(store.get(first.id).unwrap().unwrap().job, "old-job");
+        assert!(store.get(first.id).unwrap().unwrap().session.is_none());
+        let mut new = new_run("new-job");
+        let key = SessionKey {
+            harness: crate::session::Harness::Opencode,
+            id: "root".into(),
+        };
+        new.session = Some(key.clone());
+        let run = store.insert(new).unwrap();
+        store
+            .mark_ended(run.id, RunState::Succeeded, Some(0), None)
+            .unwrap();
+        drop(store);
+        let store = Store::open(&db, logs).unwrap();
+        assert_eq!(
+            store.pending_results().unwrap()[0].session,
+            Some(key.clone())
+        );
+        store
+            .acknowledge(
+                run.id,
+                &SessionKey {
+                    id: "different-session".into(),
+                    ..key.clone()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.pending_results().unwrap().len(), 1);
+        store.acknowledge(run.id, &key).unwrap();
+        assert!(store.pending_results().unwrap().is_empty());
     }
 
     #[test]

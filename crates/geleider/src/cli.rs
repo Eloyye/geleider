@@ -26,6 +26,7 @@ pub fn submit(
         job,
         args,
         submitter: "cli".into(),
+        session: crate::hook::shell_session(),
     };
     let info = protocol::call(paths, &request)?.into_run()?;
     if !wait {
@@ -102,7 +103,36 @@ pub fn status(paths: &Paths, json: bool) -> Result<i32> {
 }
 
 fn render_status(status: &Status) -> String {
-    let mut out = String::from("Resources\n");
+    let mut out = String::from("Sessions\n");
+    let mut project = None;
+    let live: Vec<_> = status
+        .sessions
+        .iter()
+        .filter(|s| s.state != crate::session::SessionState::Ended)
+        .collect();
+    if live.is_empty() {
+        out.push_str("  (none)\n");
+    }
+    for session in live {
+        let name = session
+            .project
+            .as_deref()
+            .unwrap_or("(unconfigured Project)");
+        if project != Some(name) {
+            out.push_str(&format!("  {name}\n"));
+            project = Some(name);
+        }
+        out.push_str(&format!(
+            "    {:<8} {:<7} {}  {}  {}  active {} ago\n",
+            session.state.as_str(),
+            session.key.harness.as_str(),
+            session.key.id,
+            session.branch.as_deref().unwrap_or("(detached)"),
+            paths::display(&session.worktree),
+            report::duration(now_ms() - session.last_activity)
+        ));
+    }
+    out.push_str("\nResources\n");
     if status.resources.is_empty() {
         out.push_str("  (none configured)\n");
     }

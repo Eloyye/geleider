@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lease::Holder;
 use crate::paths::Paths;
+use crate::session::{Session, SessionKey};
 use crate::store::Run;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -22,6 +23,8 @@ pub enum Request {
         job: String,
         args: Vec<String>,
         submitter: String,
+        #[serde(default)]
+        session: Option<SessionKey>,
     },
     GetRun {
         id: i64,
@@ -31,6 +34,10 @@ pub enum Request {
         finished: usize,
     },
     Status,
+    SessionResults {
+        session: SessionKey,
+        ack: Option<i64>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,6 +60,8 @@ pub struct RunInfo {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default)]
+    pub sessions: Vec<Session>,
     pub resources: Vec<ResourceStatus>,
     /// Running, then queued Runs.
     pub runs: Vec<RunInfo>,

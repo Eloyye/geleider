@@ -1,8 +1,11 @@
 mod cli;
 mod config;
 mod daemon;
+mod delivery;
 mod git;
 mod github;
+mod hook;
+mod hooks_install;
 mod install;
 mod lease;
 mod mcp;
@@ -10,6 +13,7 @@ mod paths;
 mod procs;
 mod protocol;
 mod report;
+mod session;
 mod store;
 
 use anyhow::Result;
@@ -60,16 +64,29 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Resources with their slots and current holders, plus running and queued Runs.
+    /// Sessions by Project, Resources and their holders, plus running and queued Runs.
     Status {
         #[arg(long)]
         json: bool,
+    },
+    /// Report a Harness lifecycle event from JSON on stdin. Always succeeds.
+    Hook {
+        harness: session::Harness,
+        event: String,
+    },
+    /// Internal OpenCode plugin result mailbox.
+    #[command(hide = true)]
+    SessionResults {
+        harness: session::Harness,
+        id: String,
+        #[arg(long)]
+        ack: Option<i64>,
     },
     /// Run the background process in the foreground.
     Daemon,
     /// Serve MCP over stdio for a Harness.
     Mcp,
-    /// Start the background process at login and register the MCP server in
+    /// Start the background process at login and register MCP and Session hooks in
     /// Claude Code, Codex and OpenCode.
     Install,
     /// Undo `install`. Config and Run history are kept.
@@ -88,6 +105,13 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<i32> {
+    // Hook failures, including a missing HOME/state directory, never escape to a Harness.
+    if let Cmd::Hook { harness, ref event } = cli.command {
+        if let Ok(paths) = Paths::from_env() {
+            hook::run(&paths, harness, event);
+        }
+        return Ok(0);
+    }
     let paths = Paths::from_env()?;
     match cli.command {
         Cmd::Run {
@@ -100,6 +124,23 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Wait { id, json } => cli::wait_for(&paths, cli::parse_run_id(&id)?, json),
         Cmd::Queue { all, json } => cli::queue(&paths, all, json),
         Cmd::Status { json } => cli::status(&paths, json),
+        Cmd::Hook { .. } => unreachable!(),
+        Cmd::SessionResults { harness, id, ack } => {
+            let reply = protocol::call(
+                &paths,
+                &protocol::Request::SessionResults {
+                    session: session::SessionKey { harness, id },
+                    ack,
+                },
+            )?
+            .into_runs()?;
+            let messages: Vec<_> = reply
+                .iter()
+                .map(|r| serde_json::json!({"run_id":r.run.id,"message":delivery::message(&r.run)}))
+                .collect();
+            println!("{}", serde_json::to_string(&messages)?);
+            Ok(0)
+        }
         Cmd::Daemon => daemon::run(paths).map(|()| 0),
         Cmd::Mcp => mcp::serve(&paths).map(|()| 0),
         Cmd::Install => install::install(&paths).map(|()| 0),

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
@@ -21,6 +21,7 @@ use crate::paths::{self, Paths};
 use crate::procs::{self, Snapshot};
 use crate::protocol::{self, Reply, Request, ResourceStatus, RunInfo, Status};
 use crate::report::{self, MacNotifier, Notifier, TAIL_LINES};
+use crate::session::{Activity, Harness, Session};
 use crate::store::{NewRun, Run, RunState, Store};
 
 pub fn run(paths: Paths) -> Result<()> {
@@ -38,6 +39,11 @@ pub fn run(paths: Paths) -> Result<()> {
         .with_context(|| format!("listening on {}", socket.display()))?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
 
+    let hook_path = paths.hook_socket();
+    let _ = std::fs::remove_file(&hook_path);
+    let hooks = UnixDatagram::bind(&hook_path)?;
+    std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o600))?;
+
     let daemon = Arc::new(Daemon {
         core: Mutex::new(Core {
             store: Store::open(&paths.database(), paths.run_logs())?,
@@ -49,6 +55,58 @@ pub fn run(paths: Paths) -> Result<()> {
         github: Box::new(Gh),
     });
     eprintln!("geleider: listening on {}", paths::display(&socket));
+
+    let ingress = Arc::clone(&daemon);
+    std::thread::spawn(move || {
+        let mut bytes = [0; 8192];
+        while let Ok(size) = hooks.recv(&mut bytes) {
+            if let Ok(activity) = serde_json::from_slice::<Activity>(&bytes[..size])
+                && let Err(err) = ingress.record_activity(activity)
+            {
+                eprintln!("geleider: recording Session activity: {err:#}");
+            }
+        }
+    });
+    // Independent from the scheduler and PR reporting. Failed deliveries remain
+    // in SQLite for retry, including across daemon restarts.
+    let delivery = Arc::clone(&daemon);
+    std::thread::spawn(move || {
+        let mut warned = HashSet::new();
+        loop {
+            let pending = delivery
+                .core
+                .lock()
+                .unwrap()
+                .store
+                .pending_results()
+                .unwrap_or_default();
+            for run in pending.into_iter().filter(|r| {
+                r.session
+                    .as_ref()
+                    .is_some_and(|s| s.harness == Harness::Codex)
+            }) {
+                match crate::delivery::codex(&run) {
+                    Ok(()) => {
+                        let result = delivery
+                            .core
+                            .lock()
+                            .unwrap()
+                            .store
+                            .acknowledge(run.id, run.session.as_ref().expect("filtered"));
+                        if let Err(err) = result {
+                            eprintln!("geleider: acknowledging result: {err:#}");
+                        }
+                        warned.remove(&run.id);
+                    }
+                    Err(err) if warned.insert(run.id) => {
+                        eprintln!("geleider: delivering Run #{} (will retry): {err:#}", run.id)
+                    }
+                    Err(_) => {}
+                }
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
 
     let scheduler = Arc::clone(&daemon);
     std::thread::spawn(move || scheduler.schedule_loop());
@@ -90,6 +148,61 @@ enum Event {
 }
 
 impl Daemon {
+    fn record_activity(&self, activity: Activity) -> Result<()> {
+        let config = self.core.lock().unwrap().config.get()?.clone();
+        let location = git::locate(&config, &activity.cwd).ok();
+        let mut session = Session {
+            key: activity.key,
+            project: location.as_ref().map(|l| l.project_name.to_string()),
+            worktree: location
+                .as_ref()
+                .map(|l| l.worktree.clone())
+                .unwrap_or_else(|| {
+                    git::worktree(&activity.cwd).unwrap_or_else(|| activity.cwd.clone())
+                }),
+            branch: location
+                .as_ref()
+                .and_then(|l| l.branch.clone())
+                .or_else(|| git::branch(&activity.cwd)),
+            state: activity.state,
+            last_activity: activity.at,
+            pending_prompts: Vec::new(),
+            owner_pid: activity.owner_pid,
+            owner_started: activity.owner_pid.and_then(procs::start_time),
+        };
+        let core = self.core.lock().unwrap();
+        if let Some(previous) = core.store.session(&session.key)? {
+            if previous.last_activity > activity.at {
+                return Ok(());
+            }
+            if session.owner_pid.is_none() {
+                session.owner_pid = previous.owner_pid;
+                session.owner_started = previous.owner_started;
+            }
+            if !activity.reset {
+                session.pending_prompts = previous.pending_prompts;
+            }
+        }
+        if let Some(resolved) = activity.resolved {
+            session
+                .pending_prompts
+                .retain(|p| *p != resolved && p != "user");
+        }
+        if let Some(wait_for) = activity.wait_for
+            && !session.pending_prompts.contains(&wait_for)
+            && (wait_for != "user" || session.pending_prompts.is_empty())
+        {
+            if wait_for != "user" {
+                session.pending_prompts.retain(|p| p != "user");
+            }
+            session.pending_prompts.push(wait_for);
+        }
+        if !session.pending_prompts.is_empty() {
+            session.state = crate::session::SessionState::Waiting;
+        }
+        core.store.update_session(&session)
+    }
+
     fn schedule_loop(self: &Arc<Self>) {
         loop {
             if let Err(err) = self.tick(None) {
@@ -126,6 +239,20 @@ impl Daemon {
         {
             let mut core = self.core.lock().unwrap();
             let core = &mut *core;
+
+            // A Harness can crash without sending SessionEnd. Its process identity
+            // also prevents persisted Sessions being shown as live after a reboot.
+            for mut session in core.store.sessions()? {
+                if session.state != crate::session::SessionState::Ended
+                    && session.owner_pid.is_some_and(|pid| {
+                        !snapshot.is_alive(pid, session.owner_started.as_deref())
+                    })
+                {
+                    session.state = crate::session::SessionState::Ended;
+                    session.pending_prompts.clear();
+                    core.store.update_session(&session)?;
+                }
+            }
 
             // Runs left running by an earlier background process: their Lease ends
             // when their process is gone, but their exit code is unknown.
@@ -319,7 +446,8 @@ impl Daemon {
                 job,
                 args,
                 submitter,
-            } => self.submit(&cwd, &job, args, submitter),
+                session,
+            } => self.submit(&cwd, &job, args, submitter, session),
             Request::GetRun { id } => {
                 let core = self.core.lock().unwrap();
                 let run = core
@@ -335,6 +463,24 @@ impl Daemon {
                 let runs = core.store.list(finished)?;
                 Ok(Reply::Runs {
                     runs: runs.into_iter().map(|r| info(r, &queued, false)).collect(),
+                })
+            }
+            Request::SessionResults { session, ack } => {
+                let core = self.core.lock().unwrap();
+                if let Some(id) = ack {
+                    core.store.acknowledge(id, &session)?;
+                }
+                let queued = queued_runs(&core.store)?;
+                Ok(Reply::Runs {
+                    runs: core
+                        .store
+                        .pending_results()?
+                        .into_iter()
+                        .filter(|r| r.session.as_ref() == Some(&session))
+                        // One bounded log tail per mailbox reply, even after a long outage.
+                        .take(1)
+                        .map(|r| info(r, &queued, false))
+                        .collect(),
                 })
             }
             Request::Status => {
@@ -360,6 +506,7 @@ impl Daemon {
                 let queued = queued_runs(&core.store)?;
                 let runs = core.store.list(0)?;
                 Ok(Reply::Status(Status {
+                    sessions: core.store.sessions()?,
                     resources,
                     runs: runs.into_iter().map(|r| info(r, &queued, false)).collect(),
                 }))
@@ -373,6 +520,7 @@ impl Daemon {
         job: &str,
         args: Vec<String>,
         submitter: String,
+        session: Option<crate::session::SessionKey>,
     ) -> Result<Reply> {
         // Resolving the worktree runs git, so it happens without holding the lock.
         let config = self.core.lock().unwrap().config.get()?.clone();
@@ -388,6 +536,7 @@ impl Daemon {
             branch: location.branch,
             argv: rendered.argv,
             submitter,
+            session,
         })?;
         self.tick(Some(run.id))?;
 

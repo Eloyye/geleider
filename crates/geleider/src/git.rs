@@ -73,6 +73,11 @@ fn repo_dirs(dir: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((canonical(top), canonical(common)))
 }
 
+/// The repository root, including for a Project not declared in config.
+pub fn worktree(cwd: &Path) -> Option<PathBuf> {
+    repo_dirs(cwd).ok().map(|(root, _)| root)
+}
+
 /// The branch checked out in `worktree`, or `None` on a detached HEAD.
 pub fn branch(worktree: &Path) -> Option<String> {
     let output = Command::new("git")
