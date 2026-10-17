@@ -10,6 +10,7 @@ use crate::paths::{self, Paths};
 use crate::protocol::{self, Request, RunInfo, Status};
 use crate::report;
 use crate::store::{RunState, now_ms};
+use crate::usage::{SubscriptionUsage, WindowView};
 
 /// Finished Runs `geleider queue --all` shows.
 const RECENT: usize = 20;
@@ -101,6 +102,16 @@ pub fn status(paths: &Paths, json: bool) -> Result<i32> {
     Ok(0)
 }
 
+pub fn usage(paths: &Paths, json: bool) -> Result<i32> {
+    let subscriptions = protocol::call(paths, &Request::Usage)?.into_usage()?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&subscriptions)?);
+    } else {
+        print!("{}", render_usage(&subscriptions, now_ms()));
+    }
+    Ok(0)
+}
+
 fn render_status(status: &Status) -> String {
     let mut out = String::from("Resources\n");
     if status.resources.is_empty() {
@@ -145,7 +156,49 @@ fn render_status(status: &Status) -> String {
             out.push_str(&format!("  {}\n", one_line(info)));
         }
     }
+    if !status.subscriptions.is_empty() {
+        out.push('\n');
+        out.push_str(&render_usage(&status.subscriptions, now_ms()));
+    }
     out
+}
+
+pub fn render_usage(subscriptions: &[SubscriptionUsage], now: i64) -> String {
+    let mut out = String::from("Subscriptions\n");
+    for usage in subscriptions {
+        out.push_str(&format!("  {}  ({})\n", usage.plan, usage.source));
+        if usage.windows.is_empty() {
+            out.push_str(&format!("    {}\n", usage.subscription.no_data_hint()));
+        }
+        for window in &usage.windows {
+            out.push_str(&format!("    {}\n", window_line(window, now)));
+        }
+    }
+    out
+}
+
+/// e.g. `5h  23% used, resets 14:05 (in 2h 10m)  updated 3m ago`.
+fn window_line(window: &WindowView, now: i64) -> String {
+    let state = match (window.used_percent, window.resets_at) {
+        (Some(used), Some(at)) => format!(
+            "{used:>3.0}% used, resets {} (in {})",
+            report::clock(at, now),
+            report::duration(at - now)
+        ),
+        (Some(used), None) => format!("{used:>3.0}% used"),
+        (None, Some(at)) => format!("reset at {}, no data since", report::clock(at, now)),
+        (None, None) => "unknown".into(),
+    };
+    let age = report::duration(window.age_ms);
+    let freshness = if window.stale {
+        format!(
+            "last known at {} ({age} ago)",
+            report::clock(window.observed_at, now)
+        )
+    } else {
+        format!("updated {age} ago")
+    };
+    format!("{:<3} {state}  {freshness}", window.window)
 }
 
 /// e.g. `#12 running  ck3-test events  queendom  feat/x  for 3m 12s`.

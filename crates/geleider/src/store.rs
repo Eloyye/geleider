@@ -7,6 +7,8 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
+use crate::usage::{Subscription, Window};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
@@ -132,7 +134,16 @@ impl Store {
                  error        TEXT,
                  log_path     TEXT NOT NULL DEFAULT ''
              );
-             CREATE INDEX IF NOT EXISTS runs_by_state ON runs (state, id);",
+             CREATE INDEX IF NOT EXISTS runs_by_state ON runs (state, id);
+             CREATE TABLE IF NOT EXISTS usage (
+                 subscription   TEXT NOT NULL,
+                 minutes        INTEGER NOT NULL,
+                 used_percent   REAL NOT NULL,
+                 resets_at      INTEGER,
+                 observed_at    INTEGER NOT NULL,
+                 reset_handled  INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (subscription, minutes)
+             );",
         )?;
         std::fs::create_dir_all(&logs)?;
         Ok(Self { conn, logs })
@@ -221,6 +232,53 @@ impl Store {
                              started_at = COALESCE(started_at, ?5)
              WHERE id = ?1",
             params![id, state.as_str(), exit_code, error, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// The latest known state of every Limit window, shortest window first.
+    pub fn windows(&self) -> Result<Vec<Window>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT subscription, minutes, used_percent, resets_at, observed_at, reset_handled
+             FROM usage ORDER BY subscription, minutes",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                Window {
+                    subscription: Subscription::Claude,
+                    minutes: row.get(1)?,
+                    used_percent: row.get(2)?,
+                    resets_at: row.get(3)?,
+                    observed_at: row.get(4)?,
+                    reset_handled: row.get(5)?,
+                },
+            ))
+        })?;
+        let mut windows = Vec::new();
+        for row in rows {
+            let (subscription, window) = row?;
+            windows.push(Window {
+                subscription: Subscription::parse(&subscription)?,
+                ..window
+            });
+        }
+        Ok(windows)
+    }
+
+    pub fn put_window(&self, window: &Window) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO usage
+                 (subscription, minutes, used_percent, resets_at, observed_at, reset_handled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                window.subscription.as_str(),
+                window.minutes,
+                window.used_percent,
+                window.resets_at,
+                window.observed_at,
+                window.reset_handled,
+            ],
         )?;
         Ok(())
     }
@@ -330,5 +388,35 @@ mod tests {
         let listed: Vec<i64> = store.list(10).unwrap().iter().map(|r| r.id).collect();
         assert_eq!(listed, vec![b.id, a.id]);
         assert_eq!(store.list(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn windows_are_kept_per_subscription_and_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db"), dir.path().join("runs")).unwrap();
+        let mut window = Window {
+            subscription: Subscription::Chatgpt,
+            minutes: 10_080,
+            used_percent: 12.5,
+            resets_at: Some(5_000),
+            observed_at: 1_000,
+            reset_handled: false,
+        };
+        store.put_window(&window).unwrap();
+        store
+            .put_window(&Window {
+                subscription: Subscription::Claude,
+                minutes: 300,
+                resets_at: None,
+                ..window.clone()
+            })
+            .unwrap();
+        window.reset_handled = true;
+        store.put_window(&window).unwrap();
+        let windows = store.windows().unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].subscription, Subscription::Chatgpt);
+        assert_eq!(windows[0], window);
+        assert_eq!(windows[1].resets_at, None);
     }
 }

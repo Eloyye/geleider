@@ -9,7 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -21,7 +21,12 @@ use crate::paths::{self, Paths};
 use crate::procs::{self, Snapshot};
 use crate::protocol::{self, Reply, Request, ResourceStatus, RunInfo, Status};
 use crate::report::{self, MacNotifier, Notifier, TAIL_LINES};
-use crate::store::{NewRun, Run, RunState, Store};
+use crate::store::{NewRun, Run, RunState, Store, now_ms};
+use crate::usage::{self, Reading, ResetCheck, Subscription, SubscriptionUsage, Window};
+
+/// How often the background process reads Codex's session logs and looks for
+/// Limit windows that have reset.
+const USAGE_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn run(paths: Paths) -> Result<()> {
     std::fs::create_dir_all(&paths.state_dir)
@@ -91,9 +96,16 @@ enum Event {
 
 impl Daemon {
     fn schedule_loop(self: &Arc<Self>) {
+        let mut usage_checked: Option<Instant> = None;
         loop {
             if let Err(err) = self.tick(None) {
                 eprintln!("geleider: {err:#}");
+            }
+            if usage_checked.is_none_or(|t| t.elapsed() >= USAGE_INTERVAL) {
+                if let Err(err) = self.refresh_usage() {
+                    eprintln!("geleider: reading usage: {err:#}");
+                }
+                usage_checked = Some(Instant::now());
             }
             let interval = self
                 .core
@@ -359,12 +371,122 @@ impl Daemon {
                     .collect();
                 let queued = queued_runs(&core.store)?;
                 let runs = core.store.list(0)?;
+                drop(core);
                 Ok(Reply::Status(Status {
                     resources,
                     runs: runs.into_iter().map(|r| info(r, &queued, false)).collect(),
+                    subscriptions: self.usage()?,
                 }))
             }
+            Request::ReportUsage {
+                subscription,
+                readings,
+            } => {
+                self.record_usage(subscription, &readings, now_ms())?;
+                Ok(Reply::Usage {
+                    subscriptions: Vec::new(),
+                })
+            }
+            Request::Usage => Ok(Reply::Usage {
+                subscriptions: self.usage()?,
+            }),
         }
+    }
+
+    /// Reads the newest Codex numbers, so what is shown is never older than its
+    /// session logs, then reports every enabled Subscription.
+    fn usage(self: &Arc<Self>) -> Result<Vec<SubscriptionUsage>> {
+        self.refresh_usage()?;
+        let mut core = self.core.lock().unwrap();
+        let config = core.config.get()?.clone();
+        let windows = core.store.windows()?;
+        let now = now_ms();
+        Ok(Subscription::ALL
+            .into_iter()
+            .filter(|s| config.subscriptions.get(*s).enabled)
+            .map(|s| SubscriptionUsage {
+                subscription: s,
+                plan: config.subscriptions.plan(s),
+                source: s.source().to_string(),
+                windows: windows
+                    .iter()
+                    .filter(|w| w.subscription == s)
+                    .map(|w| usage::view(w, now))
+                    .collect(),
+            })
+            .collect())
+    }
+
+    /// Records the newest Codex numbers and notifies about windows that have reset.
+    fn refresh_usage(self: &Arc<Self>) -> Result<()> {
+        let config = self.core.lock().unwrap().config.get()?.clone();
+        // Reading the logs happens without holding the lock.
+        let latest = if config.subscriptions.chatgpt.enabled {
+            usage::latest_codex(&usage::codex_sessions_dir()?)
+        } else {
+            None
+        };
+        // With nothing new this still notifies about windows that have reset.
+        let (readings, observed_at) = latest.unwrap_or_else(|| (Vec::new(), now_ms()));
+        self.record_usage(Subscription::Chatgpt, &readings, observed_at)
+    }
+
+    /// Folds readings into the stored windows. Resets that are due are handled
+    /// first, so a reading for the next window cannot hide the end of this one.
+    fn record_usage(
+        self: &Arc<Self>,
+        subscription: Subscription,
+        readings: &[Reading],
+        observed_at: i64,
+    ) -> Result<()> {
+        let now = now_ms();
+        let (config, resets) = {
+            let mut core = self.core.lock().unwrap();
+            let config = core.config.get()?.clone();
+            let mut resets = Vec::new();
+            for window in core.store.windows()? {
+                match usage::check_reset(&window, now, config.subscriptions.notify_resets) {
+                    ResetCheck::Pending => continue,
+                    ResetCheck::Notify => resets.push(window.clone()),
+                    ResetCheck::Quiet => {}
+                }
+                core.store.put_window(&Window {
+                    reset_handled: true,
+                    ..window
+                })?;
+            }
+            if config.subscriptions.get(subscription).enabled {
+                let stored = core.store.windows()?;
+                for reading in readings {
+                    let old = stored
+                        .iter()
+                        .find(|w| w.subscription == subscription && w.minutes == reading.minutes);
+                    if let Some(window) = usage::merge(old, subscription, *reading, observed_at) {
+                        core.store.put_window(&window)?;
+                    }
+                }
+            }
+            (config, resets)
+        };
+        if config.notifications && !resets.is_empty() {
+            let daemon = Arc::clone(self);
+            std::thread::spawn(move || {
+                for window in resets {
+                    let plan = config.subscriptions.plan(window.subscription);
+                    daemon.notifier.notify(
+                        &format!(
+                            "geleider: {plan} {} limit reset",
+                            usage::long_label(window.minutes)
+                        ),
+                        &format!(
+                            "It had reached {:.0}% used. The new window starts empty.",
+                            window.used_percent
+                        ),
+                    );
+                }
+            });
+        }
+        Ok(())
     }
 
     fn submit(

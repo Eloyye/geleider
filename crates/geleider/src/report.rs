@@ -38,7 +38,36 @@ pub fn duration(ms: i64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m {:02}s", s / 60, s % 60),
-        s => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
+        s if s < 86_400 => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
+        s => format!("{}d {:02}h", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+/// A local time such as `14:05`, with the weekday when it is not today and the
+/// date when it is not within a week: `Fri 09:00`, `Oct 21 09:00`.
+pub fn clock(ms: i64, now: i64) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (at, today) = (local_time(ms), local_time(now));
+    let time = format!("{:02}:{:02}", at.tm_hour, at.tm_min);
+    if (at.tm_year, at.tm_yday) == (today.tm_year, today.tm_yday) {
+        time
+    } else if (ms - now).abs() < 6 * 86_400_000 {
+        format!("{} {time}", DAYS[at.tm_wday as usize % 7])
+    } else {
+        format!("{} {} {time}", MONTHS[at.tm_mon as usize % 12], at.tm_mday)
+    }
+}
+
+fn local_time(ms: i64) -> libc::tm {
+    let secs = ms.div_euclid(1000) as libc::time_t;
+    // SAFETY: localtime_r only writes the `tm` it is given; a zeroed `tm` is valid.
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&secs, &mut tm);
+        tm
     }
 }
 
@@ -138,6 +167,15 @@ mod tests {
         assert_eq!(duration(4_200), "4s");
         assert_eq!(duration(192_000), "3m 12s");
         assert_eq!(duration(3_723_000), "1h 02m");
+        assert_eq!(duration(273_600_000), "3d 04h");
+    }
+
+    #[test]
+    fn clock_names_the_day_only_when_needed() {
+        let now = crate::store::now_ms();
+        assert_eq!(clock(now, now).len(), "14:05".len());
+        assert_eq!(clock(now + 3 * 86_400_000, now).len(), "Fri 14:05".len());
+        assert_eq!(clock(now + 20 * 86_400_000, now).split(' ').count(), 3);
     }
 
     #[test]

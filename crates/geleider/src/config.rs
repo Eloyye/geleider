@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 use crate::paths;
+use crate::usage::Subscription;
 
 /// Placeholders every Job command may use besides its own args and vars.
 const BUILTINS: &[&str] = &["worktree"];
@@ -26,9 +27,84 @@ pub struct Config {
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
     #[serde(default)]
+    pub subscriptions: Subscriptions,
+    #[serde(default)]
     pub resources: BTreeMap<String, Resource>,
     #[serde(default)]
     pub projects: BTreeMap<String, Project>,
+}
+
+/// Which Subscriptions `geleider status` shows, and when their resets notify.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Subscriptions {
+    /// Notify when a Limit window resets that had reached this percentage used,
+    /// or `false` for never. Windows used less reset quietly.
+    #[serde(deserialize_with = "percent_or_false")]
+    pub notify_resets: Option<f64>,
+    pub claude: SubscriptionConfig,
+    pub chatgpt: SubscriptionConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubscriptionConfig {
+    pub enabled: bool,
+    /// Shown in `geleider status`, e.g. `Claude Max`.
+    pub plan: Option<String>,
+}
+
+/// Reaching 80% is when a reset starts to matter: below it you were not about to
+/// run out.
+const DEFAULT_NOTIFY_RESETS: f64 = 80.0;
+
+impl Default for Subscriptions {
+    fn default() -> Self {
+        Self {
+            notify_resets: Some(DEFAULT_NOTIFY_RESETS),
+            claude: SubscriptionConfig::default(),
+            chatgpt: SubscriptionConfig::default(),
+        }
+    }
+}
+
+impl Default for SubscriptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            plan: None,
+        }
+    }
+}
+
+impl Subscriptions {
+    pub fn get(&self, subscription: Subscription) -> &SubscriptionConfig {
+        match subscription {
+            Subscription::Claude => &self.claude,
+            Subscription::Chatgpt => &self.chatgpt,
+        }
+    }
+
+    pub fn plan(&self, subscription: Subscription) -> String {
+        self.get(subscription)
+            .plan
+            .clone()
+            .unwrap_or_else(|| subscription.default_plan().to_string())
+    }
+}
+
+fn percent_or_false<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Threshold {
+        Switch(bool),
+        Percent(f64),
+    }
+    Ok(match Threshold::deserialize(d)? {
+        Threshold::Switch(false) => None,
+        Threshold::Switch(true) => Some(DEFAULT_NOTIFY_RESETS),
+        Threshold::Percent(p) => Some(p),
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +169,11 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        if let Some(p) = self.subscriptions.notify_resets
+            && !(0.0..=100.0).contains(&p)
+        {
+            bail!("subscriptions.notify_resets must be a percentage from 0 to 100, or false");
+        }
         for (name, resource) in &self.resources {
             if resource.slots == 0 {
                 bail!("resource `{name}` needs at least one slot");
@@ -367,6 +448,35 @@ mod tests {
 
         let zero_slots = QUEENDOM.replace("slots = 1", "slots = 0");
         assert!(Config::parse(&zero_slots).is_err());
+    }
+
+    #[test]
+    fn subscriptions_default_to_both_with_quiet_resets() {
+        let config = Config::parse("").unwrap();
+        assert!(config.subscriptions.claude.enabled && config.subscriptions.chatgpt.enabled);
+        assert_eq!(config.subscriptions.notify_resets, Some(80.0));
+        assert_eq!(
+            config.subscriptions.plan(Subscription::Claude),
+            "Claude Pro"
+        );
+
+        let config = Config::parse(
+            "[subscriptions]\nnotify_resets = false\n[subscriptions.claude]\nplan = \"Claude Max\"\n\
+             [subscriptions.chatgpt]\nenabled = false\n",
+        )
+        .unwrap();
+        assert_eq!(config.subscriptions.notify_resets, None);
+        assert_eq!(
+            config.subscriptions.plan(Subscription::Claude),
+            "Claude Max"
+        );
+        assert!(!config.subscriptions.chatgpt.enabled);
+
+        let config = Config::parse("[subscriptions]\nnotify_resets = 50\n").unwrap();
+        assert_eq!(config.subscriptions.notify_resets, Some(50.0));
+        assert!(Config::parse("[subscriptions]\nnotify_resets = 150\n").is_err());
+        // OpenCode Go has no documented usage source.
+        assert!(Config::parse("[subscriptions.opencode-go]\n").is_err());
     }
 
     #[test]
