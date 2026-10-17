@@ -51,6 +51,11 @@ impl Paths {
         self.state_dir.join("state.sqlite")
     }
 
+    /// Every Claim, written by the daemon for start hooks to read.
+    pub fn claims(&self) -> PathBuf {
+        self.state_dir.join("claims.json")
+    }
+
     pub fn lock_file(&self) -> PathBuf {
         self.state_dir.join("daemon.lock")
     }

@@ -27,6 +27,15 @@ impl Harness {
             Self::Opencode => "opencode",
         }
     }
+
+    /// The product name, as Claim comments show it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Opencode => "OpenCode",
+        }
+    }
 }
 
 /// Which Session a Run's result goes to. Every way in (hook stdin, the hook
@@ -264,9 +273,13 @@ fn is_question(tool: &str) -> bool {
         || tool.ends_with("request_user_input_async")
 }
 
-/// Only this tool's arguments may be annotated by a PreToolUse hook.
-pub fn is_submit_tool(tool: &str) -> bool {
-    matches!(tool, "mcp__geleider__submit_run" | "geleider_submit_run")
+/// Only these tools' arguments are annotated with the calling Session by a
+/// PreToolUse hook: where a Run's result goes, and who claims or releases an issue.
+pub fn is_attested_tool(tool: &str) -> bool {
+    let name = tool
+        .strip_prefix("mcp__geleider__")
+        .or_else(|| tool.strip_prefix("geleider_"));
+    matches!(name, Some("submit_run" | "claim" | "release"))
 }
 
 #[cfg(test)]
@@ -290,6 +303,25 @@ mod tests {
         assert_eq!(state("Notification", &input), None);
         input["agent_id"] = json!("child");
         assert_eq!(state("Stop", &input), None);
+    }
+
+    #[test]
+    fn only_geleiders_session_naming_tools_are_attested() {
+        for tool in [
+            "mcp__geleider__submit_run",
+            "geleider_claim",
+            "mcp__geleider__release",
+        ] {
+            assert!(is_attested_tool(tool), "{tool}");
+        }
+        for tool in [
+            "mcp__geleider__status",
+            "geleider_get_run",
+            "mcp__other__claim",
+            "claim",
+        ] {
+            assert!(!is_attested_tool(tool), "{tool}");
+        }
     }
 
     #[test]

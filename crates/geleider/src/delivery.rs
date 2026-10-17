@@ -4,11 +4,13 @@ use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
+use crate::command;
 use crate::report::{self, TAIL_LINES};
 use crate::session::{Harness, SessionKey};
 use crate::store::Run;
+use crate::text::printable;
 
 /// The most Job output a delivered message carries. It is queued as a prompt,
 /// and the OpenCode plugin reads it through a bounded pipe.
@@ -40,13 +42,6 @@ pub fn message(run: &Run) -> String {
         ));
     }
     text
-}
-
-/// `text` without control characters such as terminal escapes, keeping lines and tabs.
-fn printable(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
-        .collect()
 }
 
 /// The end of `tail`, at most [`MAX_TAIL_CHARS`] characters.
@@ -90,21 +85,11 @@ pub fn codex(run: &Run, session: &SessionKey) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let deadline = Instant::now() + CODEX_TIMEOUT;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            if !status.success() {
-                bail!("codex queue exited {status}")
-            }
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("codex queue timed out");
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    let status = command::wait_within(&mut child, CODEX_TIMEOUT).context("codex queue")?;
+    if !status.success() {
+        bail!("codex queue exited {status}")
     }
+    Ok(())
 }
 
 /// When each undelivered Run may be tried again: the delay doubles with every
@@ -138,11 +123,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tails_lose_control_characters_and_keep_their_end() {
-        assert_eq!(
-            printable("\u{1b}[31mred\u{1b}[0m\tok\n\u{7}"),
-            "[31mred[0m\tok\n"
-        );
+    fn tails_keep_their_end() {
         let long = format!("{}end", "x".repeat(MAX_TAIL_CHARS * 2));
         let tail = bounded_tail(&long);
         assert_eq!(tail.chars().count(), MAX_TAIL_CHARS);

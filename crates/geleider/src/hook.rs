@@ -2,6 +2,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixDatagram;
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::attest::{Attestation, Destination, Nonce};
+use crate::claim;
 use crate::paths::Paths;
 use crate::session::{self, Activity, Harness};
 
@@ -39,7 +41,7 @@ fn forward(paths: &Paths, harness: Harness, event: &str) -> Result<()> {
     // Per-call identity works even when the Harness shares an MCP server across
     // Sessions. stdout is reserved for the Harness hook contract, not diagnostics.
     if matches!(event, "PreToolUse" | "tool.before")
-        && session::is_submit_tool(input["tool_name"].as_str().unwrap_or_default())
+        && session::is_attested_tool(input["tool_name"].as_str().unwrap_or_default())
     {
         let (args, attestation) = annotate_submission(harness, &input, Nonce::generate())?;
         // Sent before the call goes ahead, so the daemon has it by the time the
@@ -47,14 +49,27 @@ fn forward(paths: &Paths, harness: Harness, event: &str) -> Result<()> {
         if let Some(attestation) = attestation {
             let _ = send(paths, &Datagram::Attestation(attestation));
         }
-        let output =
-            json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": args}});
-        let _ = writeln!(std::io::stdout(), "{output}");
+        reply("PreToolUse", "updatedInput", json!(args));
+    }
+    // Claude Code and Codex add a SessionStart hook's `additionalContext` to the
+    // conversation. Only files are read, never the daemon or git.
+    if event == "SessionStart"
+        && harness != Harness::Opencode
+        && let (Some(key), Some(cwd)) = (session::identity(harness, &input), input["cwd"].as_str())
+        && let Some(warning) = claim::start_warning(&paths.claims(), &key, Path::new(cwd))
+    {
+        reply("SessionStart", "additionalContext", json!(warning));
     }
     match session::activity(harness, event, &input) {
         Some(activity) => send(paths, &Datagram::Activity(activity)),
         None => Ok(()),
     }
+}
+
+/// Answers the Harness with one `hookSpecificOutput` field for `event`.
+fn reply(event: &str, field: &str, value: Value) {
+    let output = json!({"hookSpecificOutput": {"hookEventName": event, field: value}});
+    let _ = writeln!(std::io::stdout(), "{output}");
 }
 
 fn send(paths: &Paths, datagram: &Datagram) -> Result<()> {
@@ -68,7 +83,7 @@ fn send(paths: &Paths, datagram: &Datagram) -> Result<()> {
     Ok(())
 }
 
-/// The submit_run arguments with the Session the Harness says made this call,
+/// The submit_run, claim or release arguments with the Session the Harness says made this call,
 /// and the attestation that lets the daemon trust it. A `session` the model
 /// wrote itself is always replaced or dropped, never passed on: otherwise one
 /// conversation could have its Run result, and the Job output in it, queued as

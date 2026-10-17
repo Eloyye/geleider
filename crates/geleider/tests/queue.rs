@@ -464,15 +464,35 @@ fn sessions(env: &Env) -> Vec<Value> {
 /// The submit_run arguments a Harness's hook sends on for `session_id`, with
 /// the nonce it attested them with.
 fn attested(env: &Env, harness: &str, session_id: &str, tool_input: Value) -> Value {
+    attested_call(
+        env,
+        harness,
+        session_id,
+        "submit_run",
+        &env.repo(),
+        tool_input,
+    )
+}
+
+/// The arguments a Harness's hook sends on for a call of geleider's `tool` by
+/// `session_id` working in `cwd`.
+fn attested_call(
+    env: &Env,
+    harness: &str,
+    session_id: &str,
+    tool: &str,
+    cwd: &Path,
+    tool_input: Value,
+) -> Value {
     let (event, tool) = match harness {
-        "opencode" => ("tool.before", "geleider_submit_run"),
-        _ => ("PreToolUse", "mcp__geleider__submit_run"),
+        "opencode" => ("tool.before", format!("geleider_{tool}")),
+        _ => ("PreToolUse", format!("mcp__geleider__{tool}")),
     };
     let out = hook(
         env,
         harness,
         event,
-        serde_json::json!({"session_id":session_id,"cwd":env.repo(),"tool_name":tool,"tool_input":tool_input}),
+        serde_json::json!({"session_id":session_id,"cwd":cwd,"tool_name":tool,"tool_input":tool_input}),
     );
     let output: Value = serde_json::from_slice(&out.stdout).unwrap();
     output["hookSpecificOutput"]["updatedInput"].clone()
@@ -530,6 +550,19 @@ impl Mcp {
         let run = reply["result"]["structuredContent"].clone();
         assert!(run["id"].is_i64(), "{reply}");
         run
+    }
+
+    /// The result of calling `tool`: its JSON, or `Err` with its error text.
+    fn call(&mut self, tool: &str, arguments: Value) -> Result<Value, String> {
+        let reply = self.rpc(
+            "tools/call",
+            serde_json::json!({"name":tool,"arguments":arguments}),
+        );
+        let result = &reply["result"];
+        if result["isError"] == true {
+            return Err(result["content"][0]["text"].as_str().unwrap().to_string());
+        }
+        Ok(result["structuredContent"].clone())
     }
 
     fn stop(mut self) {
@@ -1007,4 +1040,222 @@ fn an_attestation_expires_if_its_submission_comes_too_late() {
     let prompt = attested(&env, "codex", "caller", job);
     assert_eq!(mcp.submit(prompt)["session"]["id"], "caller");
     mcp.stop();
+}
+
+/// A stand-in for `gh`, signed in as `tester`, that keeps issues of
+/// `example/demo` in `gh-issues.json`.
+const FAKE_GH: &str = r#"#!/usr/bin/env python3
+import sys, json, pathlib
+root = pathlib.Path(__file__).parent.parent
+path = root / 'gh-issues.json'
+args = sys.argv[1:]
+method = args[args.index('-X') + 1] if '-X' in args else 'GET'
+target = next(a for a in args[1:] if a == 'user' or a.startswith('repos/'))
+if target == 'user':
+    print(json.dumps({'login': 'tester'}))
+    sys.exit(0)
+state = json.loads(path.read_text())
+parts = target.split('/')
+issue = state[parts[4]]
+body = json.load(sys.stdin) if '--input' in args else None
+if parts[5:] == ['assignees']:
+    issue['assignees'] = [a for a in issue['assignees'] if a not in body['assignees']]
+    if method == 'POST':
+        issue['assignees'] += body['assignees']
+elif parts[5:] == ['comments']:
+    issue['comments'].append(body['body'])
+path.write_text(json.dumps(state))
+print(json.dumps({'state': issue['state'], 'assignees': [{'login': a} for a in issue['assignees']]}))
+"#;
+
+fn issues(env: &Env) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(env.root().join("gh-issues.json")).unwrap())
+        .unwrap()
+}
+
+fn claims(env: &Env) -> Vec<Value> {
+    let out = env.geleider(&["status", "--json"]);
+    serde_json::from_slice::<Value>(&out.stdout).unwrap()["claims"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn one_session_claims_an_issue_across_harnesses_until_it_closes_or_is_released() {
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    let mut env = Env::new("fakegame-claims");
+    let gh = env.root().join("bin/gh");
+    std::fs::write(&gh, FAKE_GH).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let open = json!({"state":"open","assignees":[],"comments":[]});
+    std::fs::write(
+        env.root().join("gh-issues.json"),
+        json!({"5": open, "6": open}).to_string(),
+    )
+    .unwrap();
+    env.daemon_env
+        .push(("GELEIDER_CLAIM_CHECK_MS", "200".into()));
+    env.daemon_env
+        .push(("GELEIDER_CLAIM_QUIET_MS", "1500".into()));
+    env.kill_daemon();
+    env.start_daemon();
+
+    let worktree = |name: &str, branch: &str| {
+        let wt = env.root().join(name);
+        git(
+            &env.repo(),
+            &["worktree", "add", "-q", "-b", branch, wt.to_str().unwrap()],
+        );
+        wt
+    };
+    let claude_wt = worktree("wt-claude", "claude/issue-5-a");
+    let codex_wt = worktree("wt-codex", "codex/issue-5-b");
+    let in_dir = |dir: &Path, args: &[&str]| {
+        let mut cmd = env.command();
+        cmd.current_dir(dir).args(args);
+        cmd.output().unwrap()
+    };
+
+    // A Claude Code Session claims #5 from the command line in its worktree.
+    hook(
+        &env,
+        "claude",
+        "SessionStart",
+        json!({"session_id":"claude-1","cwd":claude_wt}),
+    );
+    wait_until(Duration::from_secs(5), || sessions(&env).len() == 1);
+    let out = in_dir(&claude_wt, &["claim", "5"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("Claimed example/demo#5"));
+    // Claiming again is a no-op, not a second comment.
+    assert!(in_dir(&claude_wt, &["claim", "#5"]).status.success());
+    let issue = &issues(&env)["5"];
+    assert_eq!(issue["assignees"], json!(["tester"]));
+    assert_eq!(
+        issue["comments"],
+        json!(["Claimed by Claude Code session claude-1 on `claude/issue-5-a`."])
+    );
+
+    // A Codex Session starting on a branch for #5 is warned, but claims nothing.
+    let out = hook(
+        &env,
+        "codex",
+        "SessionStart",
+        json!({"session_id":"codex-1","cwd":codex_wt}),
+    );
+    let output: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        output["hookSpecificOutput"]["hookEventName"],
+        "SessionStart"
+    );
+    let warning = output["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(
+        warning.contains("example/demo#5 is claimed by Claude Code session claude-1"),
+        "{warning}"
+    );
+    assert_eq!(claims(&env).len(), 1);
+
+    // Its claim through MCP fails, naming the holder.
+    let mut mcp = Mcp::start(&env, "codex");
+    let args = attested_call(
+        &env,
+        "codex",
+        "codex-1",
+        "claim",
+        &codex_wt,
+        json!({"issue":5}),
+    );
+    let err = mcp.call("claim", args).unwrap_err();
+    assert!(
+        err.contains("already claimed by Claude Code session claude-1"),
+        "{err}"
+    );
+    assert_eq!(issues(&env)["5"]["comments"].as_array().unwrap().len(), 1);
+
+    // A quiet holder is flagged in status, and keeps its Claim.
+    std::thread::sleep(Duration::from_millis(1700));
+    let held = claims(&env);
+    assert_eq!(held[0]["session"]["id"], "claude-1");
+    assert_eq!(held[0]["quiet"], true);
+    let text = String::from_utf8(env.geleider(&["status"]).stdout).unwrap();
+    assert!(text.contains("example/demo#5  claude claude-1"), "{text}");
+    assert!(text.contains("QUIET for"), "{text}");
+
+    // Closing the issue ends the Claim.
+    let mut state = issues(&env);
+    state["5"]["state"] = json!("closed");
+    std::fs::write(env.root().join("gh-issues.json"), state.to_string()).unwrap();
+    wait_until(Duration::from_secs(5), || claims(&env).is_empty());
+    let out = hook(
+        &env,
+        "codex",
+        "SessionStart",
+        json!({"session_id":"codex-1","cwd":codex_wt}),
+    );
+    assert!(out.stdout.is_empty());
+
+    // Codex claims #6. Only it can release it, unless forced.
+    let args = attested_call(
+        &env,
+        "codex",
+        "codex-1",
+        "claim",
+        &codex_wt,
+        json!({"issue":"#6"}),
+    );
+    let claimed = mcp.call("claim", args).unwrap();
+    assert_eq!(claimed["claim"]["session"]["id"], "codex-1");
+    let out = in_dir(&claude_wt, &["release", "6"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only that Session can release it"));
+    let args = attested_call(
+        &env,
+        "codex",
+        "codex-1",
+        "release",
+        &codex_wt,
+        json!({"issue":6}),
+    );
+    let released = mcp.call("release", args).unwrap();
+    assert!(
+        released["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Released example/demo#6")
+    );
+    assert!(claims(&env).is_empty());
+    let issue = &issues(&env)["6"];
+    assert_eq!(issue["assignees"], json!([]));
+    assert_eq!(
+        issue["comments"][1],
+        "Claim released (was held by Codex session codex-1 on `codex/issue-5-b`)."
+    );
+
+    // From a terminal, a Claim another Session holds is ended with --force.
+    let args = attested_call(
+        &env,
+        "codex",
+        "codex-1",
+        "claim",
+        &codex_wt,
+        json!({"issue":6}),
+    );
+    mcp.call("claim", args).unwrap();
+    mcp.stop();
+    let out = env.geleider(&["release", "example/demo#6", "--force"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(claims(&env).is_empty());
+    assert_eq!(issues(&env)["6"]["assignees"], json!([]));
 }

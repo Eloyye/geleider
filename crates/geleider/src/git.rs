@@ -2,10 +2,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::command;
 use crate::config::{Config, Project};
+
+/// How long one git call may take. Hooks queue Session activity behind it.
+const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct Location<'a> {
@@ -13,6 +18,8 @@ pub struct Location<'a> {
     pub project: &'a Project,
     pub worktree: PathBuf,
     pub branch: Option<String>,
+    /// The repository's shared `.git` directory.
+    pub common_dir: PathBuf,
 }
 
 /// Finds the Project whose clone `cwd` is in, directly or through one of the
@@ -44,6 +51,7 @@ pub fn locate<'a>(config: &'a Config, cwd: &Path) -> Result<Location<'a>> {
                 project,
                 branch: branch(&worktree),
                 worktree,
+                common_dir,
             });
         }
     }
@@ -63,7 +71,8 @@ pub fn locate<'a>(config: &'a Config, cwd: &Path) -> Result<Location<'a>> {
 /// `dir` comes from the caller and may hold a repository an agent wrote, so git's
 /// settings that run commands are switched off and it never prompts.
 fn git(dir: &Path, args: &[&str]) -> Result<Output> {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(dir)
         .args([
@@ -74,9 +83,8 @@ fn git(dir: &Path, args: &[&str]) -> Result<Output> {
         ])
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .context("running git")
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    command::output_within(&mut command, None, GIT_TIMEOUT)
 }
 
 /// git's output, or its error message if it failed.

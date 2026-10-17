@@ -60,10 +60,11 @@ export default {
     }
 
     await ctx.tool.hook("execute.before", async (event) => {
-      const submitting = event.tool === "geleider_submit_run" || event.tool === "mcp__geleider__submit_run";
-      // A destination the model wrote itself is never passed on, even when the
+      // submit_run, claim and release name the calling Session.
+      const attested = /^(geleider_|mcp__geleider__)(submit_run|claim|release)$/.test(event.tool);
+      // A Session the model wrote itself is never passed on, even when the
       // Session cannot be resolved: it could name another Session.
-      const args = submitting ? { ...((event.input ?? {}) as Record<string, unknown>) } : undefined;
+      const args = attested ? { ...((event.input ?? {}) as Record<string, unknown>) } : undefined;
       if (args) {
         delete args.session;
         event.input = args;

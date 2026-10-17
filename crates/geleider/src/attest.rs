@@ -1,7 +1,8 @@
 //! Attested Session destinations. A Run result is queued as a prompt in the
 //! Session it names, so the daemon accepts that destination only when a Harness
 //! hook vouched for it: the hook sends the daemon a single-use nonce with the
-//! Session it saw, and puts the same nonce in the submit_run arguments.
+//! Session it saw, and puts the same nonce in the submit_run arguments. Claim and
+//! release calls name their Session the same way.
 
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -25,6 +26,8 @@ impl Nonce {
     /// A fresh nonce from the system's random source; `None` if it is unavailable.
     pub fn generate() -> Option<Self> {
         let mut bytes = [0u8; NONCE_BYTES];
+        // The standard library has no stable secure random source; getentropy is
+        // the system's, and cannot fail for a buffer of at most 256 bytes.
         // SAFETY: `bytes` is a valid, writable buffer of the length passed.
         let filled = unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } == 0;
         filled.then(|| Self(bytes.iter().map(|b| format!("{b:02x}")).collect()))
@@ -63,7 +66,7 @@ pub struct Destination {
     pub nonce: Option<Nonce>,
 }
 
-/// What a hook tells the daemon before the submit_run call it annotated goes ahead.
+/// What a hook tells the daemon before the call it annotated goes ahead.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Attestation {
     pub session: SessionKey,
