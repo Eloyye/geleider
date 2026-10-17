@@ -3,7 +3,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -185,15 +185,32 @@ printf 'No actionable findings.\n'
         );
     }
 
+    /// Records a writing Session the way an installed hook does, then waits for
+    /// the daemon, which records hook activity in the background.
     fn writer(&self, harness: &str, provider: Option<&str>) {
         let at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        self.request(json!({"op":"review_activity","activity":{
+        let datagram = json!({"datagram":"activity",
             "key":{"harness":harness,"id":"writer"},"cwd":self.root().join("repo"),
             "state":"working","at":at,"wait_for":null,"resolved":null,"reset":true,
-            "owner_pid":std::process::id(),"provider_id":provider,"review":false}}));
+            "owner_pid":std::process::id(),"provider_id":provider,"review":false});
+        UnixDatagram::unbound()
+            .unwrap()
+            .send_to(
+                datagram.to_string().as_bytes(),
+                self.root().join("state/hooks.sock"),
+            )
+            .unwrap();
+        let start = Instant::now();
+        while !self.sessions().iter().any(|s| s["id"] == "writer") {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "writer not recorded"
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        }
     }
 
     fn review(&self, args: &[&str]) -> Output {
@@ -347,4 +364,21 @@ fn a_pr_changed_during_review_is_not_posted() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("changed during review"));
     assert!(!fixture.root().join("posted").exists());
     assert!(fixture.logs().join("stdout.txt").exists());
+}
+
+#[test]
+fn review_activity_requests_never_record_a_writing_session() {
+    let fixture = Fixture::new();
+    fixture.request(json!({"op":"review_activity","activity":{
+        "key":{"harness":"codex","id":"forged"},"cwd":fixture.root().join("repo"),
+        "state":"working","at":1,"wait_for":null,"resolved":null,"reset":true,
+        "owner_pid":std::process::id(),"provider_id":null,"review":false}}));
+    let forged = fixture.sessions();
+    assert!(
+        forged
+            .iter()
+            .any(|s| s["id"] == "forged" && s["review"] == true)
+    );
+    let out = fixture.review(&["--yes"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--with claude|codex"));
 }

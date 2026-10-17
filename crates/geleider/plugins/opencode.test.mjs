@@ -104,11 +104,14 @@ if (args[0] === 'session-results') {
     assert.equal(provider.length, 1);
     assert.equal(provider[0].input.provider_id, "openai");
     assert.equal(provider[0].input.text, undefined);
+    // The same provider again, as on every later step, is not reported again.
+    events.push({ type: "message.updated", data: { info: { sessionID: "root", role: "assistant", providerID: "openai" } } });
     events.push({ type: "permission.asked", data: { sessionID: "root", id: "permission" } });
     events.push({ type: "session.idle", data: { sessionID: "child" } });
     events.push({ type: "form.created", data: { form: { sessionID: "root", id: "question" } } });
     await until(async () => (await calls()).some((c) => c.args[2] === "form.created"));
     assert.ok(!(await calls()).some((c) => c.args[2] === "session.idle"));
+    assert.ok(!(await calls()).some((c) => c.args[2] === "message.updated"));
     await until(() => deliveryAttempts > 0);
     assert.equal(prompts.length, 0);
     assert.ok(!(await calls()).some((c) => c.args.includes("--ack")));

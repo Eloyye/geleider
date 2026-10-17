@@ -99,6 +99,8 @@ export default {
       "permission.asked", "permission.replied", "form.created", "form.replied", "form.cancelled",
       "session.step.started", "message.updated",
     ]);
+    // The last provider reported for each root Session.
+    const providers = new Map<string, string>();
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
@@ -116,12 +118,16 @@ export default {
             if (event.type === "message.updated" && message?.role !== "assistant") continue;
             const model = fields.model as { providerID?: string } | undefined;
             const provider = model?.providerID ?? message?.providerID;
-            // Send only provider identity, never message text or model output.
-            if (typeof provider === "string") await report(info, event.type, { provider_id: provider });
+            // Send only provider identity, never message text or model output,
+            // and only when it changes: these events fire on every step.
+            if (typeof provider !== "string" || providers.get(id) === provider) continue;
+            providers.set(id, provider);
+            await report(info, event.type, { provider_id: provider });
           } else await report(info, event.type, fields);
           if (event.type === "session.deleted") {
             roots.delete(id);
             known.delete(id);
+            providers.delete(id);
           }
         }
       } catch { /* Subscription disposal or unavailable server. */ }

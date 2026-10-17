@@ -181,7 +181,11 @@ Harness must already be installed and signed in to its Subscription.
 The review runs headlessly in a temporary detached worktree at the PR's exact
 head, with a read-only Codex sandbox or Claude's Read/Grep/Glob tools and no MCP
 servers. Claude loads only user settings so PR-supplied settings cannot install
-hooks. Claude receives the committed diff on stdin. No current worktree edits
+hooks, and its reads are confined to the review worktree. Commands Codex runs
+inherit only core environment variables, so no tokens. Codex's read-only
+sandbox can still read files outside the worktree: since a PR can try to
+instruct its reviewer and the output is posted, review untrusted PRs with
+Claude. Claude receives the committed diff on stdin. No current worktree edits
 enter the review. The process is tracked as a working Session and ends when the
 review finishes or its owning process exits; installed hooks use the same
 review Session id. Reviews have a 30-minute deadline.
