@@ -41,6 +41,7 @@ if (args[0] === 'session-results') {
     const events = [];
     const prompts = [];
     let rejectDelivery = true;
+    let deliveryAttempts = 0;
     const ctx = {
       session: {
         async get({ sessionID }) {
@@ -48,6 +49,7 @@ if (args[0] === 'session-results') {
             location: { directory: sessionID === "other" ? "/other-worktree" : "/root-worktree" } };
         },
         async prompt(input) {
+          deliveryAttempts++;
           if (rejectDelivery) throw Error("temporarily unavailable");
           prompts.push(input);
         },
@@ -75,7 +77,7 @@ if (args[0] === 'session-results') {
     const calls = async () => (await readFile(callsPath, "utf8")).trim().split("\n").map(JSON.parse);
     await until(async () => (await calls()).some((c) => c.args[2] === "form.created"));
     assert.ok(!(await calls()).some((c) => c.args[2] === "session.idle"));
-    await until(async () => (await calls()).some((c) => c.args[0] === "session-results"));
+    await until(() => deliveryAttempts > 0);
     assert.equal(prompts.length, 0);
     assert.ok(!(await calls()).some((c) => c.args.includes("--ack")));
     rejectDelivery = false;
