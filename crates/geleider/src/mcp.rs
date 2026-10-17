@@ -203,9 +203,13 @@ fn issue(args: &Value) -> Result<IssueRef> {
 }
 
 /// The `session` argument the hooks fill in on submit_run, claim and release.
-fn session_schema() -> Value {
-    json!({ "type": "object", "description": "Set by geleider's Harness hook; do not pass it. Any value you write is replaced or ignored.",
+fn session_schema(effect: &str) -> Value {
+    json!({ "type": "object", "description": format!("Set by geleider's Harness hook; do not pass it. {effect}"),
         "properties": { "harness": { "type": "string", "enum": ["claude", "codex", "opencode"] }, "id": { "type": "string", "minLength": 1 }, "nonce": { "type": "string" } }, "required": ["harness", "id"], "additionalProperties": false })
+}
+
+fn cwd_schema() -> Value {
+    json!({ "type": "string", "description": "A directory in your worktree. Defaults to this server's working directory." })
 }
 
 fn tools() -> Value {
@@ -221,9 +225,8 @@ fn tools() -> Value {
                 "properties": {
                     "job": { "type": "string", "description": "Job name, e.g. `ck3-test`." },
                     "args": { "type": "array", "items": { "type": "string" }, "description": "The Job's positional args." },
-                    "cwd": { "type": "string", "description": "A directory in your worktree. Defaults to this server's working directory." },
-                    "session": { "type": "object", "description": "Set by geleider's Harness hook; do not pass it. Any value you write is replaced, and one no hook attested turns result delivery off.",
-                        "properties": { "harness": { "type": "string", "enum": ["claude", "codex", "opencode"] }, "id": { "type": "string", "minLength": 1 }, "nonce": { "type": "string" } }, "required": ["harness", "id"], "additionalProperties": false }
+                    "cwd": cwd_schema(),
+                    "session": session_schema("Any value you write is replaced, and one no hook attested turns result delivery off.")
                 },
                 "required": ["job"]
             }
@@ -258,8 +261,8 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "issue": { "type": ["integer", "string"], "description": "Issue number in this worktree's Project, e.g. 5 or \"#5\"." },
-                    "cwd": { "type": "string", "description": "A directory in your worktree. Defaults to this server's working directory." },
-                    "session": session_schema()
+                    "cwd": cwd_schema(),
+                    "session": session_schema("Any value you write is replaced or ignored.")
                 },
                 "required": ["issue"]
             }
@@ -273,8 +276,8 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "issue": { "type": ["integer", "string"], "description": "Issue number, e.g. 5, \"#5\" or \"owner/name#5\"." },
-                    "cwd": { "type": "string", "description": "A directory in your worktree. Defaults to this server's working directory." },
-                    "session": session_schema()
+                    "cwd": cwd_schema(),
+                    "session": session_schema("Any value you write is replaced or ignored.")
                 },
                 "required": ["issue"]
             }

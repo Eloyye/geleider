@@ -49,9 +49,7 @@ fn forward(paths: &Paths, harness: Harness, event: &str) -> Result<()> {
         if let Some(attestation) = attestation {
             let _ = send(paths, &Datagram::Attestation(attestation));
         }
-        let output =
-            json!({"hookSpecificOutput": {"hookEventName": "PreToolUse", "updatedInput": args}});
-        let _ = writeln!(std::io::stdout(), "{output}");
+        reply("PreToolUse", "updatedInput", json!(args));
     }
     // Claude Code and Codex add a SessionStart hook's `additionalContext` to the
     // conversation. Only files are read, never the daemon or git.
@@ -60,13 +58,18 @@ fn forward(paths: &Paths, harness: Harness, event: &str) -> Result<()> {
         && let (Some(key), Some(cwd)) = (session::identity(harness, &input), input["cwd"].as_str())
         && let Some(warning) = claim::start_warning(&paths.claims(), &key, Path::new(cwd))
     {
-        let output = json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": warning}});
-        let _ = writeln!(std::io::stdout(), "{output}");
+        reply("SessionStart", "additionalContext", json!(warning));
     }
     match session::activity(harness, event, &input) {
         Some(activity) => send(paths, &Datagram::Activity(activity)),
         None => Ok(()),
     }
+}
+
+/// Answers the Harness with one `hookSpecificOutput` field for `event`.
+fn reply(event: &str, field: &str, value: Value) {
+    let output = json!({"hookSpecificOutput": {"hookEventName": event, field: value}});
+    let _ = writeln!(std::io::stdout(), "{output}");
 }
 
 fn send(paths: &Paths, datagram: &Datagram) -> Result<()> {

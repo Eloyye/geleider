@@ -6,6 +6,7 @@ use std::process::Command;
 
 use crate::github;
 use crate::store::{Run, RunState};
+use crate::text;
 
 /// Lines of log shown in results and PR comments.
 pub const TAIL_LINES: usize = 40;
@@ -102,22 +103,22 @@ pub fn comment_body(run: &Run, tail: &str) -> String {
         RunState::Failed => "❌",
         _ => "⚠️",
     };
+    // The args, the error and the log come from the Session, and this comment is
+    // posted as the user: none of it may become links, mentions or HTML.
     let mut body = format!(
-        "{}\n### {icon} `{}` {}\n\nRun #{} · {} · exit code {}",
+        "{}\n### {icon} {} {}\n\nRun #{} · {} · exit code {}",
         github::marker(&run.job),
-        title(run),
+        text::code_span(&title(run)),
         outcome(run),
         run.id,
         duration(run.duration_ms().unwrap_or(0)),
         run.exit_code.map_or("unknown".into(), |c| c.to_string()),
     );
     if let Some(error) = &run.error {
-        body.push_str(&format!("\n\n> {error}"));
+        body.push_str(&format!("\n\n> {}", text::code_span(error)));
     }
     if !tail.is_empty() {
-        // A fence longer than any run of backticks in the log keeps it intact.
-        let longest = tail.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-        let fence = "`".repeat(longest.max(2) + 1);
+        let fence = text::code_fence(tail);
         body.push_str(&format!(
             "\n\n<details><summary>Last {TAIL_LINES} lines of the log</summary>\n\n{fence}text\n{tail}\n{fence}\n\n</details>"
         ));
@@ -182,6 +183,38 @@ mod tests {
         assert_eq!(clock(now, now).len(), "14:05".len());
         assert_eq!(clock(now + 3 * 86_400_000, now).len(), "Fri 14:05".len());
         assert_eq!(clock(now + 20 * 86_400_000, now).split(' ').count(), 3);
+    }
+
+    #[test]
+    fn comments_show_args_and_errors_as_code_only() {
+        let run = Run {
+            id: 1,
+            project: "p".into(),
+            repo: "o/r".into(),
+            job: "ck3-test".into(),
+            args: vec!["x` [click](https://e.vil) @org/team `".into()],
+            resource: "ck3".into(),
+            worktree: "/wt".into(),
+            branch: None,
+            argv: Vec::new(),
+            submitter: "cli".into(),
+            session: None,
+            state: RunState::Failed,
+            submitted_at: 0,
+            started_at: Some(0),
+            ended_at: Some(0),
+            pid: None,
+            pid_started: None,
+            exit_code: None,
+            error: Some("starting x\n\n<img src=x>".into()),
+            log_path: "/log".into(),
+        };
+        let body = comment_body(&run, "");
+        assert!(
+            body.contains("### ❌ `` ck3-test x` [click](https://e.vil) @org/team ` `` failed"),
+            "{body}"
+        );
+        assert!(body.contains("> `starting x  <img src=x>`"), "{body}");
     }
 
     #[test]

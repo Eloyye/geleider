@@ -147,6 +147,12 @@ does not pass start context, so OpenCode Sessions are not warned.
 A thread in the daemon asks `gh` for each Claim's issue every 2 minutes and
 ends the Claims whose issue has closed. Nothing else ends a Claim.
 
+The holder's branch is the one piece of a Claim that a Session names freely,
+and it reaches GitHub (as the user) and other Sessions' context. It is shown
+only as inline code of ASCII letters, digits and `-_./+#`, with any other
+character as `?`, cut at 100 characters. Session ids are already restricted,
+and repository names must be exactly `owner/name`.
+
 ## Verification
 
 Run the checks used by CI:

@@ -2,10 +2,15 @@
 //! comment per Job per PR, edited in place on later Runs), and the issue
 //! assignments and comments that show Claims.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+
+use crate::command;
+
+/// How long one `gh` call may take before it is killed.
+const GH_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What geleider needs from GitHub, so tests can stand in for `gh`.
 pub trait GitHub {
@@ -54,6 +59,22 @@ impl Issue {
     }
 }
 
+/// A repository name is put into GitHub API paths, so it must be exactly
+/// `owner/name`, with nothing such as `..` that could change the path.
+pub fn check_repo(repo: &str) -> Result<()> {
+    let part = |p: &str| {
+        !p.is_empty()
+            && p != "."
+            && p != ".."
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    match repo.split_once('/') {
+        Some((owner, name)) if part(owner) && part(name) => Ok(()),
+        _ => bail!("`{repo}` is not a GitHub repository (expected owner/name)"),
+    }
+}
+
 /// The hidden first line that marks a Job's result comment.
 pub fn marker(job: &str) -> String {
     format!("<!-- geleider:job={job} -->")
@@ -99,21 +120,12 @@ pub struct Gh;
 
 impl Gh {
     fn run(&self, args: &[&str], input: Option<&str>) -> Result<String> {
-        let mut child = Command::new("gh")
-            .args(args)
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("running gh (is the GitHub CLI installed and on PATH?)")?;
-        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-            stdin.write_all(input.as_bytes())?;
-        }
-        let output = child.wait_with_output()?;
+        let output = command::output_within(
+            Command::new("gh").args(args),
+            input.map(str::as_bytes),
+            GH_TIMEOUT,
+        )
+        .context("is the GitHub CLI installed and on PATH?")?;
         if !output.status.success() {
             bail!(
                 "gh {}: {}",

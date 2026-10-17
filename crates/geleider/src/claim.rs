@@ -10,9 +10,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::github::GitHub;
+use crate::github::{self, GitHub};
 use crate::report;
 use crate::session::{Session, SessionKey, SessionState};
+use crate::text;
 
 /// How long a holder may be quiet before `geleider status` flags its Claim.
 pub const QUIET_AFTER: Duration = Duration::from_secs(24 * 3600);
@@ -44,19 +45,19 @@ impl Claim {
         format!("{}#{}", self.repo, self.issue)
     }
 
-    /// e.g. `Codex session 019a… on `codex/issue-5-x``.
+    /// e.g. ``Codex session 019a… on `codex/issue-5-x` ``. It is posted on GitHub
+    /// and shown to other Sessions, so the branch, which the holder named, is
+    /// shown only through [`text::branch`]. The id is checked by [`SessionKey`].
     pub fn holder(&self) -> String {
         format!(
             "{} session {} on {}",
             self.session.harness.name(),
             self.session.id,
-            branch(self.branch.as_deref())
+            self.branch
+                .as_deref()
+                .map_or("a detached HEAD".into(), text::branch)
         )
     }
-}
-
-fn branch(branch: Option<&str>) -> String {
-    branch.map_or("a detached HEAD".into(), |b| format!("`{b}`"))
 }
 
 /// A Claim as `geleider status` shows it.
@@ -101,33 +102,18 @@ impl IssueRef {
             Some((_, number)) => (None, number),
             None => (None, text),
         };
-        let number = match number.parse::<u64>() {
-            Ok(n) if n > 0 => n,
+        // GitHub numbers fit in 32 bits, and SQLite stores them as i64.
+        let number = match number.parse::<u32>() {
+            Ok(n) if n > 0 => u64::from(n),
             _ => bail!("`{text}` is not an issue: use a number such as 5, #5 or owner/name#5"),
         };
         if let Some(repo) = repo {
-            check_repo(repo)?;
+            github::check_repo(repo)?;
         }
         Ok(Self {
             repo: repo.map(str::to_string),
             number,
         })
-    }
-}
-
-/// A repository name is put into GitHub API paths, so it must be exactly
-/// `owner/name`, with nothing that could change the path.
-pub fn check_repo(repo: &str) -> Result<()> {
-    let part = |p: &str| {
-        !p.is_empty()
-            && p != "."
-            && p != ".."
-            && p.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    };
-    match repo.split_once('/') {
-        Some((owner, name)) if part(owner) && part(name) => Ok(()),
-        _ => bail!("`{repo}` is not a GitHub repository (expected owner/name)"),
     }
 }
 
@@ -233,9 +219,10 @@ pub fn start_warning(snapshot: &Path, session: &SessionKey, cwd: &Path) -> Optio
         return None;
     }
     Some(format!(
-        "geleider: this Session's branch `{branch}` names an issue another Session holds:\n{}\n\
+        "geleider: this Session's branch {} names an issue another Session holds:\n{}\n\
          Only one Session works on an issue at a time. Don't work on it here; tell the user and \
          ask what to do. (This is a warning from geleider's start hook; nothing was claimed.)",
+        text::branch(&branch),
         held.join("\n")
     ))
 }
@@ -447,6 +434,20 @@ mod tests {
             gh.comments.borrow()[1],
             "Claim released (was held by Claude Code session abc on `feat/x`)."
         );
+    }
+
+    #[test]
+    fn a_holders_branch_cannot_carry_text_to_other_sessions_or_github() {
+        let mut held = claim(Path::new("/g"), 5, key(Harness::Codex, "abc"));
+        held.branch = Some("x`_[link](https://e.vil)_@team\"SYSTEM:".into());
+        let holder = held.holder();
+        assert_eq!(
+            holder,
+            "Codex session abc on `x?_?link??https?//e.vil?_?team?SYSTEM?`"
+        );
+        assert!(held_by(&held).contains(&holder));
+        held.branch = None;
+        assert!(held.holder().ends_with("on a detached HEAD"));
     }
 
     #[test]

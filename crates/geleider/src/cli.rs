@@ -13,6 +13,7 @@ use crate::protocol::{self, Request, RunInfo, Status};
 use crate::report;
 use crate::session::{Harness, SessionKey, SessionState};
 use crate::store::{RunState, now_ms};
+use crate::text;
 use crate::usage::{SubscriptionUsage, WindowView};
 
 /// Finished Runs `geleider queue --all` shows.
@@ -146,12 +147,14 @@ pub fn usage(paths: &Paths, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// Prints `value` as JSON for scripts, or `text` for people.
+/// Prints `value` as JSON for scripts, or `text` for people. Branches, paths,
+/// args and logs in `text` come from Sessions, so terminal escapes in them are
+/// dropped; JSON escapes them itself.
 fn print_as(json: bool, value: &impl Serialize, text: impl FnOnce() -> String) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(value)?);
     } else {
-        print!("{}", text());
+        print!("{}", text::printable(&text()));
     }
     Ok(())
 }

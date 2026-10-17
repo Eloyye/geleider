@@ -26,6 +26,8 @@ impl Nonce {
     /// A fresh nonce from the system's random source; `None` if it is unavailable.
     pub fn generate() -> Option<Self> {
         let mut bytes = [0u8; NONCE_BYTES];
+        // The standard library has no stable secure random source; getentropy is
+        // the system's, and cannot fail for a buffer of at most 256 bytes.
         // SAFETY: `bytes` is a valid, writable buffer of the length passed.
         let filled = unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } == 0;
         filled.then(|| Self(bytes.iter().map(|b| format!("{b:02x}")).collect()))

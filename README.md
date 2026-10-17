@@ -55,7 +55,9 @@ A Run executes outside any sandbox, in the submitting Session's worktree. geleid
 - A Run only starts in the Project's clone or in a worktree that clone has registered (`git worktree list`). A directory merely pointed at the clone's repository through a hand-written `.git` file is refused.
 - geleider runs git in the caller's directory with `core.fsmonitor` and hooks switched off, so repository settings an agent wrote cannot run commands.
 - geleider's state directory, socket and Run logs are readable only by you. `install` writes Harness configs, which can hold credentials, without ever making them readable by others, and never writes through a symlink planted at its temp or backup file.
-- When `pr_comments` is on, the last 40 lines of each Run's log are posted to the PR. Don't print secrets in Jobs on repositories others can read.
+- When `pr_comments` is on, the last 40 lines of each Run's log are posted to the PR. Don't print secrets in Jobs on repositories others can read. Job args, errors and the log appear there only as code, so a Session cannot make them links, mentions or HTML posted as you.
+- Job args with control or invisible characters are refused, and `geleider status`, `queue`, `show` and error messages drop terminal escapes from paths, branches and logs, so a Session cannot write escape sequences into your terminal.
+- Every `git`, `gh` and `codex` call has a deadline (10 s, 30 s and 5 s), so one that hangs cannot stall Session tracking, Claims or delivery.
 
 If the background process restarts while a Run is running, the Run keeps its Lease until its process exits. It then ends as `lost`, since its exit code is unknown; its log is complete.
 

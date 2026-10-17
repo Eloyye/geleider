@@ -1,6 +1,7 @@
 mod attest;
 mod claim;
 mod cli;
+mod command;
 mod config;
 mod daemon;
 mod delivery;
@@ -18,6 +19,7 @@ mod report;
 mod session;
 mod statusline;
 mod store;
+mod text;
 mod usage;
 
 use anyhow::Result;
@@ -133,7 +135,8 @@ fn main() {
     let code = match run(Cli::parse()) {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("geleider: {err:#}");
+            // Errors can quote paths and branches a Session chose.
+            eprintln!("geleider: {}", text::printable(&format!("{err:#}")));
             1
         }
     };
