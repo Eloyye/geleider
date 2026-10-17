@@ -61,7 +61,18 @@ fn forward(paths: &Paths, harness: Harness, event: &str) -> Result<()> {
         reply("SessionStart", "additionalContext", json!(warning));
     }
     match session::activity(harness, event, &input) {
-        Some(activity) => send(paths, &Datagram::Activity(activity)),
+        Some(mut activity) => {
+            // A headless Cross-review has one process-owned Session even when
+            // installed Harness hooks emit a second native id. Only activity is
+            // coalesced; this never changes an attested result destination.
+            if let Ok(id) = std::env::var("GELEIDER_REVIEW_SESSION")
+                && let Some(key) = session::SessionKey::new(harness, &id)
+            {
+                activity.key = key;
+                activity.review = true;
+            }
+            send(paths, &Datagram::Activity(activity))
+        }
         None => Ok(()),
     }
 }

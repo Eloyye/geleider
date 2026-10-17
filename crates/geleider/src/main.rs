@@ -18,6 +18,7 @@ mod paths;
 mod procs;
 mod protocol;
 mod report;
+mod review;
 mod session;
 mod statusline;
 mod store;
@@ -81,6 +82,17 @@ enum Cmd {
     },
     /// List Finished worktrees and remove them only after explicit confirmation.
     Clean,
+    /// Cross-review a PR with the other vendor, after showing usage and confirming.
+    Review {
+        /// PR number, #number, or a GitHub PR URL in the current Project.
+        pr: String,
+        /// Required when the writing Session's vendor is unknown.
+        #[arg(long, value_enum)]
+        with: Option<review::Reviewer>,
+        /// Start after displaying usage without waiting for a confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Claim an issue for the Session working in this worktree: assigns it to you
     /// on GitHub and comments naming the Session. Fails, naming the holder, if
     /// another Session holds it or it is assigned already.
@@ -167,6 +179,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Queue { all, json } => cli::queue(&paths, all, json),
         Cmd::Status { json } => cli::status(&paths, json),
         Cmd::Clean => cli::clean(&paths),
+        Cmd::Review { pr, with, yes } => review::run(&paths, &pr, with, yes),
         Cmd::Claim { issue, json } => cli::claim(&paths, &issue, json),
         Cmd::Release { issue, force, json } => cli::release(&paths, &issue, force, json),
         // Handled above, before anything that can fail.

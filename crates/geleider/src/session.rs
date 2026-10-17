@@ -115,6 +115,12 @@ pub struct Session {
     pub owner_pid: Option<u32>,
     #[serde(default)]
     pub owner_started: Option<String>,
+    /// OpenCode's selected provider; the other Harnesses have a fixed vendor.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// Cross-review Sessions never identify a PR's writing vendor.
+    #[serde(default)]
+    pub review: bool,
 }
 
 impl Session {
@@ -135,6 +141,8 @@ impl Session {
                 next.owner_pid = previous.owner_pid;
                 next.owner_started = previous.owner_started;
             }
+            next.provider_id = next.provider_id.or(previous.provider_id);
+            next.review |= previous.review;
             if !activity.reset {
                 next.pending_prompts = previous.pending_prompts;
             }
@@ -183,6 +191,10 @@ pub struct Activity {
     pub resolved: Option<String>,
     pub reset: bool,
     pub owner_pid: Option<u32>,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub review: bool,
 }
 
 pub fn activity(harness: Harness, event: &str, input: &Value) -> Option<Activity> {
@@ -210,6 +222,7 @@ pub fn activity(harness: Harness, event: &str, input: &Value) -> Option<Activity
                 SessionState::Working
             }
         }
+        "message.updated" | "session.step.started" => SessionState::Working,
         "UserPromptSubmit" | "PostToolUse" | "PostToolUseFailure" | "permission.replied"
         | "form.replied" | "form.cancelled" | "tool.after" => SessionState::Working,
         "session.status" => match input["status"]["type"].as_str()? {
@@ -244,6 +257,8 @@ pub fn activity(harness: Harness, event: &str, input: &Value) -> Option<Activity
         wait_for,
         resolved,
         owner_pid: owner_pid(input),
+        provider_id: input["provider_id"].as_str().map(str::to_owned),
+        review: false,
         reset: matches!(state, SessionState::Idle | SessionState::Ended)
             || event == "UserPromptSubmit",
     })
@@ -362,8 +377,29 @@ mod tests {
             pending_prompts: Vec::new(),
             owner_pid: None,
             owner_started: None,
+            provider_id: None,
+            review: false,
         };
         (session, activity)
+    }
+
+    #[test]
+    fn provider_and_review_metadata_survive_ordinary_hooks_and_old_records() {
+        let input = json!({"session_id":"s","cwd":"/wt","provider_id":"openai"});
+        let activity = activity(Harness::Opencode, "session.step.started", &input).unwrap();
+        assert_eq!(activity.provider_id.as_deref(), Some("openai"));
+        let (mut previous, _) = event(input.clone(), "UserPromptSubmit");
+        previous.provider_id = activity.provider_id;
+        previous.review = true;
+        let (next, activity) = event(input, "Stop");
+        let next = Session::after(Some(previous), next, &activity).unwrap();
+        assert_eq!(next.provider_id.as_deref(), Some("openai"));
+        assert!(next.review);
+        let mut old = serde_json::to_value(next).unwrap();
+        old.as_object_mut().unwrap().remove("review");
+        old.as_object_mut().unwrap().remove("provider_id");
+        let old: Session = serde_json::from_value(old).unwrap();
+        assert!(!old.review && old.provider_id.is_none());
     }
 
     #[test]

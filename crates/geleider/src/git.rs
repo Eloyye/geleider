@@ -90,7 +90,7 @@ fn git<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<Output> {
 }
 
 /// git's output, or its error message if it failed.
-fn git_stdout<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<String> {
+pub(crate) fn git_stdout<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<String> {
     let output = git(dir, args)?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());

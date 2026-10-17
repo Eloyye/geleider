@@ -606,6 +606,8 @@ mod tests {
             pending_prompts: Vec::new(),
             owner_pid: None,
             owner_started: None,
+            provider_id: None,
+            review: false,
         };
         store
             .update_session(&session("old-ended", SessionState::Ended, 10))

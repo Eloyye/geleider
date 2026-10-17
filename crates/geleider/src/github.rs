@@ -225,7 +225,7 @@ impl PullRequests for Gh {
 }
 
 impl Gh {
-    fn run(&self, args: &[&str], input: Option<&str>) -> Result<String> {
+    pub(crate) fn run(&self, args: &[&str], input: Option<&str>) -> Result<String> {
         let output = command::output_within(
             Command::new("gh").args(args),
             input.map(str::as_bytes),

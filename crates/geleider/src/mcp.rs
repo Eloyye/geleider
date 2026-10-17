@@ -167,6 +167,7 @@ impl Server {
             _ => bail!("unknown tool `{name}`"),
         };
         let value = match call(&request)? {
+            Reply::Recorded => json!({ "recorded": true }),
             Reply::Run(run) => serde_json::to_value(*run)?,
             Reply::Runs { runs } => json!({ "runs": runs }),
             Reply::Status(status) => serde_json::to_value(status)?,

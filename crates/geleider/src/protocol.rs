@@ -14,13 +14,17 @@ use crate::claim::{Claim, ClaimStatus, IssueRef};
 use crate::cleanup::{Cleaned, FinishedWorktree, Inventory};
 use crate::lease::Holder;
 use crate::paths::Paths;
-use crate::session::{Session, SessionKey};
+use crate::session::{Activity, Session, SessionKey};
 use crate::store::Run;
 use crate::usage::{Reading, Subscription, SubscriptionUsage};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
+    /// Synchronous lifecycle tracking for an explicitly requested Cross-review.
+    ReviewActivity {
+        activity: Activity,
+    },
     /// Queue a Run of `job` in the worktree containing `cwd`.
     Submit {
         cwd: PathBuf,
@@ -79,6 +83,7 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum Reply {
+    Recorded,
     Run(Box<RunInfo>),
     Runs {
         runs: Vec<RunInfo>,
@@ -234,6 +239,7 @@ impl Reply {
 
     fn unexpected<T>(&self) -> Result<T> {
         let kind = match self {
+            Reply::Recorded => "recorded",
             Reply::Run(_) => "run",
             Reply::Runs { .. } => "runs",
             Reply::Status(_) => "status",
