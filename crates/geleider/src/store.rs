@@ -143,6 +143,10 @@ impl Store {
                  delivered    INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS runs_by_state ON runs (state, id);
+             CREATE TABLE IF NOT EXISTS ci_failures (
+                 repo TEXT NOT NULL, pr INTEGER NOT NULL, failure TEXT NOT NULL,
+                 PRIMARY KEY (repo, pr, failure)
+             );
              CREATE TABLE IF NOT EXISTS usage (
                  subscription   TEXT NOT NULL,
                  minutes        INTEGER NOT NULL,
@@ -178,6 +182,14 @@ impl Store {
         )?;
         std::fs::create_dir_all(&logs)?;
         Ok(Self { conn, logs })
+    }
+
+    /// Claims a CI failure once, including across daemon restarts.
+    pub fn new_ci_failure(&self, repo: &str, pr: u64, failure: &str) -> Result<bool> {
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO ci_failures (repo, pr, failure) VALUES (?1, ?2, ?3)",
+            params![repo, pr, failure],
+        )? == 1)
     }
 
     pub fn insert(&self, run: NewRun) -> Result<Run> {

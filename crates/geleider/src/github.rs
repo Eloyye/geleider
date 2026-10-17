@@ -1,13 +1,88 @@
-//! GitHub through `gh`: posting a Run's result on its branch's open PR (one
-//! comment per Job per PR, edited in place on later Runs), and the issue
-//! assignments and comments that show Claims.
+//! GitHub through `gh`: branch PR history and CI checks, posting a Run's result
+//! on its branch's open PR (one comment per Job per PR, edited in place on later
+//! Runs), and the issue assignments and comments that show Claims.
 
+use std::collections::BTreeMap;
 use std::process::Command;
-use std::time::Duration;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::command;
+
+/// Branch PR history, shared by CI watching and Finished-worktree discovery.
+pub trait PullRequests {
+    fn pull_requests(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>>;
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequest {
+    pub number: u64,
+    pub state: PrState,
+    pub head_ref_oid: String,
+    pub is_cross_repository: bool,
+    pub url: String,
+    #[serde(default)]
+    pub status_check_rollup: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum PrState {
+    Open,
+    Closed,
+    Merged,
+}
+
+impl std::fmt::Display for PrState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PrState::Open => "open",
+            PrState::Closed => "closed",
+            PrState::Merged => "merged",
+        })
+    }
+}
+
+type CachedPrs = (Instant, std::result::Result<Vec<PullRequest>, String>);
+
+/// Status polling shares this cache with CI watching, including failed queries,
+/// so frequent `status` calls do not repeatedly query GitHub while it is offline.
+#[derive(Default)]
+pub struct CachedPullRequests {
+    entries: Mutex<BTreeMap<(String, String), CachedPrs>>,
+}
+
+impl CachedPullRequests {
+    fn entries(&self) -> MutexGuard<'_, BTreeMap<(String, String), CachedPrs>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl PullRequests for CachedPullRequests {
+    fn pull_requests(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>> {
+        let key = (repo.to_string(), branch.to_string());
+        let cached = {
+            let mut entries = self.entries();
+            entries.retain(|_, (at, _)| at.elapsed() < crate::ci::INTERVAL);
+            entries.get(&key).map(|(_, result)| result.clone())
+        };
+        // `gh` runs without the lock, so one slow query holds up no other branch.
+        let result = cached.unwrap_or_else(|| {
+            let fetched = Gh
+                .pull_requests(repo, branch)
+                .map_err(|err| format!("{err:#}"));
+            self.entries()
+                .insert(key, (Instant::now(), fetched.clone()));
+            fetched
+        });
+        result.map_err(anyhow::Error::msg)
+    }
+}
 
 /// How long one `gh` call may take before it is killed.
 const GH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -117,6 +192,37 @@ pub fn post_result(
 
 /// [`GitHub`] through the `gh` command, signed in as the user.
 pub struct Gh;
+
+impl PullRequests for Gh {
+    fn pull_requests(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>> {
+        let out = self.run(
+            &[
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--limit",
+                "100",
+                "--json",
+                "number,state,headRefOid,isCrossRepository,url,statusCheckRollup",
+            ],
+            None,
+        )?;
+        let prs: Vec<PullRequest> = serde_json::from_str(&out).context("decoding branch PRs")?;
+        // A truncated history cannot prove that there is no open PR for cleanup.
+        if prs.len() >= 100 {
+            bail!("too many PRs for branch `{branch}` to inspect safely");
+        }
+        Ok(prs
+            .into_iter()
+            .filter(|pr| !pr.is_cross_repository)
+            .collect())
+    }
+}
 
 impl Gh {
     fn run(&self, args: &[&str], input: Option<&str>) -> Result<String> {

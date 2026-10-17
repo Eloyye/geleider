@@ -1,12 +1,14 @@
 //! The command-line side of submitting and checking Runs, and of Claims.
 
-use std::path::PathBuf;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::claim::{ClaimStatus, IssueRef};
+use crate::cleanup::Inventory;
 use crate::lease::Holder;
 use crate::paths::{self, Paths};
 use crate::protocol::{self, Request, RunInfo, Status};
@@ -109,6 +111,84 @@ pub fn status(paths: &Paths, json: bool) -> Result<i32> {
     let status = protocol::call(paths, &Request::Status)?.into_status()?;
     print_as(json, &status, || render_status(&status))?;
     Ok(0)
+}
+
+pub fn clean(paths: &Paths) -> Result<i32> {
+    // A fresh scan may query several Projects; leave time for those network calls.
+    let timeout = Duration::from_secs(300);
+    let mut inventory =
+        protocol::call_within(paths, &Request::FinishedWorktrees, timeout)?.into_worktrees()?;
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    inventory
+        .finished_worktrees
+        .retain(|w| !cwd.starts_with(&w.worktree));
+    print!("{}", render_finished(&inventory));
+    if inventory.finished_worktrees.is_empty() {
+        return Ok(0);
+    }
+    print!(
+        "\nRemove these {} worktrees? [y/N] ",
+        inventory.finished_worktrees.len()
+    );
+    std::io::stdout().flush()?;
+    if !confirmed(&mut std::io::stdin().lock())? {
+        println!("Cancelled; no worktrees removed.");
+        return Ok(0);
+    }
+    let cleaned = protocol::call_within(
+        paths,
+        &Request::Clean {
+            worktrees: inventory.finished_worktrees,
+            cwd,
+        },
+        timeout,
+    )?
+    .into_cleaned()?;
+    for path in &cleaned.removed {
+        println!("Removed {}", shown_path(path));
+    }
+    for reason in &cleaned.skipped {
+        eprintln!("Skipped {}", text::one_line(reason));
+    }
+    Ok(i32::from(!cleaned.skipped.is_empty()))
+}
+
+fn confirmed(input: &mut impl BufRead) -> Result<bool> {
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn render_finished(inventory: &Inventory) -> String {
+    let mut out = String::from("Finished worktrees\n");
+    if inventory.cleanup_pending {
+        out.push_str("  (still being checked; `geleider clean` checks now)\n");
+    } else if inventory.finished_worktrees.is_empty() {
+        out.push_str("  (none)\n");
+    }
+    // Worktree paths and branch names are chosen by Sessions and are shown before
+    // a confirmation prompt, so each stays on its own line with no escapes.
+    for wt in &inventory.finished_worktrees {
+        out.push_str(&format!(
+            "  {}  {}  PR #{} ({})  {}\n",
+            wt.project,
+            text::one_line(&wt.branch),
+            wt.pr,
+            wt.pr_state,
+            shown_path(&wt.worktree)
+        ));
+    }
+    for warning in &inventory.cleanup_warnings {
+        out.push_str(&format!("  Could not check {}\n", text::one_line(warning)));
+    }
+    out
+}
+
+fn shown_path(path: &Path) -> String {
+    text::one_line(&paths::display(path))
 }
 
 /// Claims `issue` for the Session working in this worktree. The CLI names no
@@ -237,6 +317,8 @@ fn render_status(status: &Status) -> String {
         out.push('\n');
         out.push_str(&render_usage(&status.subscriptions, now_ms()));
     }
+    out.push('\n');
+    out.push_str(&render_finished(&status.finished));
     out
 }
 
@@ -383,5 +465,20 @@ pub fn parse_run_id(text: &str) -> Result<i64> {
     match text.trim_start_matches('#').parse() {
         Ok(id) => Ok(id),
         Err(_) => bail!("`{text}` is not a run id"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_requires_an_explicit_yes() {
+        for answer in ["", "\n", "no\n", "maybe\n", "true\n"] {
+            assert!(!confirmed(&mut answer.as_bytes()).unwrap());
+        }
+        for answer in ["y\n", "yes\n", "YES\n"] {
+            assert!(confirmed(&mut answer.as_bytes()).unwrap());
+        }
     }
 }

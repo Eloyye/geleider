@@ -1,5 +1,7 @@
 mod attest;
+mod ci;
 mod claim;
+mod cleanup;
 mod cli;
 mod command;
 mod config;
@@ -71,11 +73,14 @@ enum Cmd {
         json: bool,
     },
     /// Sessions by Project, Claims, Resources and their holders, running and queued
-    /// Runs, and how much of each Subscription is used in each Limit window.
+    /// Runs, how much of each Subscription is used in each Limit window, and
+    /// Finished worktrees.
     Status {
         #[arg(long)]
         json: bool,
     },
+    /// List Finished worktrees and remove them only after explicit confirmation.
+    Clean,
     /// Claim an issue for the Session working in this worktree: assigns it to you
     /// on GitHub and comments naming the Session. Fails, naming the holder, if
     /// another Session holds it or it is assigned already.
@@ -161,6 +166,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Wait { id, json } => cli::wait_for(&paths, cli::parse_run_id(&id)?, json),
         Cmd::Queue { all, json } => cli::queue(&paths, all, json),
         Cmd::Status { json } => cli::status(&paths, json),
+        Cmd::Clean => cli::clean(&paths),
         Cmd::Claim { issue, json } => cli::claim(&paths, &issue, json),
         Cmd::Release { issue, force, json } => cli::release(&paths, &issue, force, json),
         // Handled above, before anything that can fail.

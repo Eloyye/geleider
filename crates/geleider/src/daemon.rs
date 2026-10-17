@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
@@ -21,7 +21,7 @@ use crate::claim::{self, ClaimStatus};
 use crate::config::{Config, ConfigCache};
 use crate::delivery::{self, Retries};
 use crate::git;
-use crate::github::{self, Gh, GitHub, Posted};
+use crate::github::{self, CachedPullRequests, Gh, GitHub, Posted, PullRequests};
 use crate::hook::{Datagram, MAX_DATAGRAM_BYTES};
 use crate::lease::{self, Lease, QueuedRun, RunningRun};
 use crate::paths::{self, Paths};
@@ -30,7 +30,9 @@ use crate::protocol::{self, Reply, Request, ResourceStatus, RunInfo, Status};
 use crate::report::{self, MacNotifier, Notifier, TAIL_LINES};
 use crate::session::{Activity, Harness, Session, SessionState};
 use crate::store::{NewRun, Run, RunState, Store, now_ms};
+use crate::text;
 use crate::usage::{self, Reading, ResetCheck, Subscription, SubscriptionUsage, Window};
+use crate::{ci, cleanup};
 
 /// How often the background process reads Codex's session logs and looks for
 /// Limit windows that have reset.
@@ -50,6 +52,9 @@ const ATTESTATION_TTL: Duration = Duration::from_secs(10 * 60);
 const ATTESTATION_WAIT: Duration = Duration::from_millis(500);
 /// Activity datagrams waiting to be recorded; more are dropped, like a full socket.
 const ACTIVITY_BACKLOG: usize = 256;
+/// How long `status` waits for the Finished-worktree scan it starts. A slower
+/// scan finishes in the background and the reply shows the one before it.
+const STATUS_SCAN_WAIT: Duration = Duration::from_secs(2);
 
 /// Locks `mutex` even if a thread panicked while holding it. The state behind
 /// geleider's locks lives in SQLite or is rebuilt from the process table, so one
@@ -88,6 +93,8 @@ pub fn run(paths: Paths) -> Result<()> {
         attestations: Attestations::new(attestation_ttl()),
         notifier: Box::new(MacNotifier),
         github: Box::new(Gh),
+        prs: CachedPullRequests::default(),
+        scan: Scan::default(),
         claims_file: paths.claims(),
         claim_quiet: env_ms("GELEIDER_CLAIM_QUIET_MS").unwrap_or(claim::QUIET_AFTER),
     });
@@ -100,6 +107,8 @@ pub fn run(paths: Paths) -> Result<()> {
     std::thread::spawn(move || delivery.delivery_loop());
     let scheduler = Arc::clone(&daemon);
     std::thread::spawn(move || scheduler.schedule_loop());
+    let ci = Arc::clone(&daemon);
+    std::thread::spawn(move || ci.ci_loop());
     let claims = Arc::clone(&daemon);
     std::thread::spawn(move || claims.claims_loop());
 
@@ -124,6 +133,8 @@ struct Daemon {
     attestations: Attestations,
     notifier: Box<dyn Notifier>,
     github: Box<dyn GitHub + Send + Sync>,
+    prs: CachedPullRequests,
+    scan: Scan,
     /// Where start hooks read every Claim.
     claims_file: PathBuf,
     /// How long a holder may be quiet before its Claim is flagged.
@@ -148,6 +159,30 @@ impl Core {
         let held = lease::leases(&config.resources, &running, snapshot);
         Ok((config, held))
     }
+
+    /// The current config with every Session and Run: what decides whether a
+    /// worktree is still in use.
+    fn worktree_users(&mut self) -> Result<(Config, Vec<Session>, Vec<Run>)> {
+        Ok((
+            self.config.get()?.clone(),
+            self.store.sessions()?,
+            self.store.list(0)?,
+        ))
+    }
+}
+
+/// The latest Finished-worktree scan for `status`, which runs `git` in every
+/// worktree and may wait on GitHub, so it never holds up the reply.
+#[derive(Default)]
+struct Scan {
+    state: Mutex<ScanState>,
+    done: Condvar,
+}
+
+#[derive(Default)]
+struct ScanState {
+    latest: Option<cleanup::Inventory>,
+    running: bool,
 }
 
 /// Something that happened to a Run that people should hear about.
@@ -158,6 +193,120 @@ enum Event {
 }
 
 impl Daemon {
+    fn ci_loop(&self) {
+        let mut poller = ci::Poller::default();
+        loop {
+            if let Err(err) = self.poll_ci(&mut poller) {
+                eprintln!("geleider: checking CI: {err:#}");
+            }
+            std::thread::sleep(ci::TICK);
+        }
+    }
+
+    fn poll_ci(&self, poller: &mut ci::Poller) -> Result<()> {
+        let (config, sessions) = {
+            let mut core = lock(&self.core);
+            (core.config.get()?.clone(), core.store.sessions()?)
+        };
+        if !config.notifications {
+            return Ok(());
+        }
+        let Some((repo, branch)) = poller.next(&config, &sessions, Instant::now(), ci::INTERVAL)
+        else {
+            return Ok(());
+        };
+        // Network calls never hold the queue/Session lock.
+        for pr in self.prs.pull_requests(&repo, &branch)? {
+            for failure in ci::failures(&pr) {
+                let new = lock(&self.core)
+                    .store
+                    .new_ci_failure(&repo, pr.number, &failure.id)?;
+                if new {
+                    // Branch and check names are chosen by Sessions and workflows.
+                    self.notifier.notify(
+                        &format!("geleider: CI failed on {repo} #{}", pr.number),
+                        &format!(
+                            "{}: {}\n{}",
+                            text::one_line(&branch),
+                            text::one_line(&failure.name),
+                            pr.url
+                        ),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finished worktrees, rechecked against Sessions and Runs recorded while
+    /// GitHub was being asked. `fresh` skips the PR cache, as removal requires.
+    fn finished(&self, fresh: bool) -> Result<cleanup::Inventory> {
+        let (config, sessions, runs) = lock(&self.core).worktree_users()?;
+        let github: &dyn PullRequests = if fresh { &Gh } else { &self.prs };
+        let mut inventory = cleanup::discover(&config, &sessions, &runs, github);
+        let (config, sessions, runs) = lock(&self.core).worktree_users()?;
+        inventory
+            .finished_worktrees
+            .retain(|wt| cleanup::validate(&config, &sessions, &runs, wt).is_ok());
+        Ok(inventory)
+    }
+
+    /// Starts a cached scan unless one is running, then returns the newest
+    /// complete scan within [`STATUS_SCAN_WAIT`].
+    fn recent_finished(self: &Arc<Self>) -> cleanup::Inventory {
+        let mut state = lock(&self.scan.state);
+        if !state.running {
+            state.running = true;
+            let daemon = Arc::clone(self);
+            std::thread::spawn(move || {
+                let inventory = daemon
+                    .finished(false)
+                    .unwrap_or_else(|err| cleanup::Inventory {
+                        cleanup_warnings: vec![format!("worktrees: {err:#}")],
+                        ..Default::default()
+                    });
+                let mut state = lock(&daemon.scan.state);
+                state.latest = Some(inventory);
+                state.running = false;
+                daemon.scan.done.notify_all();
+            });
+        }
+        let (state, _) = self
+            .scan
+            .done
+            .wait_timeout_while(state, STATUS_SCAN_WAIT, |s| s.running)
+            .unwrap_or_else(PoisonError::into_inner);
+        state.latest.clone().unwrap_or_else(|| cleanup::Inventory {
+            cleanup_pending: true,
+            ..Default::default()
+        })
+    }
+
+    /// Removes the worktrees the user confirmed that are still Finished now.
+    fn clean(&self, worktrees: Vec<cleanup::FinishedWorktree>, cwd: &Path) -> Result<Reply> {
+        // Refresh GitHub after the user confirms; no cached PR state authorizes removal.
+        let current = self.finished(true)?;
+        let mut cleaned = cleanup::Cleaned::default();
+        for approved in worktrees {
+            let path = approved.worktree.display().to_string();
+            if !current.finished_worktrees.contains(&approved) {
+                cleaned.skipped.push(format!(
+                    "{path}: no longer a Finished worktree (or PR state unavailable)"
+                ));
+                continue;
+            }
+            // Holding the lock serializes the final check and removal with
+            // incoming Session and Run records; no GitHub call happens under it.
+            let mut core = lock(&self.core);
+            let (config, sessions, runs) = core.worktree_users()?;
+            match cleanup::remove(&config, &sessions, &runs, &approved, cwd) {
+                Ok(()) => cleaned.removed.push(approved.worktree),
+                Err(err) => cleaned.skipped.push(format!("{path}: {err:#}")),
+            }
+        }
+        Ok(Reply::Cleaned(cleaned))
+    }
+
     /// Records hook datagrams. Any process of this user can write to the socket,
     /// so each datagram is validated again here, not only by the hook.
     /// Attestations are taken at once; activity, which runs git, is recorded in
@@ -495,6 +644,8 @@ impl Daemon {
 
     fn handle(self: &Arc<Self>, request: Request) -> Result<Reply> {
         match request {
+            Request::FinishedWorktrees => Ok(Reply::Worktrees(self.finished(true)?)),
+            Request::Clean { worktrees, cwd } => self.clean(worktrees, &cwd),
             Request::Submit {
                 cwd,
                 job,
@@ -588,12 +739,18 @@ impl Daemon {
             })
             .collect();
         drop(core);
+        let mut finished = self.recent_finished();
+        // The scan may predate a Session or Run that started in a worktree since.
+        finished
+            .finished_worktrees
+            .retain(|wt| !cleanup::busy(&wt.worktree, &sessions, &runs));
         Ok(Reply::Status(Status {
             sessions,
             claims,
             resources,
             runs: runs.into_iter().map(|r| info(r, &queued, false)).collect(),
             subscriptions: self.usage()?,
+            finished,
         }))
     }
 
