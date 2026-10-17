@@ -13,6 +13,8 @@ struct Env {
     dir: tempfile::TempDir,
     game: String,
     daemon: Option<Child>,
+    /// Extra environment for the background process.
+    daemon_env: Vec<(&'static str, String)>,
 }
 
 impl Env {
@@ -99,6 +101,7 @@ command = "sh -c 'echo hello \"$0\" from \"$PWD\"; exit 3' {{name}}"
             dir,
             game: game.to_string(),
             daemon: None,
+            daemon_env: Vec::new(),
         };
         env.start_daemon();
         env
@@ -139,6 +142,7 @@ command = "sh -c 'echo hello \"$0\" from \"$PWD\"; exit 3' {{name}}"
             .unwrap();
         let child = self
             .command()
+            .envs(self.daemon_env.iter().map(|(k, v)| (k, v)))
             .arg("daemon")
             .stdout(Stdio::null())
             .stderr(log)
@@ -457,6 +461,83 @@ fn sessions(env: &Env) -> Vec<Value> {
         .clone()
 }
 
+/// The submit_run arguments a Harness's hook sends on for `session_id`, with
+/// the nonce it attested them with.
+fn attested(env: &Env, harness: &str, session_id: &str, tool_input: Value) -> Value {
+    let (event, tool) = match harness {
+        "opencode" => ("tool.before", "geleider_submit_run"),
+        _ => ("PreToolUse", "mcp__geleider__submit_run"),
+    };
+    let out = hook(
+        env,
+        harness,
+        event,
+        serde_json::json!({"session_id":session_id,"cwd":env.repo(),"tool_name":tool,"tool_input":tool_input}),
+    );
+    let output: Value = serde_json::from_slice(&out.stdout).unwrap();
+    output["hookSpecificOutput"]["updatedInput"].clone()
+}
+
+/// A `geleider mcp` server that has been initialized by `client`.
+struct Mcp {
+    child: Child,
+    stdin: std::process::ChildStdin,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    next_id: i64,
+}
+
+impl Mcp {
+    fn start(env: &Env, client: &str) -> Self {
+        let mut child = env
+            .command()
+            .arg("mcp")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut mcp = Self {
+            child,
+            stdin,
+            stdout,
+            next_id: 0,
+        };
+        mcp.rpc(
+            "initialize",
+            serde_json::json!({"clientInfo":{"name":client}}),
+        );
+        mcp
+    }
+
+    fn rpc(&mut self, method: &str, params: Value) -> Value {
+        use std::io::{BufRead, Write};
+        self.next_id += 1;
+        let message =
+            serde_json::json!({"jsonrpc":"2.0","id":self.next_id,"method":method,"params":params});
+        writeln!(self.stdin, "{message}").unwrap();
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// The Run a submit_run call with `arguments` queued.
+    fn submit(&mut self, arguments: Value) -> Value {
+        let reply = self.rpc(
+            "tools/call",
+            serde_json::json!({"name":"submit_run","arguments":arguments}),
+        );
+        let run = reply["result"]["structuredContent"].clone();
+        assert!(run["id"].is_i64(), "{reply}");
+        run
+    }
+
+    fn stop(mut self) {
+        drop(self.stdin);
+        self.child.wait().unwrap();
+    }
+}
+
 #[test]
 fn harness_sessions_track_worktrees_waiting_idle_and_end_across_restart() {
     use serde_json::json;
@@ -575,10 +656,10 @@ fn hooks_succeed_quickly_with_daemon_down_stalled_input_or_full_socket() {
         "tool_name":"mcp__geleider__submit_run","tool_input":{"job":"hold","args":["0"]}}),
     );
     let output: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(
-        output["hookSpecificOutput"]["updatedInput"]["session"],
-        json!({"harness":"codex","id":"right-thread"})
-    );
+    let session = &output["hookSpecificOutput"]["updatedInput"]["session"];
+    assert_eq!(session["harness"], "codex");
+    assert_eq!(session["id"], "right-thread");
+    assert_eq!(session["nonce"].as_str().unwrap().len(), 64);
     assert_eq!(
         output["hookSpecificOutput"]["updatedInput"]["cwd"],
         json!(env.repo())
@@ -604,13 +685,16 @@ with (root / 'queued-messages').open('a') as f: f.write(json.dumps(sys.argv[1:])
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let out = env
-        .command()
-        .env("CODEX_THREAD_ID", "the-submitting-session")
-        .args(["run", "script", "delivery log", "--json"])
-        .output()
-        .unwrap();
-    let run: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let args = attested(
+        &env,
+        "codex",
+        "the-submitting-session",
+        serde_json::json!({"job":"script","args":["delivery log"]}),
+    );
+    let mut mcp = Mcp::start(&env, "codex");
+    let run = mcp.submit(args);
+    mcp.stop();
+    assert!(run["delivery"].as_str().unwrap().starts_with("on"), "{run}");
     let finished = env.wait(id(&run));
     assert_eq!(finished["session"]["id"], "the-submitting-session");
     // Keep failing long enough to exercise a retry without acknowledging.
@@ -662,38 +746,21 @@ fn crashed_harness_sessions_end_when_their_process_exits() {
 #[test]
 fn a_shared_mcp_process_keeps_session_destinations_separate_and_results_survive_restart() {
     use serde_json::json;
-    use std::io::{BufRead, BufReader, Write};
     let mut env = Env::new("fakegame-shared");
-    let mut mcp = env
-        .command()
-        .arg("mcp")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = mcp.stdin.take().unwrap();
-    let mut stdout = BufReader::new(mcp.stdout.take().unwrap());
-    let mut rpc = |message: Value| -> Value {
-        writeln!(stdin, "{message}").unwrap();
-        let mut line = String::new();
-        stdout.read_line(&mut line).unwrap();
-        serde_json::from_str(&line).unwrap()
-    };
-    rpc(json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"opencode"}}}));
+    let mut mcp = Mcp::start(&env, "opencode");
     let mut ids = Vec::new();
-    for (index, session) in ["first", "second"].into_iter().enumerate() {
-        let submitted = rpc(
-            json!({"id":index+2,"method":"tools/call","params":{"name":"submit_run","arguments":{
-                "job":"hold","args":["0"],"cwd":env.repo(),"session":{"harness":"opencode","id":session}
-            }}}),
+    for session in ["first", "second"] {
+        let args = attested(
+            &env,
+            "opencode",
+            session,
+            json!({"job":"hold","args":["0"]}),
         );
-        let run = &submitted["result"]["structuredContent"];
+        let run = mcp.submit(args);
         assert_eq!(run["session"]["id"], session);
-        ids.push(id(run));
+        ids.push(id(&run));
     }
-    drop(rpc);
-    drop(stdin);
-    mcp.wait().unwrap();
+    mcp.stop();
     for id in &ids {
         env.wait(*id);
     }
@@ -877,4 +944,67 @@ fn status_shows_both_subscriptions_with_their_age() {
     let usage = &reply["result"]["structuredContent"]["subscriptions"];
     assert_eq!(usage[0]["windows"][0]["used_percent"], 25.0, "{reply}");
     assert_eq!(usage[1]["windows"][1]["used_percent"], 9.0, "{reply}");
+}
+
+#[test]
+fn only_hook_attested_destinations_are_delivered_and_each_attestation_works_once() {
+    use serde_json::json;
+    let env = Env::new("fakegame-attest");
+    let job = json!({"job":"hold","args":["0"]});
+    let mut mcp = Mcp::start(&env, "codex");
+    let undelivered = |run: &Value| {
+        assert!(run["session"].is_null(), "{run}");
+        assert!(
+            run["delivery"].as_str().unwrap().starts_with("off"),
+            "{run}"
+        );
+    };
+
+    let args = attested(&env, "codex", "caller", job.clone());
+    let run = mcp.submit(args.clone());
+    assert_eq!(run["session"], json!({"harness":"codex","id":"caller"}));
+    assert!(run["delivery"].as_str().unwrap().starts_with("on"), "{run}");
+    // Replayed: the nonce was used up by the first submission.
+    undelivered(&mcp.submit(args));
+
+    // Forged by the model, as when hooks do not run: no nonce, a nonce no hook
+    // sent, and a real nonce moved to another Session, which also uses it up.
+    let mut forged = job.clone();
+    forged["session"] = json!({"harness":"codex","id":"victim"});
+    undelivered(&mcp.submit(forged.clone()));
+    forged["session"]["nonce"] = json!("ab".repeat(32));
+    undelivered(&mcp.submit(forged.clone()));
+    let args = attested(&env, "codex", "caller", job.clone());
+    forged["session"]["nonce"] = args["session"]["nonce"].clone();
+    undelivered(&mcp.submit(forged));
+    undelivered(&mcp.submit(args));
+    mcp.stop();
+
+    // A shell's CODEX_THREAD_ID is the model's to set, so it names nothing.
+    let out = env
+        .command()
+        .env("CODEX_THREAD_ID", "victim")
+        .args(["run", "hold", "0", "--json"])
+        .output()
+        .unwrap();
+    undelivered(&serde_json::from_slice(&out.stdout).unwrap());
+}
+
+#[test]
+fn an_attestation_expires_if_its_submission_comes_too_late() {
+    use serde_json::json;
+    let mut env = Env::new("fakegame-attest-expiry");
+    env.kill_daemon();
+    env.daemon_env
+        .push(("GELEIDER_ATTESTATION_TTL_MS", "1000".into()));
+    env.start_daemon();
+    let job = json!({"job":"hold","args":["0"]});
+    let mut mcp = Mcp::start(&env, "codex");
+    let late = attested(&env, "codex", "caller", job.clone());
+    std::thread::sleep(Duration::from_millis(1500));
+    let run = mcp.submit(late);
+    assert!(run["session"].is_null(), "{run}");
+    let prompt = attested(&env, "codex", "caller", job);
+    assert_eq!(mcp.submit(prompt)["session"]["id"], "caller");
+    mcp.stop();
 }

@@ -57,6 +57,22 @@ fn bounded_tail(tail: &str) -> &str {
     }
 }
 
+/// What a submission's reply says about where its result goes.
+pub fn notice(session: Option<&SessionKey>) -> String {
+    match session.map(|s| s.harness) {
+        Some(Harness::Codex | Harness::Opencode) => {
+            "on: the result is queued as a prompt in this Session when the Run finishes".into()
+        }
+        Some(Harness::Claude) => {
+            "off: Claude Code cannot be sent results; poll get_run, or use `geleider run --wait`"
+                .into()
+        }
+        None => "off: no geleider hook attested this call's Session, so the result is not \
+            sent anywhere; poll get_run, or use `geleider wait <id>`"
+            .into(),
+    }
+}
+
 /// Queues `run`'s result in its Codex thread with `codex queue`.
 pub fn codex(run: &Run, session: &SessionKey) -> Result<()> {
     if session.harness != Harness::Codex {

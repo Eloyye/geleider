@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::attest::Destination;
 use crate::lease::Holder;
 use crate::paths::Paths;
 use crate::session::{Session, SessionKey};
@@ -24,8 +25,9 @@ pub enum Request {
         job: String,
         args: Vec<String>,
         submitter: String,
+        /// Where the result should go. Only a destination a hook attested is kept.
         #[serde(default)]
-        session: Option<SessionKey>,
+        session: Option<Destination>,
     },
     GetRun {
         id: i64,
@@ -69,6 +71,9 @@ pub struct RunInfo {
     pub queue_position: Option<usize>,
     /// The end of the log, once the Run has finished.
     pub log_tail: Option<String>,
+    /// Whether the result will be sent to the submitting Session, in replies to a submission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

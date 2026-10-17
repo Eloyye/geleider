@@ -29,7 +29,9 @@ pub fn submit(
         job,
         args,
         submitter: "cli".into(),
-        session: crate::hook::shell_session(),
+        // A shell's environment, such as `CODEX_THREAD_ID`, is the model's to
+        // choose, so it never names where a result goes. Use `--wait` instead.
+        session: None,
     };
     let info = protocol::call(paths, &request)?.into_run()?;
     if !wait {

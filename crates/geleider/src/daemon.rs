@@ -8,22 +8,23 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+use crate::attest::{Attestations, Destination};
 use crate::config::{Config, ConfigCache};
 use crate::delivery::{self, Retries};
 use crate::git;
 use crate::github::{self, Gh, GitHub, Posted};
-use crate::hook::MAX_DATAGRAM_BYTES;
+use crate::hook::{Datagram, MAX_DATAGRAM_BYTES};
 use crate::lease::{self, Lease, QueuedRun, RunningRun};
 use crate::paths::{self, Paths};
 use crate::procs::{self, Snapshot};
 use crate::protocol::{self, Reply, Request, ResourceStatus, RunInfo, Status};
 use crate::report::{self, MacNotifier, Notifier, TAIL_LINES};
-use crate::session::{Activity, Harness, Session, SessionKey, SessionState};
+use crate::session::{Activity, Harness, Session, SessionState};
 use crate::store::{NewRun, Run, RunState, Store, now_ms};
 use crate::usage::{self, Reading, ResetCheck, Subscription, SubscriptionUsage, Window};
 
@@ -37,6 +38,14 @@ const DELIVERY_INTERVAL: Duration = Duration::from_secs(2);
 /// How long an ended Session stays in `status`, and how often older ones are forgotten.
 const SESSION_HISTORY: Duration = Duration::from_secs(7 * 24 * 3600);
 const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
+/// How long a hook's attestation waits for its submission. The Harness may ask
+/// the user to allow the call first. `GELEIDER_ATTESTATION_TTL_MS` overrides it
+/// for tests.
+const ATTESTATION_TTL: Duration = Duration::from_secs(10 * 60);
+/// How long a submission waits for the attestation sent just before it.
+const ATTESTATION_WAIT: Duration = Duration::from_millis(500);
+/// Activity datagrams waiting to be recorded; more are dropped, like a full socket.
+const ACTIVITY_BACKLOG: usize = 256;
 
 /// Locks `mutex` even if a thread panicked while holding it. The state behind
 /// geleider's locks lives in SQLite or is rebuilt from the process table, so one
@@ -71,6 +80,7 @@ pub fn run(paths: Paths) -> Result<()> {
             children: HashSet::new(),
         }),
         wake: (Mutex::new(false), Condvar::new()),
+        attestations: Attestations::new(attestation_ttl()),
         notifier: Box::new(MacNotifier),
         github: Box::new(Gh),
     });
@@ -100,6 +110,8 @@ struct Daemon {
     core: Mutex<Core>,
     /// Set and signalled to make the scheduler look at the queue right away.
     wake: (Mutex<bool>, Condvar),
+    /// Session destinations hooks vouched for, waiting for their submissions.
+    attestations: Attestations,
     notifier: Box<dyn Notifier>,
     github: Box<dyn GitHub + Send + Sync>,
 }
@@ -132,14 +144,26 @@ enum Event {
 impl Daemon {
     /// Records hook datagrams. Any process of this user can write to the socket,
     /// so each datagram is validated again here, not only by the hook.
-    fn ingress_loop(&self, hooks: &UnixDatagram) {
+    /// Attestations are taken at once; activity, which runs git, is recorded in
+    /// order by another thread, so a submission never waits behind it.
+    fn ingress_loop(self: &Arc<Self>, hooks: &UnixDatagram) {
+        let (activities, backlog) = mpsc::sync_channel(ACTIVITY_BACKLOG);
+        let recorder = Arc::clone(self);
+        std::thread::spawn(move || {
+            for activity in backlog {
+                if let Err(err) = recorder.record_activity(activity) {
+                    eprintln!("geleider: recording Session activity: {err:#}");
+                }
+            }
+        });
         let mut bytes = [0; MAX_DATAGRAM_BYTES];
         while let Ok(size) = hooks.recv(&mut bytes) {
-            let Ok(activity) = serde_json::from_slice::<Activity>(&bytes[..size]) else {
-                continue;
-            };
-            if let Err(err) = self.record_activity(activity) {
-                eprintln!("geleider: recording Session activity: {err:#}");
+            match serde_json::from_slice::<Datagram>(&bytes[..size]) {
+                Ok(Datagram::Attestation(attestation)) => self.attestations.record(attestation),
+                Ok(Datagram::Activity(activity)) => {
+                    let _ = activities.try_send(activity);
+                }
+                Err(_) => continue,
             }
         }
     }
@@ -637,8 +661,13 @@ impl Daemon {
         job: &str,
         args: Vec<String>,
         submitter: String,
-        session: Option<SessionKey>,
+        session: Option<Destination>,
     ) -> Result<Reply> {
+        // The result is queued as a prompt in this Session, so only a hook may
+        // choose it. Anything else is kept as a Run with no destination.
+        let session = session
+            .filter(|d| self.attestations.consume(d, ATTESTATION_WAIT))
+            .map(|d| d.key);
         // Resolving the worktree runs git, so it happens without holding the lock.
         let config = self.config()?;
         let location = git::locate(&config, cwd)?;
@@ -660,8 +689,17 @@ impl Daemon {
         let core = lock(&self.core);
         let run = core.store.require(run.id)?;
         let queued = queued_runs(&core.store)?;
-        Ok(Reply::Run(Box::new(info(run, &queued, false))))
+        let mut info = info(run, &queued, false);
+        info.delivery = Some(delivery::notice(info.run.session.as_ref()));
+        Ok(Reply::Run(Box::new(info)))
     }
+}
+
+fn attestation_ttl() -> Duration {
+    std::env::var("GELEIDER_ATTESTATION_TTL_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(ATTESTATION_TTL, Duration::from_millis)
 }
 
 /// What `activity` alone says about its Session: where it is and what it is doing.
@@ -724,5 +762,6 @@ fn info(run: Run, queued: &[QueuedRun], with_tail: bool) -> RunInfo {
         run,
         queue_position,
         log_tail,
+        delivery: None,
     }
 }

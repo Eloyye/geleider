@@ -56,37 +56,64 @@ No Session event invokes the notification service.
 
 MCP initialization identifies a Harness, not a conversation. Its cwd or process
 environment is also insufficient when a desktop app shares the MCP server.
-Geleider therefore uses **per-call identity**:
+Geleider therefore uses **per-call identity**, which the daemon accepts only
+when a hook **attested** it:
 
 - Claude Code and Codex PreToolUse hooks annotate only
   `mcp__geleider__submit_run`, using `updatedInput` to supply
-  `session: { harness, id }` from that hook's own `session_id`, and the hook cwd
-  when the call omitted cwd. Codex root Session ids are its thread ids. A
-  `session` the model wrote into the call is always replaced, or dropped when
+  `session: { harness, id, nonce }` from that hook's own `session_id`, and the
+  hook cwd when the call omitted cwd. Codex root Session ids are its thread ids.
+  A `session` the model wrote into the call is always replaced, or dropped when
   the hook has no `session_id`.
-- OpenCode's `tool.hook("execute.before", …)` annotates the corresponding MCP
-  tool arguments using the originating Session id, resolving children to their
-  parent. It supplies the Session's location, not the plugin instance location.
-  It also drops a model-written `session`.
-- For shell submissions, Codex supplies `CODEX_THREAD_ID` to execution processes.
-  MCP servers deliberately do not infer their caller from an inherited value.
+- OpenCode's `tool.hook("execute.before", …)` resolves the call to its root
+  Session and passes the arguments to `geleider hook opencode tool.before`,
+  which annotates them the same way; a child call carries `agent_id` so it does
+  not report the parent's state. It supplies the Session's location, not the
+  plugin instance location. It also drops a model-written `session`, and if the
+  hook fails the call goes ahead with no destination.
+- The `nonce` is 32 bytes from `getentropy`, as 64 hex digits. Before printing
+  `updatedInput`, the hook sends the daemon an attestation datagram
+  `{datagram: "attestation", session, nonce}` on the hook socket, so it is
+  already queued when the submission arrives. The ingress thread records
+  attestations at once; activity datagrams, which run git, are recorded by a
+  separate thread and cannot delay them.
+- On `submit`, the daemon waits up to 500 ms for an attestation with the
+  call's nonce and removes it whatever it finds, so each nonce is good for one
+  submission. The destination is kept only if that attestation names the same
+  Harness and id and is younger than 10 minutes, enough for a permission
+  prompt. At most 1024 attestations wait at once; the oldest goes first.
+- Otherwise the Run is still queued and runs, with no destination. Every
+  submit reply carries `delivery`, starting `on` or `off`; an unattested
+  destination reads `off: no geleider hook attested this call's Session…`.
+- `geleider run` from a shell never sets a destination. `CODEX_THREAD_ID` is
+  part of an environment the model controls, so it is no longer read; use
+  `geleider run --wait`, or `geleider wait <id>`, from a shell.
 - Session ids are validated wherever they enter geleider (hook input, the hook
   socket, MCP arguments, the daemon socket): 1–256 characters of ASCII letters,
   digits and `-_.:`, not starting with `-`.
 
-If hooks are disabled or skipped by an app, the model can still pass `session`
-in `submit_run`, for example
-`{"job":"ck3-test","args":["events"],"cwd":"/path/to/worktree","session":{"harness":"codex","id":"<exact-session-id>"}}`.
-Without identity the Run still works through `get_run` or `geleider wait`; no
-result is guessed into another Session. Claude Code should use `--wait`.
+If hooks are disabled or skipped by an app, nothing is delivered: there is no
+way for the model to name a destination itself. The Run still works, and its
+result is available through `get_run` or `geleider wait <id>`. Claude Code,
+which geleider cannot send results to, should use `--wait`.
 
-**Trust boundary.** A delivered result is queued as a prompt in the receiving
-Session. Hook annotation is what makes the destination trustworthy: an explicit
-`session` (hooks disabled) or `CODEX_THREAD_ID` (shell) is a claim the caller
-can choose, so a conversation without working hooks can direct a result, and
-the Job output in its log tail, to another Session whose id it knows. The
-message marks the log tail as data, strips control characters and caps it at
-8 KiB, but treat explicit destinations as unauthenticated.
+**Trust boundary.** A delivered result, including its Job output, is queued as
+a prompt in the receiving Session, so the destination is accepted only from a
+hook. A model can write any `session`, or any environment for its shell, but it
+cannot see an unused nonce for another Session or put one into the daemon's
+table. Forged, replayed, moved and expired nonces all turn delivery off.
+
+The attestation authenticates whoever can write the hook socket, not the hook
+binary. That socket and the daemon socket are mode 0600 in a 0700 state
+directory, so other accounts cannot reach them, but every process of this
+user can. Such a process can mint an attestation for any Session id, or call
+`codex queue` directly, so this is no new power for unsandboxed code. It does
+matter for a sandbox: a Harness sandbox that lets the model's shell connect to
+`hooks.sock` lets the model mint attestations for other Sessions. Keep
+geleider's state directory out of sandbox allowlists. With the shell path gone,
+no Job submission needs it. The message also marks the log tail as data,
+strips control characters and caps it at 8 KiB, because a correctly attested
+Run can still carry hostile Job output.
 
 The Run retains its Session destination in SQLite. A separate worker invokes
 `codex queue --thread <id> --message <result>` with a five-second timeout,
@@ -114,9 +141,12 @@ The Rust suite drives a real daemon and disposable Git worktrees. It covers all
 three Harness payload formats, branches, prompt correlation, waiting-first
 ordering, idle/end transitions, owner exit, restarts, old database migration,
 shared-MCP routing, daemon-down/full-socket/stalled-input behavior, exact config
-round trips and retried Codex delivery through a recording executable. The Node
+round trips, retried Codex delivery through a recording executable, and
+attested destinations: forged, replayed, moved and expired nonces, plus a
+shell `CODEX_THREAD_ID` that no longer names a destination. The Node
 fixture exercises the actual OpenCode plugin against the v2 context contract,
-including root/child identities, different worktree locations, queued result
+including root/child identities, attestation through `geleider hook`, a failed
+hook leaving no destination, different worktree locations, queued result
 admission, acknowledgment, retry and disposal.
 
 Installed Harnesses on the development Mac: Claude Code 2.1.282, Codex CLI

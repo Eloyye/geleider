@@ -71,12 +71,19 @@ export default {
       try {
         const info = await root(event.sessionID);
         if (!info || stopped) return;
-        if (args) {
-          args.cwd ??= info.location.directory;
-          args.session = { harness: "opencode", id: info.id };
-        }
         // A child belongs to its parent Session, but can't overwrite its state.
-        if (info.id === event.sessionID) await report(info, "tool.before", { tool_name: event.tool, tool_use_id: event.id });
+        const child = info.id !== event.sessionID;
+        const fields = { tool_name: event.tool, tool_use_id: event.id, ...(child ? { agent_id: event.sessionID } : {}) };
+        if (!args) {
+          if (!child) await report(info, "tool.before", fields);
+          return;
+        }
+        args.cwd ??= info.location.directory;
+        // geleider attests the root Session to its daemon and returns the
+        // arguments carrying that attestation's nonce.
+        const output = await report(info, "tool.before", { ...fields, tool_input: args });
+        const updated = output && JSON.parse(output)?.hookSpecificOutput?.updatedInput;
+        if (updated && typeof updated === "object" && !Array.isArray(updated)) event.input = updated;
       } catch { /* Hooks must never fail a Harness operation. */ }
     });
     await ctx.tool.hook("execute.after", async (event) => {
