@@ -110,6 +110,11 @@ fn repo_dirs(dir: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((canonical(top), canonical(common)))
 }
 
+/// The repository root, including for a Project not declared in config.
+pub fn worktree(cwd: &Path) -> Option<PathBuf> {
+    repo_dirs(cwd).ok().map(|(root, _)| root)
+}
+
 /// The clone itself and every worktree it has registered.
 fn worktrees(clone: &Path) -> Result<Vec<PathBuf>> {
     let text = git_stdout(clone, &["worktree", "list", "--porcelain"])?;

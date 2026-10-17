@@ -74,7 +74,8 @@ impl Server {
                     "serverInfo": { "name": "geleider", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": "Use geleider to run Jobs that need a shared Resource (such as a game \
                         used by integration tests). Submit with submit_run; it returns at once with the Run id \
-                        and queue position. Then check with get_run until the Run has finished. \
+                        and queue position. Hooks attach the calling Session to each submission, so Codex and OpenCode can receive the result automatically. \
+                        If hooks or delivery are unavailable, check get_run; Claude Code should use geleider run --wait. \
                         usage shows how much of each Subscription (Claude Pro, ChatGPT Plus) is used.",
                 })
             }
@@ -134,6 +135,14 @@ impl Server {
                     job,
                     args: job_args,
                     submitter,
+                    // Never infer a Session from clientInfo, cwd, or server env:
+                    // desktop apps may share this process between conversations.
+                    session: args
+                        .get("session")
+                        .filter(|s| !s.is_null())
+                        .map(|s| serde_json::from_value(s.clone()))
+                        .transpose()
+                        .context("`session` must contain harness and id")?,
                 }
             }
             "get_run" => Request::GetRun {
@@ -172,7 +181,9 @@ fn tools() -> Value {
                 "properties": {
                     "job": { "type": "string", "description": "Job name, e.g. `ck3-test`." },
                     "args": { "type": "array", "items": { "type": "string" }, "description": "The Job's positional args." },
-                    "cwd": { "type": "string", "description": "A directory in your worktree. Defaults to this server's working directory." }
+                    "cwd": { "type": "string", "description": "A directory in your worktree. Defaults to this server's working directory." },
+                    "session": { "type": "object", "description": "Set by the Harness hook from this call's Session id, replacing any value given. Only if hooks are unavailable, pass your own exact Harness Session id for result delivery; never another Session's, and never guess from a worktree.",
+                        "properties": { "harness": { "type": "string", "enum": ["claude", "codex", "opencode"] }, "id": { "type": "string", "minLength": 1 } }, "required": ["harness", "id"], "additionalProperties": false }
                 },
                 "required": ["job"]
             }
@@ -199,7 +210,7 @@ fn tools() -> Value {
         },
         {
             "name": "status",
-            "description": "Every Resource with its slots and current Lease holders, running and queued Runs, \
+            "description": "Sessions grouped by Project (waiting first), every Resource with its slots and current Lease holders, running and queued Runs, \
                 and Subscription usage as the usage tool reports it.",
             "inputSchema": { "type": "object", "properties": {} }
         },
@@ -277,7 +288,7 @@ mod tests {
         assert_eq!(result["result"]["isError"], true);
         assert_eq!(
             seen.borrow()[0],
-            json!({"op": "submit", "cwd": "/wt", "job": "ck3-test", "args": ["events"], "submitter": "mcp:codex"})
+            json!({"op": "submit", "cwd": "/wt", "job": "ck3-test", "args": ["events"], "submitter": "mcp:codex", "session": null})
         );
 
         let unknown = server

@@ -116,6 +116,15 @@ command = "sh -c 'echo hello \"$0\" from \"$PWD\"; exit 3' {{name}}"
         let mut cmd = Command::new(BIN);
         cmd.env("GELEIDER_CONFIG", self.root().join("config.toml"))
             .env("GELEIDER_STATE_DIR", self.root().join("state"))
+            .env_remove("CODEX_THREAD_ID")
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.root().join("bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
             // Never the real Codex's session logs.
             .env("CODEX_HOME", self.root().join("codex"))
             .current_dir(self.repo());
@@ -419,6 +428,297 @@ fn mcp_server_submits_and_reports_runs() {
 
     drop(stdin);
     mcp.wait().unwrap();
+}
+
+fn hook(env: &Env, harness: &str, event: &str, payload: Value) -> Output {
+    use std::io::Write;
+    let mut child = env
+        .command()
+        .args(["hook", harness, event])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn sessions(env: &Env) -> Vec<Value> {
+    let out = env.geleider(&["status", "--json"]);
+    serde_json::from_slice::<Value>(&out.stdout).unwrap()["sessions"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn harness_sessions_track_worktrees_waiting_idle_and_end_across_restart() {
+    use serde_json::json;
+    let mut env = Env::new("fakegame-sessions");
+    let wt = env.root().join("worktree");
+    git(
+        &env.repo(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/other",
+            wt.to_str().unwrap(),
+        ],
+    );
+    for harness in ["claude", "codex", "opencode"] {
+        let out = hook(
+            &env,
+            harness,
+            "SessionStart",
+            json!({"session_id":harness, "cwd":wt}),
+        );
+        assert!(out.status.success());
+    }
+    wait_until(Duration::from_secs(5), || sessions(&env).len() == 3);
+    for session in sessions(&env) {
+        assert_eq!(session["project"], "demo");
+        assert_eq!(session["branch"], "feat/other");
+        assert_eq!(session["state"], "idle");
+    }
+    let input = json!({"session_id":"codex", "cwd":wt, "tool_use_id":"needs-approval"});
+    hook(&env, "codex", "PermissionRequest", input.clone());
+    wait_until(Duration::from_secs(5), || {
+        sessions(&env)[0]["state"] == "waiting"
+    });
+    assert_eq!(sessions(&env)[0]["id"], "codex");
+    // Completing a parallel tool must not hide an outstanding user prompt.
+    hook(
+        &env,
+        "codex",
+        "PostToolUse",
+        json!({"session_id":"codex","cwd":wt,"tool_use_id":"another-tool"}),
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(sessions(&env)[0]["state"], "waiting");
+    hook(&env, "codex", "PostToolUse", input.clone());
+    wait_until(Duration::from_secs(5), || {
+        sessions(&env)
+            .iter()
+            .any(|s| s["id"] == "codex" && s["state"] == "working")
+    });
+    hook(&env, "codex", "Stop", input.clone());
+    wait_until(Duration::from_secs(5), || {
+        sessions(&env).iter().all(|s| s["state"] == "idle")
+    });
+    env.kill_daemon();
+    env.start_daemon();
+    assert_eq!(sessions(&env).len(), 3);
+    hook(&env, "codex", "SessionEnd", input);
+    wait_until(Duration::from_secs(5), || {
+        sessions(&env).iter().any(|s| s["state"] == "ended")
+    });
+    let text = String::from_utf8(env.geleider(&["status"]).stdout).unwrap();
+    assert!(!text.contains(" codex "));
+}
+
+#[test]
+fn hooks_succeed_quickly_with_daemon_down_stalled_input_or_full_socket() {
+    use serde_json::json;
+    use std::os::unix::net::UnixDatagram;
+    let mut env = Env::new("fakegame-hook-down");
+    env.kill_daemon();
+    let start = Instant::now();
+    let out = hook(
+        &env,
+        "codex",
+        "PermissionRequest",
+        json!({"session_id":"s", "cwd":env.repo()}),
+    );
+    assert!(out.status.success());
+    assert!(out.stderr.is_empty());
+    assert!(start.elapsed() < Duration::from_secs(1));
+    // A caller that leaves stdin open cannot hold the hook indefinitely.
+    let mut child = env
+        .command()
+        .args(["hook", "claude", "Stop"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    wait_until(Duration::from_secs(1), || {
+        child.try_wait().unwrap().is_some()
+    });
+    assert!(start.elapsed() < Duration::from_millis(800));
+    assert!(child.wait().unwrap().success());
+    let path = env.root().join("state/hooks.sock");
+    std::fs::remove_file(&path).unwrap();
+    let _unread = UnixDatagram::bind(&path).unwrap();
+    for _ in 0..40 {
+        let out = hook(
+            &env,
+            "codex",
+            "Stop",
+            json!({"session_id":"s", "cwd":env.repo()}),
+        );
+        assert!(out.status.success());
+    }
+    // The annotation still works while reporting is unavailable, including for
+    // a child tool call whose session_id belongs to the parent Session.
+    let out = hook(
+        &env,
+        "codex",
+        "PreToolUse",
+        json!({"session_id":"right-thread","cwd":env.repo(),"agent_id":"child",
+        "tool_name":"mcp__geleider__submit_run","tool_input":{"job":"hold","args":["0"]}}),
+    );
+    let output: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        output["hookSpecificOutput"]["updatedInput"]["session"],
+        json!({"harness":"codex","id":"right-thread"})
+    );
+    assert_eq!(
+        output["hookSpecificOutput"]["updatedInput"]["cwd"],
+        json!(env.repo())
+    );
+    let malformed = hook(&env, "claude", "Stop", json!("bad payload"));
+    assert!(malformed.status.success());
+    assert!(malformed.stdout.is_empty());
+}
+
+#[test]
+fn codex_result_delivery_retries_and_targets_the_submitting_session() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new("fakegame-delivery");
+    let program = env.root().join("bin/codex");
+    std::fs::write(
+        &program,
+        r#"#!/usr/bin/env python3
+import sys,json,pathlib
+root = pathlib.Path(__file__).parent.parent
+if not (root / 'allow-delivery').exists(): sys.exit(1)
+with (root / 'queued-messages').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let out = env
+        .command()
+        .env("CODEX_THREAD_ID", "the-submitting-session")
+        .args(["run", "script", "delivery log", "--json"])
+        .output()
+        .unwrap();
+    let run: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let finished = env.wait(id(&run));
+    assert_eq!(finished["session"]["id"], "the-submitting-session");
+    // Keep failing long enough to exercise a retry without acknowledging.
+    std::thread::sleep(Duration::from_millis(2300));
+    assert!(!env.root().join("queued-messages").exists());
+    std::fs::write(env.root().join("allow-delivery"), "").unwrap();
+    wait_until(Duration::from_secs(8), || {
+        env.root().join("queued-messages").exists()
+    });
+    let text = std::fs::read_to_string(env.root().join("queued-messages")).unwrap();
+    let args: Value = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(args[0], "queue");
+    assert_eq!(args[1], "--thread");
+    assert_eq!(args[2], "the-submitting-session");
+    assert_eq!(args[3], "--message");
+    let message = args[4].as_str().unwrap();
+    assert!(message.contains("failed (exit 3)"));
+    assert!(message.contains("hello delivery log"));
+    std::thread::sleep(Duration::from_millis(2300));
+    assert_eq!(
+        std::fs::read_to_string(env.root().join("queued-messages"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn crashed_harness_sessions_end_when_their_process_exits() {
+    use serde_json::json;
+    let env = Env::new("fakegame-owner");
+    let mut owner = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    hook(
+        &env,
+        "codex",
+        "SessionStart",
+        json!({"session_id":"owned","cwd":env.repo(),"owner_pid":owner.id()}),
+    );
+    wait_until(Duration::from_secs(5), || !sessions(&env).is_empty());
+    assert_eq!(sessions(&env)[0]["state"], "idle");
+    owner.kill().unwrap();
+    owner.wait().unwrap();
+    wait_until(Duration::from_secs(5), || {
+        sessions(&env)[0]["state"] == "ended"
+    });
+}
+
+#[test]
+fn a_shared_mcp_process_keeps_session_destinations_separate_and_results_survive_restart() {
+    use serde_json::json;
+    use std::io::{BufRead, BufReader, Write};
+    let mut env = Env::new("fakegame-shared");
+    let mut mcp = env
+        .command()
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = mcp.stdin.take().unwrap();
+    let mut stdout = BufReader::new(mcp.stdout.take().unwrap());
+    let mut rpc = |message: Value| -> Value {
+        writeln!(stdin, "{message}").unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+    rpc(json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"opencode"}}}));
+    let mut ids = Vec::new();
+    for (index, session) in ["first", "second"].into_iter().enumerate() {
+        let submitted = rpc(
+            json!({"id":index+2,"method":"tools/call","params":{"name":"submit_run","arguments":{
+                "job":"hold","args":["0"],"cwd":env.repo(),"session":{"harness":"opencode","id":session}
+            }}}),
+        );
+        let run = &submitted["result"]["structuredContent"];
+        assert_eq!(run["session"]["id"], session);
+        ids.push(id(run));
+    }
+    drop(rpc);
+    drop(stdin);
+    mcp.wait().unwrap();
+    for id in &ids {
+        env.wait(*id);
+    }
+    env.kill_daemon();
+    env.start_daemon();
+    let out = env.geleider(&["session-results", "opencode", "second"]);
+    let results: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(results.as_array().unwrap().len(), 1);
+    assert_eq!(results[0]["run_id"], ids[1]);
+    let out = env.geleider(&[
+        "session-results",
+        "opencode",
+        "second",
+        "--ack",
+        &ids[1].to_string(),
+    ]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap(),
+        json!([])
+    );
+    let out = env.geleider(&["session-results", "opencode", "first"]);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()[0]["run_id"],
+        ids[0]
+    );
 }
 
 /// What Claude Code passes its status line, with the given 5-hour and 7-day usage.

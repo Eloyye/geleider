@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -14,13 +14,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, ConfigCache};
+use crate::delivery::{self, Retries};
 use crate::git;
 use crate::github::{self, Gh, GitHub, Posted};
+use crate::hook::MAX_DATAGRAM_BYTES;
 use crate::lease::{self, Lease, QueuedRun, RunningRun};
 use crate::paths::{self, Paths};
 use crate::procs::{self, Snapshot};
 use crate::protocol::{self, Reply, Request, ResourceStatus, RunInfo, Status};
 use crate::report::{self, MacNotifier, Notifier, TAIL_LINES};
+use crate::session::{Activity, Harness, Session, SessionKey, SessionState};
 use crate::store::{NewRun, Run, RunState, Store, now_ms};
 use crate::usage::{self, Reading, ResetCheck, Subscription, SubscriptionUsage, Window};
 
@@ -29,6 +32,11 @@ use crate::usage::{self, Reading, ResetCheck, Subscription, SubscriptionUsage, W
 const USAGE_INTERVAL: Duration = Duration::from_secs(30);
 /// The longest request accepted over the socket. Real ones are well under 1 KiB.
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+/// How often finished Runs are offered to the Codex threads that submitted them.
+const DELIVERY_INTERVAL: Duration = Duration::from_secs(2);
+/// How long an ended Session stays in `status`, and how often older ones are forgotten.
+const SESSION_HISTORY: Duration = Duration::from_secs(7 * 24 * 3600);
+const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Locks `mutex` even if a thread panicked while holding it. The state behind
 /// geleider's locks lives in SQLite or is rebuilt from the process table, so one
@@ -51,6 +59,11 @@ pub fn run(paths: Paths) -> Result<()> {
         .with_context(|| format!("listening on {}", socket.display()))?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
 
+    let hook_path = paths.hook_socket();
+    let _ = std::fs::remove_file(&hook_path);
+    let hooks = UnixDatagram::bind(&hook_path)?;
+    std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o600))?;
+
     let daemon = Arc::new(Daemon {
         core: Mutex::new(Core {
             store: Store::open(&paths.database(), paths.run_logs())?,
@@ -63,6 +76,10 @@ pub fn run(paths: Paths) -> Result<()> {
     });
     eprintln!("geleider: listening on {}", paths::display(&socket));
 
+    let ingress = Arc::clone(&daemon);
+    std::thread::spawn(move || ingress.ingress_loop(&hooks));
+    let delivery = Arc::clone(&daemon);
+    std::thread::spawn(move || delivery.delivery_loop());
     let scheduler = Arc::clone(&daemon);
     std::thread::spawn(move || scheduler.schedule_loop());
 
@@ -113,11 +130,92 @@ enum Event {
 }
 
 impl Daemon {
+    /// Records hook datagrams. Any process of this user can write to the socket,
+    /// so each datagram is validated again here, not only by the hook.
+    fn ingress_loop(&self, hooks: &UnixDatagram) {
+        let mut bytes = [0; MAX_DATAGRAM_BYTES];
+        while let Ok(size) = hooks.recv(&mut bytes) {
+            let Ok(activity) = serde_json::from_slice::<Activity>(&bytes[..size]) else {
+                continue;
+            };
+            if let Err(err) = self.record_activity(activity) {
+                eprintln!("geleider: recording Session activity: {err:#}");
+            }
+        }
+    }
+
+    fn record_activity(&self, activity: Activity) -> Result<()> {
+        // Dropped like a malformed datagram: logging each would let a flood fill the log.
+        if !activity.cwd.is_absolute() {
+            return Ok(());
+        }
+        // Locating the worktree runs git, so it happens without holding the lock.
+        let config = self.config()?;
+        let next = locate_session(&config, &activity);
+        let core = lock(&self.core);
+        let previous = core.store.session(&activity.key)?;
+        match Session::after(previous, next, &activity) {
+            Some(session) => core.store.update_session(&session),
+            None => Ok(()),
+        }
+    }
+
+    /// Offers finished Runs to the Codex threads that submitted them, until one
+    /// acknowledges by succeeding. Undelivered Runs stay in SQLite, so they are
+    /// retried after a restart too. OpenCode polls instead (`session-results`).
+    fn delivery_loop(&self) {
+        let mut retries = Retries::default();
+        loop {
+            let pending = lock(&self.core).store.pending_results(Harness::Codex);
+            match pending {
+                Ok(runs) => {
+                    for run in runs {
+                        self.deliver(&run, &mut retries);
+                    }
+                }
+                Err(err) => eprintln!("geleider: reading undelivered results: {err:#}"),
+            }
+            std::thread::sleep(DELIVERY_INTERVAL);
+        }
+    }
+
+    fn deliver(&self, run: &Run, retries: &mut Retries) {
+        let Some(session) = &run.session else {
+            return;
+        };
+        let now = Instant::now();
+        if !retries.is_due(run.id, now) {
+            return;
+        }
+        // `codex queue` runs without holding the lock.
+        match delivery::codex(run, session) {
+            Ok(()) => {
+                retries.succeeded(run.id);
+                if let Err(err) = lock(&self.core).store.acknowledge(run.id, session) {
+                    eprintln!("geleider: acknowledging Run #{}: {err:#}", run.id);
+                }
+            }
+            Err(err) => {
+                if retries.failed(run.id, now) {
+                    eprintln!("geleider: delivering Run #{} (will retry): {err:#}", run.id);
+                }
+            }
+        }
+    }
+
     fn schedule_loop(self: &Arc<Self>) {
         let mut usage_checked: Option<Instant> = None;
+        let mut pruned: Option<Instant> = None;
         loop {
             if let Err(err) = self.tick(None) {
                 eprintln!("geleider: {err:#}");
+            }
+            if pruned.is_none_or(|t| t.elapsed() >= PRUNE_INTERVAL) {
+                let before = now_ms() - SESSION_HISTORY.as_millis() as i64;
+                if let Err(err) = lock(&self.core).store.prune_sessions(before) {
+                    eprintln!("geleider: forgetting ended Sessions: {err:#}");
+                }
+                pruned = Some(Instant::now());
             }
             if usage_checked.is_none_or(|t| t.elapsed() >= USAGE_INTERVAL) {
                 if let Err(err) = self.refresh_usage() {
@@ -158,6 +256,19 @@ impl Daemon {
         {
             let mut core = lock(&self.core);
             let core = &mut *core;
+
+            // A Harness can crash without sending SessionEnd. Its process identity
+            // also prevents persisted Sessions being shown as live after a reboot.
+            for mut session in core.store.live_sessions()? {
+                if session
+                    .owner_pid
+                    .is_some_and(|pid| !snapshot.is_alive(pid, session.owner_started.as_deref()))
+                {
+                    session.state = SessionState::Ended;
+                    session.pending_prompts.clear();
+                    core.store.update_session(&session)?;
+                }
+            }
 
             // Runs left running by an earlier background process: their Lease ends
             // when their process is gone, but their exit code is unknown.
@@ -349,7 +460,8 @@ impl Daemon {
                 job,
                 args,
                 submitter,
-            } => self.submit(&cwd, &job, args, submitter),
+                session,
+            } => self.submit(&cwd, &job, args, submitter, session),
             Request::GetRun { id } => {
                 let core = lock(&self.core);
                 let run = core.store.require(id)?;
@@ -362,6 +474,18 @@ impl Daemon {
                 let runs = core.store.list(finished)?;
                 Ok(Reply::Runs {
                     runs: runs.into_iter().map(|r| info(r, &queued, false)).collect(),
+                })
+            }
+            Request::SessionResults { session, ack } => {
+                let core = lock(&self.core);
+                if let Some(id) = ack {
+                    core.store.acknowledge(id, &session)?;
+                }
+                let queued = queued_runs(&core.store)?;
+                // One bounded log tail per mailbox reply, even after a long outage.
+                let next = core.store.next_result(&session)?;
+                Ok(Reply::Runs {
+                    runs: next.into_iter().map(|r| info(r, &queued, false)).collect(),
                 })
             }
             Request::Status => {
@@ -384,8 +508,10 @@ impl Daemon {
                     .collect();
                 let queued = queued_runs(&core.store)?;
                 let runs = core.store.list(0)?;
+                let sessions = core.store.sessions()?;
                 drop(core);
                 Ok(Reply::Status(Status {
+                    sessions,
                     resources,
                     runs: runs.into_iter().map(|r| info(r, &queued, false)).collect(),
                     subscriptions: self.usage()?,
@@ -511,6 +637,7 @@ impl Daemon {
         job: &str,
         args: Vec<String>,
         submitter: String,
+        session: Option<SessionKey>,
     ) -> Result<Reply> {
         // Resolving the worktree runs git, so it happens without holding the lock.
         let config = self.config()?;
@@ -526,6 +653,7 @@ impl Daemon {
             branch: location.branch,
             argv: rendered.argv,
             submitter,
+            session,
         })?;
         self.tick(Some(run.id))?;
 
@@ -533,6 +661,35 @@ impl Daemon {
         let run = core.store.require(run.id)?;
         let queued = queued_runs(&core.store)?;
         Ok(Reply::Run(Box::new(info(run, &queued, false))))
+    }
+}
+
+/// What `activity` alone says about its Session: where it is and what it is doing.
+/// A directory outside every configured Project is still shown, by its repository.
+fn locate_session(config: &Config, activity: &Activity) -> Session {
+    let cwd = &activity.cwd;
+    let (project, worktree, branch) = match git::locate(config, cwd) {
+        Ok(location) => (
+            Some(location.project_name.to_string()),
+            location.worktree,
+            location.branch,
+        ),
+        Err(_) => (
+            None,
+            git::worktree(cwd).unwrap_or_else(|| cwd.clone()),
+            git::branch(cwd),
+        ),
+    };
+    Session {
+        key: activity.key.clone(),
+        project,
+        worktree,
+        branch,
+        state: activity.state,
+        last_activity: activity.at,
+        pending_prompts: Vec::new(),
+        owner_pid: activity.owner_pid,
+        owner_started: activity.owner_pid.and_then(procs::start_time),
     }
 }
 

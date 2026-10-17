@@ -43,6 +43,10 @@ impl Paths {
         self.state_dir.join("geleider.sock")
     }
 
+    pub fn hook_socket(&self) -> PathBuf {
+        self.state_dir.join("hooks.sock")
+    }
+
     pub fn database(&self) -> PathBuf {
         self.state_dir.join("state.sqlite")
     }

@@ -59,6 +59,37 @@ A Run executes outside any sandbox, in the submitting Session's worktree. geleid
 
 If the background process restarts while a Run is running, the Run keeps its Lease until its process exits. It then ends as `lost`, since its exit code is unknown; its log is complete.
 
+## Sessions through Harness hooks
+
+`geleider install` also merges lifecycle hooks into Claude Code's
+`~/.claude/settings.json` and Codex's `$CODEX_HOME/hooks.json` (normally
+`~/.codex/hooks.json`), and installs a thin OpenCode **2.x** plugin at
+`~/.config/opencode/plugins/geleider.ts`. Restart existing Sessions to load the
+new hooks. In Codex, review and trust them with `/hooks`; installation does not
+bypass the Harness's trust checks.
+
+`geleider status` groups live Sessions by Project, with waiting ones first. Each
+entry includes the Harness's Session id, worktree, branch, state and last
+activity. Permission requests and question tools mean **waiting**; finishing a
+turn means **idle**. Session changes never send geleider notifications.
+
+Hooks report through a nonblocking local socket. They always exit successfully,
+even when the daemon is stopped or its socket is full. Run and Session history
+survive daemon restarts; a Session ends when its Harness reports it or its
+owning process exits.
+
+For `submit_run`, the Harness hook attaches the exact calling Session id and its
+working directory to that call. This supports MCP server processes shared by
+multiple Sessions. Codex receives completed Run results through `codex queue`;
+OpenCode receives queued messages through the plugin. Failed deliveries stay in
+SQLite for retry. Claude Code continues to use `geleider run … --wait`.
+
+`geleider uninstall` restores unchanged Harness files byte for byte (and removes
+files created during installation). If you edited a file after installation, it
+removes geleider's entries while preserving your edits. See
+[hook integration details and verification](docs/harness-hooks.md), including
+manual desktop checks and the fallback when a Harness doesn't run hooks.
+
 ## Subscription usage
 
 `geleider status` (or `geleider usage`) shows how much of each Subscription is used in each Limit window and when each window resets, so you can see what is left before starting work. The MCP tool `usage` returns the same data. geleider only shows these numbers; it never routes work by them.
