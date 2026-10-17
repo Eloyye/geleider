@@ -39,10 +39,10 @@ geleider run ck3-test events --wait   # blocks, then exits with the Run's exit c
 geleider show 12                      # state, exit code, duration, log path and tail
 geleider wait 12
 geleider queue [--all]
-geleider status                       # Resources, their holders, running and queued Runs
+geleider status                       # Sessions, Claims, Resources and their holders, Runs
 ```
 
-The MCP server (`geleider mcp`) offers the same as the tools `submit_run`, `get_run`, `list_runs` and `status`. In Codex, `geleider install` pre-approves these tools (`default_tools_approval_mode = "approve"`), since `codex exec` cannot ask. They can only queue Jobs from geleider's own config, and the Session itself stays in its sandbox, but see [Trust boundary](#trust-boundary). Set it to `"prompt"` in `~/.codex/config.toml` to be asked each time; reinstalling keeps your choice.
+The MCP server (`geleider mcp`) offers the same as the tools `submit_run`, `get_run`, `list_runs` and `status`, plus `claim`, `release` and `usage` (see below). In Codex, `geleider install` pre-approves these tools (`default_tools_approval_mode = "approve"`), since `codex exec` cannot ask. They can only queue Jobs from geleider's own config, and the Session itself stays in its sandbox, but see [Trust boundary](#trust-boundary). Set it to `"prompt"` in `~/.codex/config.toml` to be asked each time; reinstalling keeps your choice.
 
 When a Run finishes, geleider sends a macOS notification and, if the worktree's branch has an open PR, posts the result there through `gh`. Each Job gets one comment per PR, edited in place on later Runs. It also notifies you when a queued Run starts because a slot freed up. Set `notifications = false` or `pr_comments = false` at the top of the config to turn these off.
 
@@ -89,6 +89,24 @@ files created during installation). If you edited a file after installation, it
 removes geleider's entries while preserving your edits. See
 [hook integration details and verification](docs/harness-hooks.md), including
 manual desktop checks and the fallback when a Harness doesn't run hooks.
+
+## Issue Claims
+
+Only one Session works on an issue at a time, across all Harnesses. Every Harness acts on GitHub as you, so an assignee alone can't show *which* Session has an issue; a Claim records that. A Session claims an issue as its first write, with the MCP tool `claim` or from a shell in its worktree:
+
+```sh
+geleider claim 5                      # or #5
+geleider release 5                    # by the Session holding it
+geleider release owner/name#5 --force # you, ending a Claim another Session holds
+```
+
+`claim` fails, naming the holder, if another Session holds the issue or it is already assigned on GitHub. On success it assigns the issue to you, so issue workflows that skip assigned issues keep working, and comments ``Claimed by <Harness> session <id> on `<branch>`.`` `release` (also an MCP tool) unassigns you and comments that the Claim was released. Claiming an issue you already hold changes nothing. The issue must be in a Project from geleider's config, and claiming goes through `gh`, signed in as you.
+
+A Claim ends when its issue closes (geleider checks every 2 minutes) or when it is released, never by timing out. `geleider status` lists Claims and flags any whose Session has been quiet for more than 24 hours, so you can check on it; it is not released.
+
+When a Session starts on a branch containing `issue-<n>`, such as `codex/issue-5-fix`, while another Session holds #n, the start hook adds a warning to that Session's context. It only warns; it never claims. Claude Code and Codex get it; OpenCode's plugin has no way to add start context, so its Sessions are not warned.
+
+**Which Session claims.** Through MCP, the Harness hook names the calling Session and attests it, as for `submit_run`. From a shell, or when no hook ran, the Claim goes to the only live Session in the caller's worktree; with none or several there, `claim` fails and asks for the MCP tool instead. In Codex, `geleider install` pre-approves `claim` and `release` along with geleider's other tools, so they comment on GitHub without asking. See [ADR 0004](docs/adr/0004-claim-holders.md).
 
 ## Subscription usage
 

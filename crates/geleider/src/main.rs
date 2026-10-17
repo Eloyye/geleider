@@ -1,4 +1,5 @@
 mod attest;
+mod claim;
 mod cli;
 mod config;
 mod daemon;
@@ -67,9 +68,28 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Sessions by Project, Resources and their holders, running and queued Runs,
-    /// and how much of each Subscription is used in each Limit window.
+    /// Sessions by Project, Claims, Resources and their holders, running and queued
+    /// Runs, and how much of each Subscription is used in each Limit window.
     Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Claim an issue for the Session working in this worktree: assigns it to you
+    /// on GitHub and comments naming the Session. Fails, naming the holder, if
+    /// another Session holds it or it is assigned already.
+    Claim {
+        /// `5`, `#5` or `owner/name#5`.
+        issue: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// End a Claim: unassigns you and comments that the Claim was released.
+    Release {
+        /// `5`, `#5`, or `owner/name#5` from outside the Project.
+        issue: String,
+        /// Release a Claim another Session holds.
+        #[arg(long)]
+        force: bool,
         #[arg(long)]
         json: bool,
     },
@@ -138,6 +158,8 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Wait { id, json } => cli::wait_for(&paths, cli::parse_run_id(&id)?, json),
         Cmd::Queue { all, json } => cli::queue(&paths, all, json),
         Cmd::Status { json } => cli::status(&paths, json),
+        Cmd::Claim { issue, json } => cli::claim(&paths, &issue, json),
+        Cmd::Release { issue, force, json } => cli::release(&paths, &issue, force, json),
         // Handled above, before anything that can fail.
         Cmd::Hook { .. } => Ok(0),
         Cmd::SessionResults { harness, id, ack } => cli::session_results(&paths, harness, &id, ack),

@@ -13,6 +13,8 @@ pub struct Location<'a> {
     pub project: &'a Project,
     pub worktree: PathBuf,
     pub branch: Option<String>,
+    /// The repository's shared `.git` directory.
+    pub common_dir: PathBuf,
 }
 
 /// Finds the Project whose clone `cwd` is in, directly or through one of the
@@ -44,6 +46,7 @@ pub fn locate<'a>(config: &'a Config, cwd: &Path) -> Result<Location<'a>> {
                 project,
                 branch: branch(&worktree),
                 worktree,
+                common_dir,
             });
         }
     }

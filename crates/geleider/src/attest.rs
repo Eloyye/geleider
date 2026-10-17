@@ -1,7 +1,8 @@
 //! Attested Session destinations. A Run result is queued as a prompt in the
 //! Session it names, so the daemon accepts that destination only when a Harness
 //! hook vouched for it: the hook sends the daemon a single-use nonce with the
-//! Session it saw, and puts the same nonce in the submit_run arguments.
+//! Session it saw, and puts the same nonce in the submit_run arguments. Claim and
+//! release calls name their Session the same way.
 
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
@@ -63,7 +64,7 @@ pub struct Destination {
     pub nonce: Option<Nonce>,
 }
 
-/// What a hook tells the daemon before the submit_run call it annotated goes ahead.
+/// What a hook tells the daemon before the call it annotated goes ahead.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Attestation {
     pub session: SessionKey,

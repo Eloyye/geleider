@@ -126,6 +126,27 @@ between Harness admission and acknowledgment can cause a duplicate message;
 Run ids let the recipient recognize it. Ended/archived recipients can leave a
 result pending until that Harness accepts delivery again.
 
+## Claims
+
+`claim` and `release` (`mcp__geleider__claim`, `mcp__geleider__release`, and
+OpenCode's `geleider_claim`, `geleider_release`) are annotated and attested
+exactly like `submit_run`: the hook replaces any `session` the model wrote,
+and the daemon believes the Session only if it consumes that call's nonce.
+Without one, the daemon takes the only live Session whose worktree is the
+caller's; with none or several it refuses the claim. `release` succeeds only
+for the holder, unless `geleider release … --force` is run from a terminal.
+
+The daemon writes every Claim to `claims.json` in its state directory (mode
+0600) whenever one starts or ends. On `SessionStart`, the Claude Code and Codex
+hooks read the worktree's branch and shared `.git` directory straight from
+git's files (no git process, no daemon call), and if the branch names
+`issue-<n>` for a Claim another Session holds in the same repository, print
+`hookSpecificOutput.additionalContext` with a warning. The OpenCode plugin
+does not pass start context, so OpenCode Sessions are not warned.
+
+A thread in the daemon asks `gh` for each Claim's issue every 2 minutes and
+ends the Claims whose issue has closed. Nothing else ends a Claim.
+
 ## Verification
 
 Run the checks used by CI:

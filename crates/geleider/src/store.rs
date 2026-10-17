@@ -1,4 +1,5 @@
-//! Runs, kept in SQLite so the queue survives the background process restarting.
+//! Runs, Sessions, Claims and usage, kept in SQLite so they survive the background
+//! process restarting.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
+use crate::claim::Claim;
 use crate::session::{Harness, Session, SessionKey, SessionState};
 use crate::usage::{Subscription, Window};
 
@@ -167,6 +169,10 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS sessions (
             harness TEXT NOT NULL, id TEXT NOT NULL, updated_at INTEGER NOT NULL,
             record TEXT NOT NULL, PRIMARY KEY (harness, id)
+        );
+        CREATE TABLE IF NOT EXISTS claims (
+            repo TEXT NOT NULL, issue INTEGER NOT NULL, claimed_at INTEGER NOT NULL,
+            record TEXT NOT NULL, PRIMARY KEY (repo, issue)
         );",
         )?;
         std::fs::create_dir_all(&logs)?;
@@ -323,6 +329,51 @@ impl Store {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    /// Records a Claim. A held Claim is never replaced: it must end first.
+    pub fn insert_claim(&self, claim: &Claim) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO claims (repo, issue, claimed_at, record) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                claim.repo,
+                claim.issue as i64,
+                claim.claimed_at,
+                serde_json::to_string(claim)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim(&self, repo: &str, issue: u64) -> Result<Option<Claim>> {
+        let text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT record FROM claims WHERE repo = ?1 AND issue = ?2",
+                params![repo, issue as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        text.map(|s| serde_json::from_str(&s).map_err(Into::into))
+            .transpose()
+    }
+
+    /// Every held Claim, oldest first.
+    pub fn claims(&self) -> Result<Vec<Claim>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT record FROM claims ORDER BY claimed_at, repo, issue")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    /// Ends `claim`, unless it already ended and the issue was claimed again.
+    /// Returns whether it was still held.
+    pub fn end_claim(&self, claim: &Claim) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM claims WHERE repo = ?1 AND issue = ?2 AND claimed_at = ?3",
+            params![claim.repo, claim.issue as i64, claim.claimed_at],
+        )? > 0)
     }
 
     /// Finished Runs whose result a `harness` Session has not acknowledged, oldest first.
@@ -559,6 +610,37 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["new-ended", "old-idle"]);
+    }
+
+    #[test]
+    fn a_held_claim_is_kept_until_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db"), dir.path().join("runs")).unwrap();
+        let claim = Claim {
+            repo: "o/r".into(),
+            issue: 5,
+            project: "demo".into(),
+            session: SessionKey::new(Harness::Claude, "abc").unwrap(),
+            worktree: "/wt".into(),
+            branch: Some("feat/x".into()),
+            git_dir: "/clone/.git".into(),
+            assignee: "me".into(),
+            claimed_at: 10,
+        };
+        store.insert_claim(&claim).unwrap();
+        let other = Claim {
+            session: SessionKey::new(Harness::Codex, "def").unwrap(),
+            claimed_at: 20,
+            ..claim.clone()
+        };
+        assert!(store.insert_claim(&other).is_err());
+        assert_eq!(store.claim("o/r", 5).unwrap(), Some(claim.clone()));
+        assert!(store.claim("o/r", 6).unwrap().is_none());
+        // An end meant for an earlier Claim on the issue leaves this one alone.
+        assert!(!store.end_claim(&other).unwrap());
+        assert_eq!(store.claims().unwrap(), std::slice::from_ref(&claim));
+        assert!(store.end_claim(&claim).unwrap());
+        assert!(store.claims().unwrap().is_empty());
     }
 
     #[test]
