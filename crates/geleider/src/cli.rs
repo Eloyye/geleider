@@ -3,13 +3,14 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::lease::Holder;
 use crate::paths::{self, Paths};
 use crate::protocol::{self, Request, RunInfo, Status};
 use crate::report;
+use crate::session::{Harness, SessionKey, SessionState};
 use crate::store::{RunState, now_ms};
 use crate::usage::{SubscriptionUsage, WindowView};
 
@@ -37,6 +38,19 @@ pub fn submit(
     }
     eprintln!("{}", one_line(&info));
     wait_for(paths, info.run.id, json)
+}
+
+/// The OpenCode plugin's result mailbox: at most one finished Run for `id` as
+/// `[{run_id, message}]`, after acknowledging `ack` if given.
+pub fn session_results(paths: &Paths, harness: Harness, id: &str, ack: Option<i64>) -> Result<i32> {
+    let session = SessionKey::new(harness, id).context("invalid Session id")?;
+    let runs = protocol::call(paths, &Request::SessionResults { session, ack })?.into_runs()?;
+    let messages: Vec<_> = runs
+        .iter()
+        .map(|r| serde_json::json!({"run_id": r.run.id, "message": crate::delivery::message(&r.run)}))
+        .collect();
+    println!("{}", serde_json::to_string(&messages)?);
+    Ok(0)
 }
 
 /// Blocks until Run `id` ends, prints its result and returns its exit code, so a
@@ -117,7 +131,7 @@ fn render_status(status: &Status) -> String {
     let live: Vec<_> = status
         .sessions
         .iter()
-        .filter(|s| s.state != crate::session::SessionState::Ended)
+        .filter(|s| s.state != SessionState::Ended)
         .collect();
     if live.is_empty() {
         out.push_str("  (none)\n");

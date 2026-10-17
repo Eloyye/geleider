@@ -67,7 +67,8 @@ if (args[0] === 'session-results') {
     await hooks.get("execute.before")(call);
     assert.deepEqual(call.input.session, { harness: "opencode", id: "root" });
     assert.equal(call.input.cwd, "/root-worktree");
-    const other = { id: "call-2", sessionID: "other", tool: "geleider_submit_run", input: { job: "test" } };
+    const other = { id: "call-2", sessionID: "other", tool: "geleider_submit_run",
+      input: { job: "test", session: { harness: "codex", id: "victim" } } };
     await hooks.get("execute.before")(other);
     assert.deepEqual(other.input.session, { harness: "opencode", id: "other" });
     assert.equal(other.input.cwd, "/other-worktree");

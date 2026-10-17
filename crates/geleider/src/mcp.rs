@@ -182,7 +182,7 @@ fn tools() -> Value {
                     "job": { "type": "string", "description": "Job name, e.g. `ck3-test`." },
                     "args": { "type": "array", "items": { "type": "string" }, "description": "The Job's positional args." },
                     "cwd": { "type": "string", "description": "A directory in your worktree. Defaults to this server's working directory." },
-                    "session": { "type": "object", "description": "Set by the Harness hook from this call's Session id. If hooks are unavailable, pass your exact Harness Session id for result delivery; never guess from a worktree.",
+                    "session": { "type": "object", "description": "Set by the Harness hook from this call's Session id, replacing any value given. Only if hooks are unavailable, pass your own exact Harness Session id for result delivery; never another Session's, and never guess from a worktree.",
                         "properties": { "harness": { "type": "string", "enum": ["claude", "codex", "opencode"] }, "id": { "type": "string", "minLength": 1 } }, "required": ["harness", "id"], "additionalProperties": false }
                 },
                 "required": ["job"]

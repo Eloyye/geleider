@@ -14,14 +14,16 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, ConfigCache};
+use crate::delivery::{self, Retries};
 use crate::git;
 use crate::github::{self, Gh, GitHub, Posted};
+use crate::hook::MAX_DATAGRAM_BYTES;
 use crate::lease::{self, Lease, QueuedRun, RunningRun};
 use crate::paths::{self, Paths};
 use crate::procs::{self, Snapshot};
 use crate::protocol::{self, Reply, Request, ResourceStatus, RunInfo, Status};
 use crate::report::{self, MacNotifier, Notifier, TAIL_LINES};
-use crate::session::{Activity, Harness, Session};
+use crate::session::{Activity, Harness, Session, SessionKey, SessionState};
 use crate::store::{NewRun, Run, RunState, Store, now_ms};
 use crate::usage::{self, Reading, ResetCheck, Subscription, SubscriptionUsage, Window};
 
@@ -30,6 +32,11 @@ use crate::usage::{self, Reading, ResetCheck, Subscription, SubscriptionUsage, W
 const USAGE_INTERVAL: Duration = Duration::from_secs(30);
 /// The longest request accepted over the socket. Real ones are well under 1 KiB.
 const MAX_REQUEST_BYTES: u64 = 1024 * 1024;
+/// How often finished Runs are offered to the Codex threads that submitted them.
+const DELIVERY_INTERVAL: Duration = Duration::from_secs(2);
+/// How long an ended Session stays in `status`, and how often older ones are forgotten.
+const SESSION_HISTORY: Duration = Duration::from_secs(7 * 24 * 3600);
+const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Locks `mutex` even if a thread panicked while holding it. The state behind
 /// geleider's locks lives in SQLite or is rebuilt from the process table, so one
@@ -70,57 +77,9 @@ pub fn run(paths: Paths) -> Result<()> {
     eprintln!("geleider: listening on {}", paths::display(&socket));
 
     let ingress = Arc::clone(&daemon);
-    std::thread::spawn(move || {
-        let mut bytes = [0; 8192];
-        while let Ok(size) = hooks.recv(&mut bytes) {
-            if let Ok(activity) = serde_json::from_slice::<Activity>(&bytes[..size])
-                && let Err(err) = ingress.record_activity(activity)
-            {
-                eprintln!("geleider: recording Session activity: {err:#}");
-            }
-        }
-    });
-    // Independent from the scheduler and PR reporting. Failed deliveries remain
-    // in SQLite for retry, including across daemon restarts.
+    std::thread::spawn(move || ingress.ingress_loop(&hooks));
     let delivery = Arc::clone(&daemon);
-    std::thread::spawn(move || {
-        let mut warned = HashSet::new();
-        loop {
-            let pending = delivery
-                .core
-                .lock()
-                .unwrap()
-                .store
-                .pending_results()
-                .unwrap_or_default();
-            for run in pending.into_iter().filter(|r| {
-                r.session
-                    .as_ref()
-                    .is_some_and(|s| s.harness == Harness::Codex)
-            }) {
-                match crate::delivery::codex(&run) {
-                    Ok(()) => {
-                        let result = delivery
-                            .core
-                            .lock()
-                            .unwrap()
-                            .store
-                            .acknowledge(run.id, run.session.as_ref().expect("filtered"));
-                        if let Err(err) = result {
-                            eprintln!("geleider: acknowledging result: {err:#}");
-                        }
-                        warned.remove(&run.id);
-                    }
-                    Err(err) if warned.insert(run.id) => {
-                        eprintln!("geleider: delivering Run #{} (will retry): {err:#}", run.id)
-                    }
-                    Err(_) => {}
-                }
-            }
-            std::thread::sleep(Duration::from_secs(2));
-        }
-    });
-
+    std::thread::spawn(move || delivery.delivery_loop());
     let scheduler = Arc::clone(&daemon);
     std::thread::spawn(move || scheduler.schedule_loop());
 
@@ -171,66 +130,92 @@ enum Event {
 }
 
 impl Daemon {
+    /// Records hook datagrams. Any process of this user can write to the socket,
+    /// so each datagram is validated again here, not only by the hook.
+    fn ingress_loop(&self, hooks: &UnixDatagram) {
+        let mut bytes = [0; MAX_DATAGRAM_BYTES];
+        while let Ok(size) = hooks.recv(&mut bytes) {
+            let Ok(activity) = serde_json::from_slice::<Activity>(&bytes[..size]) else {
+                continue;
+            };
+            if let Err(err) = self.record_activity(activity) {
+                eprintln!("geleider: recording Session activity: {err:#}");
+            }
+        }
+    }
+
     fn record_activity(&self, activity: Activity) -> Result<()> {
-        let config = self.core.lock().unwrap().config.get()?.clone();
-        let location = git::locate(&config, &activity.cwd).ok();
-        let mut session = Session {
-            key: activity.key,
-            project: location.as_ref().map(|l| l.project_name.to_string()),
-            worktree: location
-                .as_ref()
-                .map(|l| l.worktree.clone())
-                .unwrap_or_else(|| {
-                    git::worktree(&activity.cwd).unwrap_or_else(|| activity.cwd.clone())
-                }),
-            branch: location
-                .as_ref()
-                .and_then(|l| l.branch.clone())
-                .or_else(|| git::branch(&activity.cwd)),
-            state: activity.state,
-            last_activity: activity.at,
-            pending_prompts: Vec::new(),
-            owner_pid: activity.owner_pid,
-            owner_started: activity.owner_pid.and_then(procs::start_time),
+        // Dropped like a malformed datagram: logging each would let a flood fill the log.
+        if !activity.cwd.is_absolute() {
+            return Ok(());
+        }
+        // Locating the worktree runs git, so it happens without holding the lock.
+        let config = self.config()?;
+        let next = locate_session(&config, &activity);
+        let core = lock(&self.core);
+        let previous = core.store.session(&activity.key)?;
+        match Session::after(previous, next, &activity) {
+            Some(session) => core.store.update_session(&session),
+            None => Ok(()),
+        }
+    }
+
+    /// Offers finished Runs to the Codex threads that submitted them, until one
+    /// acknowledges by succeeding. Undelivered Runs stay in SQLite, so they are
+    /// retried after a restart too. OpenCode polls instead (`session-results`).
+    fn delivery_loop(&self) {
+        let mut retries = Retries::default();
+        loop {
+            let pending = lock(&self.core).store.pending_results(Harness::Codex);
+            match pending {
+                Ok(runs) => {
+                    for run in runs {
+                        self.deliver(&run, &mut retries);
+                    }
+                }
+                Err(err) => eprintln!("geleider: reading undelivered results: {err:#}"),
+            }
+            std::thread::sleep(DELIVERY_INTERVAL);
+        }
+    }
+
+    fn deliver(&self, run: &Run, retries: &mut Retries) {
+        let Some(session) = &run.session else {
+            return;
         };
-        let core = self.core.lock().unwrap();
-        if let Some(previous) = core.store.session(&session.key)? {
-            if previous.last_activity > activity.at {
-                return Ok(());
+        let now = Instant::now();
+        if !retries.is_due(run.id, now) {
+            return;
+        }
+        // `codex queue` runs without holding the lock.
+        match delivery::codex(run, session) {
+            Ok(()) => {
+                retries.succeeded(run.id);
+                if let Err(err) = lock(&self.core).store.acknowledge(run.id, session) {
+                    eprintln!("geleider: acknowledging Run #{}: {err:#}", run.id);
+                }
             }
-            if session.owner_pid.is_none() {
-                session.owner_pid = previous.owner_pid;
-                session.owner_started = previous.owner_started;
-            }
-            if !activity.reset {
-                session.pending_prompts = previous.pending_prompts;
+            Err(err) => {
+                if retries.failed(run.id, now) {
+                    eprintln!("geleider: delivering Run #{} (will retry): {err:#}", run.id);
+                }
             }
         }
-        if let Some(resolved) = activity.resolved {
-            session
-                .pending_prompts
-                .retain(|p| *p != resolved && p != "user");
-        }
-        if let Some(wait_for) = activity.wait_for
-            && !session.pending_prompts.contains(&wait_for)
-            && (wait_for != "user" || session.pending_prompts.is_empty())
-        {
-            if wait_for != "user" {
-                session.pending_prompts.retain(|p| p != "user");
-            }
-            session.pending_prompts.push(wait_for);
-        }
-        if !session.pending_prompts.is_empty() {
-            session.state = crate::session::SessionState::Waiting;
-        }
-        core.store.update_session(&session)
     }
 
     fn schedule_loop(self: &Arc<Self>) {
         let mut usage_checked: Option<Instant> = None;
+        let mut pruned: Option<Instant> = None;
         loop {
             if let Err(err) = self.tick(None) {
                 eprintln!("geleider: {err:#}");
+            }
+            if pruned.is_none_or(|t| t.elapsed() >= PRUNE_INTERVAL) {
+                let before = now_ms() - SESSION_HISTORY.as_millis() as i64;
+                if let Err(err) = lock(&self.core).store.prune_sessions(before) {
+                    eprintln!("geleider: forgetting ended Sessions: {err:#}");
+                }
+                pruned = Some(Instant::now());
             }
             if usage_checked.is_none_or(|t| t.elapsed() >= USAGE_INTERVAL) {
                 if let Err(err) = self.refresh_usage() {
@@ -274,13 +259,12 @@ impl Daemon {
 
             // A Harness can crash without sending SessionEnd. Its process identity
             // also prevents persisted Sessions being shown as live after a reboot.
-            for mut session in core.store.sessions()? {
-                if session.state != crate::session::SessionState::Ended
-                    && session.owner_pid.is_some_and(|pid| {
-                        !snapshot.is_alive(pid, session.owner_started.as_deref())
-                    })
+            for mut session in core.store.live_sessions()? {
+                if session
+                    .owner_pid
+                    .is_some_and(|pid| !snapshot.is_alive(pid, session.owner_started.as_deref()))
                 {
-                    session.state = crate::session::SessionState::Ended;
+                    session.state = SessionState::Ended;
                     session.pending_prompts.clear();
                     core.store.update_session(&session)?;
                 }
@@ -493,21 +477,15 @@ impl Daemon {
                 })
             }
             Request::SessionResults { session, ack } => {
-                let core = self.core.lock().unwrap();
+                let core = lock(&self.core);
                 if let Some(id) = ack {
                     core.store.acknowledge(id, &session)?;
                 }
                 let queued = queued_runs(&core.store)?;
+                // One bounded log tail per mailbox reply, even after a long outage.
+                let next = core.store.next_result(&session)?;
                 Ok(Reply::Runs {
-                    runs: core
-                        .store
-                        .pending_results()?
-                        .into_iter()
-                        .filter(|r| r.session.as_ref() == Some(&session))
-                        // One bounded log tail per mailbox reply, even after a long outage.
-                        .take(1)
-                        .map(|r| info(r, &queued, false))
-                        .collect(),
+                    runs: next.into_iter().map(|r| info(r, &queued, false)).collect(),
                 })
             }
             Request::Status => {
@@ -659,7 +637,7 @@ impl Daemon {
         job: &str,
         args: Vec<String>,
         submitter: String,
-        session: Option<crate::session::SessionKey>,
+        session: Option<SessionKey>,
     ) -> Result<Reply> {
         // Resolving the worktree runs git, so it happens without holding the lock.
         let config = self.config()?;
@@ -683,6 +661,35 @@ impl Daemon {
         let run = core.store.require(run.id)?;
         let queued = queued_runs(&core.store)?;
         Ok(Reply::Run(Box::new(info(run, &queued, false))))
+    }
+}
+
+/// What `activity` alone says about its Session: where it is and what it is doing.
+/// A directory outside every configured Project is still shown, by its repository.
+fn locate_session(config: &Config, activity: &Activity) -> Session {
+    let cwd = &activity.cwd;
+    let (project, worktree, branch) = match git::locate(config, cwd) {
+        Ok(location) => (
+            Some(location.project_name.to_string()),
+            location.worktree,
+            location.branch,
+        ),
+        Err(_) => (
+            None,
+            git::worktree(cwd).unwrap_or_else(|| cwd.clone()),
+            git::branch(cwd),
+        ),
+    };
+    Session {
+        key: activity.key.clone(),
+        project,
+        worktree,
+        branch,
+        state: activity.state,
+        last_activity: activity.at,
+        pending_prompts: Vec::new(),
+        owner_pid: activity.owner_pid,
+        owner_started: activity.owner_pid.and_then(procs::start_time),
     }
 }
 

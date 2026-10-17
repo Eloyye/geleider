@@ -122,9 +122,7 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     // Hook failures, including a missing HOME/state directory, never escape to a Harness.
     if let Cmd::Hook { harness, ref event } = cli.command {
-        if let Ok(paths) = Paths::from_env() {
-            hook::run(&paths, harness, event);
-        }
+        hook::run(harness, event);
         return Ok(0);
     }
     let paths = Paths::from_env()?;
@@ -139,23 +137,9 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Wait { id, json } => cli::wait_for(&paths, cli::parse_run_id(&id)?, json),
         Cmd::Queue { all, json } => cli::queue(&paths, all, json),
         Cmd::Status { json } => cli::status(&paths, json),
-        Cmd::Hook { .. } => unreachable!(),
-        Cmd::SessionResults { harness, id, ack } => {
-            let reply = protocol::call(
-                &paths,
-                &protocol::Request::SessionResults {
-                    session: session::SessionKey { harness, id },
-                    ack,
-                },
-            )?
-            .into_runs()?;
-            let messages: Vec<_> = reply
-                .iter()
-                .map(|r| serde_json::json!({"run_id":r.run.id,"message":delivery::message(&r.run)}))
-                .collect();
-            println!("{}", serde_json::to_string(&messages)?);
-            Ok(0)
-        }
+        // Handled above, before anything that can fail.
+        Cmd::Hook { .. } => Ok(0),
+        Cmd::SessionResults { harness, id, ack } => cli::session_results(&paths, harness, &id, ack),
         Cmd::Usage { json } => cli::usage(&paths, json),
         Cmd::Statusline { wrap } => statusline::run(&paths, wrap.as_deref()),
         Cmd::Daemon => daemon::run(paths).map(|()| 0),

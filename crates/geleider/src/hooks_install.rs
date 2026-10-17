@@ -6,7 +6,9 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::install::Merge;
+use crate::session::Harness;
 
+/// Events both Claude Code and Codex report.
 const COMMON: &[&str] = &[
     "SessionStart",
     "SessionEnd",
@@ -17,12 +19,25 @@ const COMMON: &[&str] = &[
     "Stop",
 ];
 
+/// The lifecycle events geleider registers a command hook for.
+fn events(harness: Harness) -> impl Iterator<Item = &'static str> {
+    let extra: &[&str] = match harness {
+        Harness::Claude => &["Notification", "PostToolUseFailure", "StopFailure"],
+        Harness::Codex => &["Interrupt"],
+        // OpenCode reports through its plugin instead.
+        Harness::Opencode => &[],
+    };
+    COMMON.iter().chain(extra).copied()
+}
+
 pub fn claude_add(text: Option<&str>, exe: &Path) -> Result<Merge> {
-    add(text, exe, "claude")
+    add(text, exe, Harness::Claude)
 }
+
 pub fn codex_add(text: Option<&str>, exe: &Path) -> Result<Merge> {
-    add(text, exe, "codex")
+    add(text, exe, Harness::Codex)
 }
+
 pub fn remove(text: Option<&str>) -> Result<Merge> {
     let Some(text) = text else {
         return Ok(Merge::Unchanged);
@@ -59,31 +74,37 @@ fn ours(hook: &Value) -> bool {
         && matches!(words[2].as_str(), "claude" | "codex")
 }
 
+/// Removes geleider's hook commands, and any group, event or `hooks` table that
+/// only they made non-empty. Everything else is left as it was.
 fn strip(doc: &mut Value) {
-    if let Some(events) = doc.get_mut("hooks").and_then(Value::as_object_mut) {
-        let original_len = events.len();
-        events.retain(|_, groups| {
-            if let Some(groups) = groups.as_array_mut() {
-                let original_len = groups.len();
-                groups.retain_mut(|group| {
-                    if let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-                        let had_ours = hooks.iter().any(ours);
-                        hooks.retain(|h| !ours(h));
-                        return !had_ours || !hooks.is_empty();
-                    }
-                    true
-                });
-                return original_len == 0 || !groups.is_empty();
-            }
-            true
+    let Some(root) = doc.as_object_mut() else {
+        return;
+    };
+    let Some(events) = root.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let had_events = !events.is_empty();
+    events.retain(|_, groups| {
+        let Some(groups) = groups.as_array_mut() else {
+            return true;
+        };
+        let had_groups = !groups.is_empty();
+        groups.retain_mut(|group| {
+            let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            let had_ours = hooks.iter().any(ours);
+            hooks.retain(|h| !ours(h));
+            !had_ours || !hooks.is_empty()
         });
-        if original_len > 0 && events.is_empty() {
-            doc.as_object_mut().expect("object").remove("hooks");
-        }
+        !had_groups || !groups.is_empty()
+    });
+    if had_events && events.is_empty() {
+        root.remove("hooks");
     }
 }
 
-fn add(text: Option<&str>, exe: &Path, harness: &str) -> Result<Merge> {
+fn add(text: Option<&str>, exe: &Path, harness: Harness) -> Result<Merge> {
     let mut doc: Value = serde_json::from_str(text.unwrap_or("{}"))?;
     let original = doc.clone();
     strip(&mut doc);
@@ -94,20 +115,16 @@ fn add(text: Option<&str>, exe: &Path, harness: &str) -> Result<Merge> {
         .or_insert(json!({}))
         .as_object_mut()
         .context("hooks is not an object")?;
-    let extra: &[&str] = if harness == "claude" {
-        &["Notification", "PostToolUseFailure", "StopFailure"]
-    } else {
-        &["Interrupt"]
-    };
-    for event in COMMON.iter().chain(extra) {
+    let exe = shell_words::quote(exe.to_str().context("non-UTF-8 executable path")?);
+    for event in events(harness) {
         let groups = hooks
-            .entry(*event)
+            .entry(event)
             .or_insert(json!([]))
             .as_array_mut()
             .context("hook event is not an array")?;
         let command = format!(
-            "GELEIDER_HARNESS_PID=$PPID {} hook {harness} {event}",
-            shell_words::quote(exe.to_str().context("non-UTF-8 executable path")?)
+            "GELEIDER_HARNESS_PID=$PPID {exe} hook {} {event}",
+            harness.as_str()
         );
         groups.push(json!({"hooks":[{"type":"command", "command":command, "timeout":1}]}));
     }

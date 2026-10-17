@@ -60,14 +60,20 @@ export default {
     }
 
     await ctx.tool.hook("execute.before", async (event) => {
+      const submitting = event.tool === "geleider_submit_run" || event.tool === "mcp__geleider__submit_run";
+      // A destination the model wrote itself is never passed on, even when the
+      // Session cannot be resolved: it could name another Session.
+      const args = submitting ? { ...((event.input ?? {}) as Record<string, unknown>) } : undefined;
+      if (args) {
+        delete args.session;
+        event.input = args;
+      }
       try {
         const info = await root(event.sessionID);
         if (!info || stopped) return;
-        if (event.tool === "geleider_submit_run" || event.tool === "mcp__geleider__submit_run") {
-          const args = (event.input ?? {}) as Record<string, unknown>;
+        if (args) {
           args.cwd ??= info.location.directory;
           args.session = { harness: "opencode", id: info.id };
-          event.input = args;
         }
         // A child belongs to its parent Session, but can't overwrite its state.
         if (info.id === event.sessionID) await report(info, "tool.before", { tool_name: event.tool, tool_use_id: event.id });

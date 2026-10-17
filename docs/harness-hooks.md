@@ -61,21 +61,36 @@ Geleider therefore uses **per-call identity**:
 - Claude Code and Codex PreToolUse hooks annotate only
   `mcp__geleider__submit_run`, using `updatedInput` to supply
   `session: { harness, id }` from that hook's own `session_id`, and the hook cwd
-  when the call omitted cwd. Codex root Session ids are its thread ids.
+  when the call omitted cwd. Codex root Session ids are its thread ids. A
+  `session` the model wrote into the call is always replaced, or dropped when
+  the hook has no `session_id`.
 - OpenCode's `tool.hook("execute.before", …)` annotates the corresponding MCP
   tool arguments using the originating Session id, resolving children to their
   parent. It supplies the Session's location, not the plugin instance location.
+  It also drops a model-written `session`.
 - For shell submissions, Codex supplies `CODEX_THREAD_ID` to execution processes.
   MCP servers deliberately do not infer their caller from an inherited value.
+- Session ids are validated wherever they enter geleider (hook input, the hook
+  socket, MCP arguments, the daemon socket): 1–256 characters of ASCII letters,
+  digits and `-_.:`, not starting with `-`.
 
-If hooks are disabled or skipped by an app, pass the exact Session explicitly
+If hooks are disabled or skipped by an app, the model can still pass `session`
 in `submit_run`, for example
 `{"job":"ck3-test","args":["events"],"cwd":"/path/to/worktree","session":{"harness":"codex","id":"<exact-session-id>"}}`.
 Without identity the Run still works through `get_run` or `geleider wait`; no
 result is guessed into another Session. Claude Code should use `--wait`.
 
+**Trust boundary.** A delivered result is queued as a prompt in the receiving
+Session. Hook annotation is what makes the destination trustworthy: an explicit
+`session` (hooks disabled) or `CODEX_THREAD_ID` (shell) is a claim the caller
+can choose, so a conversation without working hooks can direct a result, and
+the Job output in its log tail, to another Session whose id it knows. The
+message marks the log tail as data, strips control characters and caps it at
+8 KiB, but treat explicit destinations as unauthenticated.
+
 The Run retains its Session destination in SQLite. A separate worker invokes
-`codex queue --thread <id> --message <result>` with a five-second timeout.
+`codex queue --thread <id> --message <result>` with a five-second timeout,
+retrying failures with a delay that doubles from 2 seconds up to 5 minutes.
 OpenCode polls `geleider session-results opencode <id>` and calls
 `ctx.session.prompt({sessionID, text, delivery: "queue"})`, acknowledging the Run
 only after admission succeeds. Results include outcome, exit code, duration,

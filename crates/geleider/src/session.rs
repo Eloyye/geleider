@@ -5,6 +5,12 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The stand-in for a prompt the Harness reported without an id of its own.
+const ANONYMOUS_PROMPT: &str = "user";
+/// Outstanding prompts kept per Session; the oldest is dropped beyond this.
+const MAX_PENDING_PROMPTS: usize = 32;
+const MAX_ID_LEN: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum Harness {
@@ -23,10 +29,46 @@ impl Harness {
     }
 }
 
+/// Which Session a Run's result goes to. Every way in (hook stdin, the hook
+/// socket, MCP arguments, the daemon socket) deserializes through [`SessionKey::new`],
+/// so an id is never empty, never an option to a command it is passed to, and
+/// never holds terminal escapes for `geleider status` to print.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedKey")]
 pub struct SessionKey {
     pub harness: Harness,
     pub id: String,
+}
+
+#[derive(Deserialize)]
+struct UncheckedKey {
+    harness: Harness,
+    id: String,
+}
+
+impl TryFrom<UncheckedKey> for SessionKey {
+    type Error = String;
+
+    fn try_from(key: UncheckedKey) -> Result<Self, String> {
+        Self::new(key.harness, &key.id).ok_or_else(|| format!("invalid Session id {:?}", key.id))
+    }
+}
+
+impl SessionKey {
+    /// Harness Session ids are UUIDs or ids such as `ses_01J…`.
+    pub fn new(harness: Harness, id: &str) -> Option<Self> {
+        let id = id.trim();
+        let valid = !id.is_empty()
+            && id.len() <= MAX_ID_LEN
+            && !id.starts_with('-')
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'));
+        valid.then(|| Self {
+            harness,
+            id: id.to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +106,61 @@ pub struct Session {
     pub owner_pid: Option<u32>,
     #[serde(default)]
     pub owner_started: Option<String>,
+}
+
+impl Session {
+    /// `next`, built from `activity` alone, completed with what `previous` knew.
+    /// Outstanding permission and question prompts keep a Session waiting while
+    /// other tools finish. `None` when `previous` is newer: datagrams can arrive
+    /// out of order.
+    pub fn after(
+        previous: Option<Session>,
+        mut next: Session,
+        activity: &Activity,
+    ) -> Option<Self> {
+        if let Some(previous) = previous {
+            if previous.last_activity > next.last_activity {
+                return None;
+            }
+            if next.owner_pid.is_none() {
+                next.owner_pid = previous.owner_pid;
+                next.owner_started = previous.owner_started;
+            }
+            if !activity.reset {
+                next.pending_prompts = previous.pending_prompts;
+            }
+        }
+        if let Some(resolved) = &activity.resolved {
+            next.pending_prompts
+                .retain(|p| p != resolved && p != ANONYMOUS_PROMPT);
+        }
+        if let Some(prompt) = &activity.wait_for {
+            next.wait_on(prompt);
+        }
+        if !next.pending_prompts.is_empty() {
+            next.state = SessionState::Waiting;
+        }
+        Some(next)
+    }
+
+    fn wait_on(&mut self, prompt: &str) {
+        let prompts = &mut self.pending_prompts;
+        if prompts.iter().any(|p| p == prompt) {
+            return;
+        }
+        if prompt == ANONYMOUS_PROMPT {
+            // Only stands in while no identified prompt is known.
+            if prompts.is_empty() {
+                prompts.push(prompt.into());
+            }
+            return;
+        }
+        prompts.retain(|p| p != ANONYMOUS_PROMPT);
+        if prompts.len() >= MAX_PENDING_PROMPTS {
+            prompts.remove(0);
+        }
+        prompts.push(prompt.into());
+    }
 }
 
 /// Small datagram: no prompts, tool inputs, transcripts or credentials leave the hook.
@@ -118,18 +215,16 @@ pub fn activity(harness: Harness, event: &str, input: &Value) -> Option<Activity
     if !cwd.is_absolute() {
         return None;
     }
-    let tool_id = || input["tool_use_id"].as_str().unwrap_or("user").to_string();
+    let tool_id = || prompt_id(&input["tool_use_id"]);
     let wait_for = (state == SessionState::Waiting).then(|| match event {
-        "permission.asked" => input["id"].as_str().unwrap_or("user").to_string(),
-        "form.created" => input["form"]["id"].as_str().unwrap_or("user").to_string(),
+        "permission.asked" => prompt_id(&input["id"]),
+        "form.created" => prompt_id(&input["form"]["id"]),
         _ => tool_id(),
     });
     let resolved = match event {
         "PostToolUse" | "PostToolUseFailure" | "tool.after" => Some(tool_id()),
-        "permission.replied" => Some(input["requestID"].as_str().unwrap_or("user").to_string()),
-        "form.replied" | "form.cancelled" => {
-            Some(input["id"].as_str().unwrap_or("user").to_string())
-        }
+        "permission.replied" => Some(prompt_id(&input["requestID"])),
+        "form.replied" | "form.cancelled" => Some(prompt_id(&input["id"])),
         _ => None,
     };
     Some(Activity {
@@ -139,31 +234,27 @@ pub fn activity(harness: Harness, event: &str, input: &Value) -> Option<Activity
         at: crate::store::now_ms(),
         wait_for,
         resolved,
-        owner_pid: input["owner_pid"]
-            .as_u64()
-            .and_then(|p| u32::try_from(p).ok())
-            .filter(|p| *p > 1)
-            .or_else(|| {
-                std::env::var("GELEIDER_HARNESS_PID")
-                    .ok()?
-                    .parse()
-                    .ok()
-                    .filter(|p| *p > 1)
-            }),
+        owner_pid: owner_pid(input),
         reset: matches!(state, SessionState::Idle | SessionState::Ended)
             || event == "UserPromptSubmit",
     })
 }
 
 pub fn identity(harness: Harness, input: &Value) -> Option<SessionKey> {
-    let id = input["session_id"].as_str()?.trim();
-    if id.is_empty() || id.len() > 512 {
-        return None;
-    }
-    Some(SessionKey {
-        harness,
-        id: id.into(),
-    })
+    SessionKey::new(harness, input["session_id"].as_str()?)
+}
+
+fn prompt_id(value: &Value) -> String {
+    value.as_str().unwrap_or(ANONYMOUS_PROMPT).to_string()
+}
+
+/// The Harness process, so a Session it never ended can be ended once it exits.
+fn owner_pid(input: &Value) -> Option<u32> {
+    let reported = input["owner_pid"]
+        .as_u64()
+        .and_then(|p| u32::try_from(p).ok());
+    let parent = || std::env::var("GELEIDER_HARNESS_PID").ok()?.parse().ok();
+    reported.or_else(parent).filter(|p| *p > 1)
 }
 
 fn is_question(tool: &str) -> bool {
@@ -199,5 +290,93 @@ mod tests {
         assert_eq!(state("Notification", &input), None);
         input["agent_id"] = json!("child");
         assert_eq!(state("Stop", &input), None);
+    }
+
+    #[test]
+    fn session_ids_cannot_carry_options_or_terminal_escapes() {
+        for id in ["019a-uuid", "ses_01JABC", "thread.1:2", "  padded  "] {
+            assert!(SessionKey::new(Harness::Codex, id).is_some(), "{id}");
+        }
+        let long = "a".repeat(MAX_ID_LEN + 1);
+        for id in [
+            "",
+            "   ",
+            "--help",
+            "a b",
+            "a\nb",
+            "\u{1b}[2J",
+            "a/b",
+            &long,
+        ] {
+            assert!(SessionKey::new(Harness::Codex, id).is_none(), "{id:?}");
+        }
+        // Every deserialization path validates, not only the hook's.
+        let forged = json!({"harness":"codex","id":"--dangerously-bypass"});
+        assert!(serde_json::from_value::<SessionKey>(forged).is_err());
+        let datagram = json!({"key":{"harness":"codex","id":"\u{1b}]0;x"},"cwd":"/wt",
+            "state":"idle","at":0,"wait_for":null,"resolved":null,"reset":true,"owner_pid":null});
+        assert!(serde_json::from_value::<Activity>(datagram).is_err());
+    }
+
+    fn event(input: Value, event: &str) -> (Session, Activity) {
+        let activity = activity(Harness::Codex, event, &input).unwrap();
+        let session = Session {
+            key: activity.key.clone(),
+            project: None,
+            worktree: activity.cwd.clone(),
+            branch: None,
+            state: activity.state,
+            last_activity: activity.at,
+            pending_prompts: Vec::new(),
+            owner_pid: None,
+            owner_started: None,
+        };
+        (session, activity)
+    }
+
+    #[test]
+    fn prompts_keep_a_session_waiting_until_each_is_resolved() {
+        let base = json!({"session_id":"s","cwd":"/wt"});
+        let with = |id: &str| {
+            let mut input = base.clone();
+            input["tool_use_id"] = json!(id);
+            input
+        };
+        let step = |previous: Option<Session>, (next, activity): (Session, Activity)| {
+            Session::after(previous, next, &activity).unwrap()
+        };
+        let s = step(None, event(base.clone(), "UserPromptSubmit"));
+        let s = step(Some(s), event(with("p1"), "PermissionRequest"));
+        let s = step(Some(s), event(with("p2"), "PermissionRequest"));
+        let s = step(Some(s), event(with("other"), "PostToolUse"));
+        assert_eq!(s.state, SessionState::Waiting);
+        assert_eq!(s.pending_prompts, ["p1", "p2"]);
+        let s = step(Some(s), event(with("p1"), "PostToolUse"));
+        assert_eq!(s.state, SessionState::Waiting);
+        let s = step(Some(s), event(with("p2"), "PostToolUse"));
+        assert_eq!(s.state, SessionState::Working);
+        // An anonymous prompt gives way to an identified one.
+        let s = step(Some(s), event(base.clone(), "PermissionRequest"));
+        assert_eq!(s.pending_prompts, [ANONYMOUS_PROMPT]);
+        let s = step(Some(s), event(with("p3"), "PermissionRequest"));
+        assert_eq!(s.pending_prompts, ["p3"]);
+        // Stop clears everything outstanding.
+        let s = step(Some(s), event(base.clone(), "Stop"));
+        assert_eq!(s.state, SessionState::Idle);
+        assert!(s.pending_prompts.is_empty());
+
+        let (mut older, activity) = event(base, "Stop");
+        older.last_activity = s.last_activity - 1;
+        assert!(Session::after(Some(s), older, &activity).is_none());
+    }
+
+    #[test]
+    fn pending_prompts_are_bounded() {
+        let mut session = event(json!({"session_id":"s","cwd":"/wt"}), "Stop").0;
+        for i in 0..MAX_PENDING_PROMPTS + 5 {
+            session.wait_on(&format!("p{i}"));
+        }
+        assert_eq!(session.pending_prompts.len(), MAX_PENDING_PROMPTS);
+        assert_eq!(session.pending_prompts[0], "p5");
     }
 }

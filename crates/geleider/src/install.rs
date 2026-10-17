@@ -8,17 +8,19 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::hooks_install;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::hooks_install;
 use crate::paths::{self, Paths};
 
 const LABEL: &str = "com.github.eloyye.geleider";
 const SERVER: &str = "geleider";
 /// Claude Code's user settings, under the home directory; its `statusLine` lives here.
 const CLAUDE_SETTINGS: &str = ".claude/settings.json";
+/// Added to a config file's name for its [`InstallJournal`].
+const JOURNAL_SUFFIX: &str = ".geleider-install";
 
 /// The result of merging geleider's entry into a config file.
 #[derive(Debug, PartialEq, Eq)]
@@ -26,6 +28,8 @@ pub enum Merge {
     Write(String),
     Unchanged,
     RemoveFile,
+    /// Uninstall put back the file exactly as it was before install.
+    Restored,
     /// A `geleider` entry exists that geleider did not write; it is left alone.
     Foreign,
 }
@@ -43,13 +47,9 @@ pub fn install(paths: &Paths) -> Result<()> {
 
     write_starter_config(&paths.config)?;
     install_service(&home, &exe)?;
-    for harness in harnesses(&home) {
-        let outcome = harness.apply(false, |text| (harness.add)(text, &exe));
-        if harness.path == home.join(CLAUDE_SETTINGS) {
-            report_status_line(&harness.path, outcome, false);
-        } else {
-            report(harness.name, &harness.path, outcome, "registered");
-        }
+    for integration in integrations(&home) {
+        let outcome = integration.apply(false, |text| (integration.add)(text, &exe));
+        integration.report(outcome, false);
     }
     println!(
         "Codex: review and trust the installed hooks in /hooks before relying on Session tracking."
@@ -63,14 +63,10 @@ pub fn install(paths: &Paths) -> Result<()> {
 
 pub fn uninstall() -> Result<()> {
     let home = paths::home_dir()?;
-    for harness in harnesses(&home) {
-        if harness.path.exists() {
-            let outcome = harness.apply(true, |text| (harness.remove)(text));
-            if harness.path == home.join(CLAUDE_SETTINGS) {
-                report_status_line(&harness.path, outcome, true);
-            } else {
-                report(harness.name, &harness.path, outcome, "removed");
-            }
+    for integration in integrations(&home) {
+        if integration.path.exists() {
+            let outcome = integration.apply(true, integration.remove);
+            integration.report(outcome, true);
         }
     }
     let plist = plist_path(&home);
@@ -83,13 +79,38 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// What a config file held before geleider first changed it, and what geleider
+/// last wrote there. Uninstall puts back a file the user has not edited since,
+/// byte for byte; an edited one only loses geleider's entries.
 #[derive(Serialize, Deserialize)]
 struct InstallJournal {
     original: Option<String>,
     installed: String,
 }
 
-struct Harness {
+impl InstallJournal {
+    fn path(config: &Path) -> PathBuf {
+        sibling(config, JOURNAL_SUFFIX)
+    }
+
+    fn load(config: &Path) -> Result<Option<Self>> {
+        read_optional(&Self::path(config))?
+            .map(|text| serde_json::from_str(&text).context("reading geleider install journal"))
+            .transpose()
+    }
+
+    /// Written before the config, so an interrupted install can still be undone.
+    fn save(&self, config: &Path) -> Result<()> {
+        write_atomically(&Self::path(config), &serde_json::to_string(self)?, false)
+    }
+
+    fn discard(config: &Path) -> Result<()> {
+        remove_if_present(&Self::path(config))
+    }
+}
+
+/// A config file geleider adds its entries to: an MCP server, hooks or a plugin.
+struct Integration {
     name: &'static str,
     path: PathBuf,
     /// Whether the Harness looks installed, so its config should be touched.
@@ -98,7 +119,7 @@ struct Harness {
     remove: fn(Option<&str>) -> Result<Merge>,
 }
 
-impl Harness {
+impl Integration {
     fn apply(
         &self,
         removing: bool,
@@ -107,73 +128,84 @@ impl Harness {
         if !self.present {
             return Ok(None);
         }
-        let existing = match std::fs::read_to_string(&self.path) {
-            Ok(text) => Some(text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => {
-                return Err(err).with_context(|| format!("reading {}", self.path.display()));
-            }
-        };
-        let journal_path = self.path.with_file_name(format!(
-            "{}.geleider-install",
-            self.path
-                .file_name()
-                .context("config has no name")?
-                .to_string_lossy()
-        ));
-        let journal: Option<InstallJournal> = match std::fs::read_to_string(&journal_path) {
-            Ok(text) => {
-                Some(serde_json::from_str(&text).context("reading geleider install journal")?)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        };
-        if removing
-            && let Some(journal) = &journal
-            && existing.as_deref() == Some(&journal.installed)
-        {
+        let path = &self.path;
+        let existing = read_optional(path)?;
+        let journal = InstallJournal::load(path)?;
+        let untouched = |j: &InstallJournal| existing.as_deref() == Some(j.installed.as_str());
+
+        if removing && let Some(journal) = journal.as_ref().filter(|j| untouched(j)) {
             match &journal.original {
-                Some(original) => write_atomically(&self.path, original, false)?,
-                None => std::fs::remove_file(&self.path)?,
+                Some(original) => write_atomically(path, original, false)?,
+                None => std::fs::remove_file(path)?,
             }
-            std::fs::remove_file(&journal_path)?;
-            return Ok(Some(Merge::Write(String::new())));
+            InstallJournal::discard(path)?;
+            return Ok(Some(Merge::Restored));
         }
-        let merged = merge(existing.as_deref())
-            .with_context(|| format!("updating {}", self.path.display()))?;
-        if let Merge::Write(text) = &merged {
-            if !removing {
-                // Write intent before config so an interrupted install can be undone.
-                let record = InstallJournal {
-                    original: match &journal {
-                        Some(j) if existing.as_deref() == Some(&j.installed) => j.original.clone(),
-                        Some(_) => match (self.remove)(existing.as_deref())? {
-                            Merge::Write(cleaned) => Some(cleaned),
-                            Merge::RemoveFile => None,
-                            _ => existing.clone(),
-                        },
-                        None => existing.clone(),
+
+        let merged =
+            merge(existing.as_deref()).with_context(|| format!("updating {}", path.display()))?;
+        match &merged {
+            Merge::Write(text) if !removing => {
+                let original = match &journal {
+                    None => existing.clone(),
+                    Some(j) if untouched(j) => j.original.clone(),
+                    // Edited since install: what it would be without geleider.
+                    Some(_) => match (self.remove)(existing.as_deref())? {
+                        Merge::Write(cleaned) => Some(cleaned),
+                        Merge::RemoveFile => None,
+                        _ => existing.clone(),
                     },
-                    installed: text.clone(),
                 };
-                write_atomically(&journal_path, &serde_json::to_string(&record)?, false)?;
+                let installed = text.clone();
+                InstallJournal {
+                    original,
+                    installed,
+                }
+                .save(path)?;
+                write_atomically(path, text, existing.is_some())?;
             }
-            write_atomically(&self.path, text, existing.is_some())?;
-            if removing && journal.is_some() {
-                std::fs::remove_file(&journal_path)?;
+            Merge::Write(text) => {
+                write_atomically(path, text, existing.is_some())?;
+                InstallJournal::discard(path)?;
             }
-        }
-        if merged == Merge::RemoveFile {
-            std::fs::remove_file(&self.path)?;
-            if journal.is_some() {
-                std::fs::remove_file(&journal_path)?;
+            Merge::RemoveFile => {
+                std::fs::remove_file(path)?;
+                InstallJournal::discard(path)?;
             }
+            Merge::Unchanged | Merge::Foreign | Merge::Restored => {}
         }
         Ok(Some(merged))
     }
+
+    fn report(&self, outcome: Result<Option<Merge>>, removing: bool) {
+        if self.path.ends_with(CLAUDE_SETTINGS) {
+            report_status_line(&self.path, outcome, removing);
+        } else {
+            let verb = if removing { "removed" } else { "registered" };
+            report(self.name, &self.path, outcome, verb);
+        }
+    }
 }
 
-fn harnesses(home: &Path) -> Vec<Harness> {
+/// The file's text, or `None` if there is no file.
+fn read_optional(path: &Path) -> Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn remove_if_present(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            Err(err).with_context(|| format!("removing {}", path.display()))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn integrations(home: &Path) -> Vec<Integration> {
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"));
@@ -184,42 +216,42 @@ fn harnesses(home: &Path) -> Vec<Harness> {
         .find(|p| p.exists())
         .unwrap_or_else(|| opencode_dir.join("opencode.json"));
     vec![
-        Harness {
+        Integration {
             name: "Claude Code",
             path: home.join(".claude.json"),
             present: home.join(".claude.json").exists() || home.join(".claude").is_dir(),
             add: claude_add,
             remove: claude_remove,
         },
-        Harness {
+        Integration {
             name: "Codex",
             path: codex_home.join("config.toml"),
             present: codex_home.is_dir(),
             add: codex_add,
             remove: codex_remove,
         },
-        Harness {
+        Integration {
             name: "OpenCode",
             path: opencode.clone(),
             present: opencode_dir.is_dir(),
             add: opencode_add,
             remove: opencode_remove,
         },
-        Harness {
+        Integration {
             name: "Claude Code hooks",
             path: home.join(CLAUDE_SETTINGS),
             present: home.join(".claude").is_dir() || home.join(".claude.json").exists(),
             add: claude_settings_add,
             remove: claude_settings_remove,
         },
-        Harness {
+        Integration {
             name: "Codex hooks",
             path: codex_home.join("hooks.json"),
             present: codex_home.is_dir(),
             add: hooks_install::codex_add,
             remove: hooks_install::remove,
         },
-        Harness {
+        Integration {
             name: "OpenCode hooks",
             path: opencode_dir.join("plugins/geleider.ts"),
             present: opencode_dir.is_dir(),
@@ -247,6 +279,9 @@ fn report_status_line(path: &Path, outcome: Result<Option<Merge>>, removing: boo
         Ok(Some(Merge::RemoveFile)) => {
             println!("Claude Code: hooks and status line removed in {path}")
         }
+        Ok(Some(Merge::Restored)) => {
+            println!("Claude Code: {path} restored to its state before install")
+        }
         Ok(Some(Merge::Unchanged)) if !removing => {
             println!("Claude Code: hooks and status line in {path} already up to date")
         }
@@ -265,6 +300,9 @@ fn report(name: &str, path: &Path, outcome: Result<Option<Merge>>, verb: &str) {
         Ok(None) => println!("{name}: not installed, skipped"),
         Ok(Some(Merge::Write(_) | Merge::RemoveFile)) => {
             println!("{name}: integration {verb} in {path}")
+        }
+        Ok(Some(Merge::Restored)) => {
+            println!("{name}: {path} restored to its state before install")
         }
         Ok(Some(Merge::Unchanged)) => println!("{name}: {path} already up to date"),
         Ok(Some(Merge::Foreign)) => {
@@ -630,7 +668,8 @@ fn write_atomically(path: &Path, text: &str, keep_backup: bool) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mode = if path.extension().is_some_and(|e| e == "geleider-install") {
+    // A journal copies a config that can hold credentials; it is never shared.
+    let mode = if path.as_os_str().to_string_lossy().ends_with(JOURNAL_SUFFIX) {
         0o600
     } else {
         std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777)
@@ -653,12 +692,7 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 
 /// Writes a fresh file with `mode`, replacing whatever was at `path`.
 fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
-            return Err(err).with_context(|| format!("removing {}", path.display()));
-        }
-        _ => {}
-    }
+    remove_if_present(path)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -964,7 +998,7 @@ mod tests {
                 hooks_install::opencode_remove,
             ),
         ] {
-            let harness = Harness {
+            let integration = Integration {
                 name: "test",
                 path: dir.path().join(name),
                 present: true,
@@ -972,12 +1006,15 @@ mod tests {
                 remove,
             };
             if let Some(original) = original {
-                std::fs::write(&harness.path, original).unwrap();
+                std::fs::write(&integration.path, original).unwrap();
             }
-            harness.apply(false, |s| add(s, Path::new(EXE))).unwrap();
+            integration
+                .apply(false, |s| add(s, Path::new(EXE)))
+                .unwrap();
             if name == "settings.json" {
                 let installed: Value =
-                    serde_json::from_str(&std::fs::read_to_string(&harness.path).unwrap()).unwrap();
+                    serde_json::from_str(&std::fs::read_to_string(&integration.path).unwrap())
+                        .unwrap();
                 assert!(installed["hooks"]["SessionStart"].is_array());
                 assert_eq!(
                     our_status_line(installed["statusLine"]["command"].as_str().unwrap()),
@@ -985,37 +1022,39 @@ mod tests {
                 );
                 assert_eq!(installed["statusLine"]["padding"], 2);
             }
-            harness
+            integration
                 .apply(false, |s| add(s, Path::new("/new/geleider")))
                 .unwrap();
-            harness.apply(true, remove).unwrap();
+            integration.apply(true, remove).unwrap();
             assert_eq!(
-                std::fs::read_to_string(&harness.path).ok().as_deref(),
+                std::fs::read_to_string(&integration.path).ok().as_deref(),
                 original,
                 "{name}"
             );
         }
-        let harness = Harness {
+        let integration = Integration {
             name: "test",
             path: dir.path().join("changed.json"),
             present: true,
             add: claude_settings_add,
             remove: claude_settings_remove,
         };
-        std::fs::write(&harness.path, "{}").unwrap();
-        harness
-            .apply(false, |s| (harness.add)(s, Path::new(EXE)))
+        std::fs::write(&integration.path, "{}").unwrap();
+        integration
+            .apply(false, |s| (integration.add)(s, Path::new(EXE)))
             .unwrap();
         let mut doc: Value =
-            serde_json::from_str(&std::fs::read_to_string(&harness.path).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&integration.path).unwrap()).unwrap();
         doc["theme"] = json!("light");
-        std::fs::write(&harness.path, doc.to_string()).unwrap();
-        harness
-            .apply(false, |s| (harness.add)(s, Path::new("/updated/geleider")))
+        std::fs::write(&integration.path, doc.to_string()).unwrap();
+        integration
+            .apply(false, |s| {
+                (integration.add)(s, Path::new("/updated/geleider"))
+            })
             .unwrap();
-        harness.apply(true, harness.remove).unwrap();
+        integration.apply(true, integration.remove).unwrap();
         let doc: Value =
-            serde_json::from_str(&std::fs::read_to_string(&harness.path).unwrap()).unwrap();
+            serde_json::from_str(&std::fs::read_to_string(&integration.path).unwrap()).unwrap();
         assert_eq!(doc["theme"], "light");
         assert!(doc.get("hooks").is_none());
         assert!(doc.get("statusLine").is_none());

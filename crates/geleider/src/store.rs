@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
-use crate::session::{Session, SessionKey};
+use crate::session::{Harness, Session, SessionKey, SessionState};
 use crate::usage::{Subscription, Window};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,19 +289,14 @@ impl Store {
             .transpose()
     }
 
+    /// Every recorded Session, by Project with waiting ones first.
     pub fn sessions(&self) -> Result<Vec<Session>> {
-        let mut stmt = self.conn.prepare("SELECT record FROM sessions")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut sessions = Vec::new();
-        for row in rows {
-            sessions.push(serde_json::from_str::<Session>(&row?)?);
-        }
+        let mut sessions = self.query_sessions("SELECT record FROM sessions")?;
         sessions.sort_by(|a, b| {
             a.project
                 .cmp(&b.project)
                 .then_with(|| {
-                    (a.state != crate::session::SessionState::Waiting)
-                        .cmp(&(b.state != crate::session::SessionState::Waiting))
+                    (a.state != SessionState::Waiting).cmp(&(b.state != SessionState::Waiting))
                 })
                 .then_with(|| b.last_activity.cmp(&a.last_activity))
                 .then_with(|| a.key.id.cmp(&b.key.id))
@@ -309,15 +304,48 @@ impl Store {
         Ok(sessions)
     }
 
-    /// Results remain pending until the receiving Harness acknowledges them.
-    pub fn pending_results(&self) -> Result<Vec<Run>> {
+    /// Sessions that have not ended, in no particular order.
+    pub fn live_sessions(&self) -> Result<Vec<Session>> {
+        self.query_sessions(
+            "SELECT record FROM sessions WHERE json_extract(record, '$.state') <> 'ended'",
+        )
+    }
+
+    /// Forgets Sessions that ended before `before` (Unix ms), so history stays bounded.
+    pub fn prune_sessions(&self, before: i64) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM sessions WHERE updated_at < ?1 AND json_extract(record, '$.state') = 'ended'",
+            params![before],
+        )?)
+    }
+
+    fn query_sessions(&self, sql: &str) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    /// Finished Runs whose result a `harness` Session has not acknowledged, oldest first.
+    pub fn pending_results(&self, harness: Harness) -> Result<Vec<Run>> {
         self.query(
             &format!(
-                "SELECT {COLUMNS} FROM runs WHERE json_extract(session, '$.harness') IN ('codex', 'opencode') AND delivered = 0
-            AND state NOT IN ('queued', 'running') ORDER BY id"
+                "SELECT {COLUMNS} FROM runs WHERE delivered = 0 AND state NOT IN ('queued', 'running')
+                 AND json_extract(session, '$.harness') = ?1 ORDER BY id"
             ),
-            [],
+            params![harness.as_str()],
         )
+    }
+
+    /// The oldest finished Run whose result `session` has not acknowledged.
+    pub fn next_result(&self, session: &SessionKey) -> Result<Option<Run>> {
+        let runs = self.query(
+            &format!(
+                "SELECT {COLUMNS} FROM runs WHERE delivered = 0 AND state NOT IN ('queued', 'running')
+                 AND session = ?1 ORDER BY id LIMIT 1"
+            ),
+            params![serde_json::to_string(session)?],
+        )?;
+        Ok(runs.into_iter().next())
     }
 
     pub fn acknowledge(&self, id: i64, session: &SessionKey) -> Result<()> {
@@ -477,10 +505,7 @@ mod tests {
         assert_eq!(store.get(first.id).unwrap().unwrap().job, "old-job");
         assert!(store.get(first.id).unwrap().unwrap().session.is_none());
         let mut new = new_run("new-job");
-        let key = SessionKey {
-            harness: crate::session::Harness::Opencode,
-            id: "root".into(),
-        };
+        let key = SessionKey::new(Harness::Opencode, "root").unwrap();
         new.session = Some(key.clone());
         let run = store.insert(new).unwrap();
         store
@@ -488,22 +513,52 @@ mod tests {
             .unwrap();
         drop(store);
         let store = Store::open(&db, logs).unwrap();
-        assert_eq!(
-            store.pending_results().unwrap()[0].session,
-            Some(key.clone())
-        );
-        store
-            .acknowledge(
-                run.id,
-                &SessionKey {
-                    id: "different-session".into(),
-                    ..key.clone()
-                },
-            )
-            .unwrap();
-        assert_eq!(store.pending_results().unwrap().len(), 1);
+        let pending = store.pending_results(Harness::Opencode).unwrap();
+        assert_eq!(pending[0].session, Some(key.clone()));
+        assert!(store.pending_results(Harness::Codex).unwrap().is_empty());
+        let other = SessionKey::new(Harness::Opencode, "different-session").unwrap();
+        assert!(store.next_result(&other).unwrap().is_none());
+        store.acknowledge(run.id, &other).unwrap();
+        assert_eq!(store.next_result(&key).unwrap().unwrap().id, run.id);
         store.acknowledge(run.id, &key).unwrap();
-        assert!(store.pending_results().unwrap().is_empty());
+        assert!(store.pending_results(Harness::Opencode).unwrap().is_empty());
+        assert!(store.next_result(&key).unwrap().is_none());
+    }
+
+    #[test]
+    fn only_long_ended_sessions_are_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db"), dir.path().join("runs")).unwrap();
+        let session = |id: &str, state, last_activity| Session {
+            key: SessionKey::new(Harness::Codex, id).unwrap(),
+            project: None,
+            worktree: "/wt".into(),
+            branch: None,
+            state,
+            last_activity,
+            pending_prompts: Vec::new(),
+            owner_pid: None,
+            owner_started: None,
+        };
+        store
+            .update_session(&session("old-ended", SessionState::Ended, 10))
+            .unwrap();
+        store
+            .update_session(&session("new-ended", SessionState::Ended, 1000))
+            .unwrap();
+        store
+            .update_session(&session("old-idle", SessionState::Idle, 10))
+            .unwrap();
+        assert_eq!(store.live_sessions().unwrap().len(), 1);
+        assert_eq!(store.prune_sessions(500).unwrap(), 1);
+        let mut left: Vec<_> = store
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.key.id)
+            .collect();
+        left.sort();
+        assert_eq!(left, ["new-ended", "old-idle"]);
     }
 
     #[test]
