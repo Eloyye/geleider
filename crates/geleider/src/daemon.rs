@@ -644,6 +644,13 @@ impl Daemon {
 
     fn handle(self: &Arc<Self>, request: Request) -> Result<Reply> {
         match request {
+            Request::ReviewActivity { mut activity } => {
+                // This request only ever records a Cross-review, which must never
+                // be counted as a PR's writing Session.
+                activity.review = true;
+                self.record_activity(activity)?;
+                Ok(Reply::Recorded)
+            }
             Request::FinishedWorktrees => Ok(Reply::Worktrees(self.finished(true)?)),
             Request::Clean { worktrees, cwd } => self.clean(worktrees, &cwd),
             Request::Submit {
@@ -931,6 +938,8 @@ fn locate_session(config: &Config, activity: &Activity) -> Session {
         pending_prompts: Vec::new(),
         owner_pid: activity.owner_pid,
         owner_started: activity.owner_pid.and_then(procs::start_time),
+        provider_id: activity.provider_id.clone(),
+        review: activity.review,
     }
 }
 

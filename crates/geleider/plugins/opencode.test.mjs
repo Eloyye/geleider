@@ -97,11 +97,21 @@ if (args[0] === 'session-results') {
     const read = { id: "call-5", sessionID: "root", tool: "geleider_status", input: { session: "kept" } };
     await hooks.get("execute.before")(read);
     assert.deepEqual(read.input, { session: "kept" });
+    events.push({ type: "session.step.started", data: { sessionID: "root", model: { providerID: "openai", id: "model" }, text: "private" } });
+    events.push({ type: "session.step.started", data: { sessionID: "child", model: { providerID: "anthropic" } } });
+    await until(async () => (await calls()).some((c) => c.args[2] === "session.step.started"));
+    const provider = (await calls()).filter((c) => c.args[2] === "session.step.started");
+    assert.equal(provider.length, 1);
+    assert.equal(provider[0].input.provider_id, "openai");
+    assert.equal(provider[0].input.text, undefined);
+    // The same provider again, as on every later step, is not reported again.
+    events.push({ type: "message.updated", data: { info: { sessionID: "root", role: "assistant", providerID: "openai" } } });
     events.push({ type: "permission.asked", data: { sessionID: "root", id: "permission" } });
     events.push({ type: "session.idle", data: { sessionID: "child" } });
     events.push({ type: "form.created", data: { form: { sessionID: "root", id: "question" } } });
     await until(async () => (await calls()).some((c) => c.args[2] === "form.created"));
     assert.ok(!(await calls()).some((c) => c.args[2] === "session.idle"));
+    assert.ok(!(await calls()).some((c) => c.args[2] === "message.updated"));
     await until(() => deliveryAttempts > 0);
     assert.equal(prompts.length, 0);
     assert.ok(!(await calls()).some((c) => c.args.includes("--ack")));

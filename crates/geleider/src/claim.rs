@@ -345,6 +345,8 @@ mod tests {
             pending_prompts: Vec::new(),
             owner_pid: None,
             owner_started: None,
+            provider_id: None,
+            review: false,
         };
         let at = |now, s: Option<&Session>| ClaimStatus::new(c.clone(), s, QUIET_AFTER, now);
         assert!(!at(c.claimed_at + day, None).quiet);

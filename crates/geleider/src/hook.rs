@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::attest::{Attestation, Destination, Nonce};
-use crate::claim;
 use crate::paths::Paths;
 use crate::session::{self, Activity, Harness};
+use crate::{claim, review};
 
 /// The longest a Harness waits on stdin before the hook gives up.
 const INPUT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -61,7 +61,18 @@ fn forward(paths: &Paths, harness: Harness, event: &str) -> Result<()> {
         reply("SessionStart", "additionalContext", json!(warning));
     }
     match session::activity(harness, event, &input) {
-        Some(activity) => send(paths, &Datagram::Activity(activity)),
+        Some(mut activity) => {
+            // A headless Cross-review has one process-owned Session even when
+            // installed Harness hooks emit a second native id. Only activity is
+            // coalesced; this never changes an attested result destination.
+            if let Ok(id) = std::env::var(review::REVIEW_SESSION_ENV)
+                && let Some(key) = session::SessionKey::new(harness, &id)
+            {
+                activity.key = key;
+                activity.review = true;
+            }
+            send(paths, &Datagram::Activity(activity))
+        }
         None => Ok(()),
     }
 }

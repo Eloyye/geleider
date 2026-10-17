@@ -224,7 +224,72 @@ impl PullRequests for Gh {
     }
 }
 
+/// A PR's pinned commits, as a Cross-review sees them.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrCommits {
+    pub number: u64,
+    pub head_ref_name: String,
+    pub head_ref_oid: String,
+    pub base_ref_oid: String,
+    pub is_cross_repository: bool,
+}
+
+impl PrCommits {
+    /// Whether `other` still points at the same base and head commits.
+    pub fn same_commits(&self, other: &PrCommits) -> bool {
+        self.head_ref_oid == other.head_ref_oid && self.base_ref_oid == other.base_ref_oid
+    }
+}
+
+/// A full commit id, which git can never read as an option or a revision range.
+fn is_commit_id(oid: &str) -> bool {
+    oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 impl Gh {
+    /// PR `number` in `repo`, with its commits validated before git sees them.
+    pub fn pr_commits(&self, repo: &str, number: u64) -> Result<PrCommits> {
+        let json = self.run(
+            &[
+                "pr",
+                "view",
+                &number.to_string(),
+                "--repo",
+                repo,
+                "--json",
+                "number,headRefName,headRefOid,baseRefOid,isCrossRepository",
+            ],
+            None,
+        )?;
+        let pr: PrCommits = serde_json::from_str(&json).context("decoding the PR from gh")?;
+        if !is_commit_id(&pr.head_ref_oid) || !is_commit_id(&pr.base_ref_oid) {
+            bail!("GitHub returned an invalid PR commit");
+        }
+        if pr.number != number {
+            bail!("GitHub returned a different PR");
+        }
+        Ok(pr)
+    }
+
+    /// Posts `body` as a comment review, which never approves or blocks the PR.
+    pub fn comment_review(&self, repo: &str, number: u64, body: &str) -> Result<()> {
+        self.run(
+            &[
+                "pr",
+                "review",
+                &number.to_string(),
+                "--repo",
+                repo,
+                "--comment",
+                "--body-file",
+                "-",
+            ],
+            Some(body),
+        )?;
+        Ok(())
+    }
+
     fn run(&self, args: &[&str], input: Option<&str>) -> Result<String> {
         let output = command::output_within(
             Command::new("gh").args(args),

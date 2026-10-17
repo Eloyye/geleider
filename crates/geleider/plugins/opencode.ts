@@ -97,7 +97,10 @@ export default {
     const supported = new Set([
       "session.created", "session.deleted", "session.status", "session.idle", "session.error",
       "permission.asked", "permission.replied", "form.created", "form.replied", "form.cancelled",
+      "session.step.started", "message.updated",
     ]);
+    // The last provider reported for each root Session.
+    const providers = new Map<string, string>();
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
@@ -105,15 +108,26 @@ export default {
           if (!supported.has(event.type)) continue;
           const fields = event.data;
           const form = fields.form as { sessionID?: string } | undefined;
-          const id = (fields.sessionID ?? form?.sessionID) as string | undefined;
+          const message = fields.info as { sessionID?: string; role?: string; providerID?: string } | undefined;
+          const id = (fields.sessionID ?? form?.sessionID ?? message?.sessionID) as string | undefined;
           if (!id) continue;
           const info = await root(id);
           if (!info) continue;
           if (info.id !== id && event.type !== "permission.asked" && event.type !== "form.created") continue;
-          await report(info, event.type, fields);
+          if (event.type === "session.step.started" || event.type === "message.updated") {
+            if (event.type === "message.updated" && message?.role !== "assistant") continue;
+            const model = fields.model as { providerID?: string } | undefined;
+            const provider = model?.providerID ?? message?.providerID;
+            // Send only provider identity, never message text or model output,
+            // and only when it changes: these events fire on every step.
+            if (typeof provider !== "string" || providers.get(id) === provider) continue;
+            providers.set(id, provider);
+            await report(info, event.type, { provider_id: provider });
+          } else await report(info, event.type, fields);
           if (event.type === "session.deleted") {
             roots.delete(id);
             known.delete(id);
+            providers.delete(id);
           }
         }
       } catch { /* Subscription disposal or unavailable server. */ }

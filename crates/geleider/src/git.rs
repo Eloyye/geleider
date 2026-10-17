@@ -13,6 +13,9 @@ use crate::config::{Config, Project};
 
 /// How long one git call may take. Hooks queue Session activity behind it.
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long fetching and checking out a PR's commits may take. Only an explicit
+/// Cross-review waits on this, never a hook.
+const CHECKOUT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
 pub struct Location<'a> {
@@ -73,6 +76,10 @@ pub fn locate<'a>(config: &'a Config, cwd: &Path) -> Result<Location<'a>> {
 /// `dir` comes from the caller and may hold a repository an agent wrote, so git's
 /// settings that run commands are switched off and it never prompts.
 fn git<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<Output> {
+    git_within(dir, args, GIT_TIMEOUT)
+}
+
+fn git_within<S: AsRef<OsStr>>(dir: &Path, args: &[S], timeout: Duration) -> Result<Output> {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -86,12 +93,15 @@ fn git<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<Output> {
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0");
-    command::output_within(&mut command, None, GIT_TIMEOUT)
+    command::output_within(&mut command, None, timeout)
 }
 
 /// git's output, or its error message if it failed.
 fn git_stdout<S: AsRef<OsStr>>(dir: &Path, args: &[S]) -> Result<String> {
-    let output = git(dir, args)?;
+    checked(git(dir, args)?)
+}
+
+fn checked(output: Output) -> Result<String> {
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
@@ -274,6 +284,37 @@ pub fn remove_worktree(clone: &Path, worktree: &Path) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+/// Checks out `head` in a new detached worktree of `clone` at `worktree`,
+/// first fetching any of `commits` the clone lacks from `url`. Commits are
+/// validated object names, so none can be read as an option.
+pub fn add_detached_worktree(
+    clone: &Path,
+    url: &str,
+    commits: &[&str],
+    head: &str,
+    worktree: &Path,
+) -> Result<()> {
+    for oid in commits {
+        if git_stdout(clone, &["cat-file", "-e", &format!("{oid}^{{commit}}")]).is_err() {
+            let fetch = ["fetch", "--no-tags", "--no-write-fetch-head", url, oid];
+            checked(git_within(clone, &fetch, CHECKOUT_TIMEOUT)?)
+                .with_context(|| format!("fetching commit {oid}"))?;
+        }
+    }
+    let path = worktree.to_str().context("worktree path is not UTF-8")?;
+    let add = ["worktree", "add", "--detach", "--", path, head];
+    checked(git_within(clone, &add, CHECKOUT_TIMEOUT)?)?;
+    Ok(())
+}
+
+/// The committed changes from the merge base of `base` and `head` to `head`,
+/// as GitHub shows a PR, without external diff or textconv programs.
+pub fn pr_diff(worktree: &Path, base: &str, head: &str) -> Result<String> {
+    let range = format!("{base}...{head}");
+    let args = ["diff", "--no-ext-diff", "--no-textconv", &range, "--"];
+    checked(git_within(worktree, &args, CHECKOUT_TIMEOUT)?)
 }
 
 /// The branch checked out in `worktree`, or `None` on a detached HEAD.
