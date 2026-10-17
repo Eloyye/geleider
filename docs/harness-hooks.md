@@ -191,7 +191,7 @@ no desktop hook failure is claimed from the CLI checks.
 
 For the remaining desktop smoke checks, restart each Harness after installing:
 
-1. Open a Queendom worktree in Claude Code CLI, Claude desktop, Codex CLI,
+1. Open a Lanternfall worktree in Claude Code CLI, Claude desktop, Codex CLI,
    Codex desktop and OpenCode. Confirm the exact Session id, worktree and branch
    in `geleider status --json`.
 2. Trigger a permission prompt and a question tool. Confirm waiting while the

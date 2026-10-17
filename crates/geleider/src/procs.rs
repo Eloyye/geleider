@@ -12,7 +12,7 @@ pub struct Process {
     /// `ps`'s start time. With the pid it identifies a process even if the pid is
     /// reused later.
     pub started: String,
-    /// The executable's file name, e.g. `ck3`.
+    /// The executable's file name, e.g. `Unity`.
     pub name: String,
 }
 
@@ -129,13 +129,13 @@ mod tests {
     fn parses_ps_output_with_spaces_in_paths() {
         let snapshot = Snapshot::parse(
             "    1     0 Wed Oct 15 09:00:01 2026     /sbin/launchd\n\
-             4567     1 Wed Oct 15 18:03:00 2026     /Games/Crusader Kings III/binaries/ck3.app/Contents/MacOS/ck3\n\
+             4567     1 Wed Oct 15 18:03:00 2026     /Volumes/External SSD/Unity/6000.0.23f1/Unity.app/Contents/MacOS/Unity\n\
              garbage\n",
         );
-        let ck3 = &snapshot.processes[&4567];
-        assert_eq!(ck3.name, "ck3");
-        assert_eq!(ck3.ppid, 1);
-        assert_eq!(ck3.started, "Wed Oct 15 18:03:00 2026");
+        let unity = &snapshot.processes[&4567];
+        assert_eq!(unity.name, "Unity");
+        assert_eq!(unity.ppid, 1);
+        assert_eq!(unity.started, "Wed Oct 15 18:03:00 2026");
         assert_eq!(snapshot.processes.len(), 2);
         assert!(snapshot.is_alive(4567, Some("Wed Oct 15 18:03:00 2026")));
         assert!(!snapshot.is_alive(4567, Some("Thu Oct 16 08:00:00 2026")));

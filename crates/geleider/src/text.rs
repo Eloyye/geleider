@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn code_spans_cannot_be_closed_from_inside() {
-        assert_eq!(code_span("ck3-test events"), "`ck3-test events`");
+        assert_eq!(code_span("playmode-test combat"), "`playmode-test combat`");
         // A backtick in an arg would otherwise end the span and let a link through.
         assert_eq!(
             code_span("x` [click](https://e.vil) @team `"),

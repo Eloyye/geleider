@@ -37,15 +37,15 @@ _Avoid_: Stale worktree, dead worktree
 ### Scheduling
 
 **Resource**:
-A named thing on this Mac, recognised by the process that uses it, that only a fixed number of processes may use at once, such as `ck3` with one slot. It is shared by every Project.
+A named thing on this Mac, recognised by the process that uses it, that only a fixed number of processes may use at once, such as `unity` with one slot, since only one Unity Editor may have a project open at a time. It is shared by every Project.
 _Avoid_: GPU (the limit is often memory, not the GPU)
 
 **Lease**:
-One slot of a Resource, taken by a running Job or by any other process using the Resource, such as you play-testing CK3. It ends when that process exits, even if it crashes.
+One slot of a Resource, taken by a running Job or by any other process using the Resource, such as you working in the Unity Editor. It ends when that process exits, even if it crashes.
 _Avoid_: Lock, mutex
 
 **Job**:
-A named command a Project declares, such as `ck3-test <suite>`, that needs a Resource. A Session submits it and geleider runs it, outside any sandbox, once a slot is free. Jobs are declared in geleider's own config, never in the Project, so agents cannot add them.
+A named command a Project declares, such as `playmode-test <suite>`, that needs a Resource. A Session submits it and geleider runs it, outside any sandbox, once a slot is free. Jobs are declared in geleider's own config, never in the Project, so agents cannot add them.
 _Avoid_: Task, script
 
 **Run**:

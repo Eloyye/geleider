@@ -824,20 +824,20 @@ const STARTER_CONFIG: &str = r#"# geleider config. Jobs are declared only here, 
 # plan = "ChatGPT Plus"
 # enabled = true
 #
-# [resources.ck3]
+# [resources.unity]
 # slots = 1                 # how many processes may use it at once
-# process = "ck3"           # executable name; any running process with it holds a Lease
+# process = "Unity"         # executable name; any running process with it holds a Lease
 #
-# [projects.queendom]
-# repo = "owner/queendom"
-# path = "~/code/queendom"  # the clone; its worktrees belong to the Project too
-# vars = { ck3_dir = "~/Library/Application Support/Steam/steamapps/common/Crusader Kings III" }
+# [projects.lanternfall]
+# repo = "owner/lanternfall"
+# path = "~/code/lanternfall"  # the clone; its worktrees belong to the Project too
+# vars = { unity = "/Applications/Unity/Hub/Editor/6000.0.23f1/Unity.app/Contents/MacOS/Unity" }
 #
-# [projects.queendom.jobs.ck3-test]
-# resource = "ck3"
-# args = ["suite"]          # geleider run ck3-test <suite>
+# [projects.lanternfall.jobs.playmode-test]
+# resource = "unity"
+# args = ["suite"]          # geleider run playmode-test <suite>
 # # Split like a shell would, but never run through one. {worktree} is built in.
-# command = "scripts/test-engine.sh {suite} {ck3_dir}"
+# command = "scripts/run-playmode.sh {suite} {unity}"
 "#;
 
 fn write_starter_config(path: &Path) -> Result<()> {

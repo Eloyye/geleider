@@ -225,7 +225,7 @@ fn tools() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job": { "type": "string", "description": "Job name, e.g. `ck3-test`." },
+                    "job": { "type": "string", "description": "Job name, e.g. `playmode-test`." },
                     "args": { "type": "array", "items": { "type": "string" }, "description": "The Job's positional args." },
                     "cwd": cwd_schema(),
                     "session": session_schema("Any value you write is replaced, and one no hook attested turns result delivery off.")
@@ -365,14 +365,14 @@ mod tests {
         let result = server
             .handle(
                 json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-                       "params": {"name": "submit_run", "arguments": {"job": "ck3-test", "args": ["events"], "cwd": "/wt"}}}),
+                       "params": {"name": "submit_run", "arguments": {"job": "playmode-test", "args": ["combat"], "cwd": "/wt"}}}),
                 &call,
             )
             .unwrap();
         assert_eq!(result["result"]["isError"], true);
         assert_eq!(
             seen.borrow()[0],
-            json!({"op": "submit", "cwd": "/wt", "job": "ck3-test", "args": ["events"], "submitter": "mcp:codex", "session": null})
+            json!({"op": "submit", "cwd": "/wt", "job": "playmode-test", "args": ["combat"], "submitter": "mcp:codex", "session": null})
         );
 
         server.handle(
