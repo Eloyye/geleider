@@ -38,8 +38,43 @@ pub fn duration(ms: i64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m {:02}s", s / 60, s % 60),
-        s => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
+        s if s < 86_400 => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
+        s => format!("{}d {:02}h", s / 86_400, (s % 86_400) / 3600),
     }
+}
+
+/// A local time such as `14:05`, with the weekday when it is not today and the
+/// date when it is not within a week: `Fri 09:00`, `Oct 21 09:00`.
+pub fn clock(ms: i64, now: i64) -> String {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (Some(at), Some(today)) = (local_time(ms), local_time(now)) else {
+        let secs = ms.div_euclid(1000).rem_euclid(86_400);
+        return format!("{:02}:{:02} UTC", secs / 3600, secs % 3600 / 60);
+    };
+    let time = format!("{:02}:{:02}", at.tm_hour, at.tm_min);
+    if (at.tm_year, at.tm_yday) == (today.tm_year, today.tm_yday) {
+        time
+    } else if (ms - now).abs() < 6 * 86_400_000 {
+        format!("{} {time}", DAYS[at.tm_wday as usize % 7])
+    } else {
+        format!("{} {} {time}", MONTHS[at.tm_mon as usize % 12], at.tm_mday)
+    }
+}
+
+/// The local calendar time at `ms`, or `None` if the C library cannot represent
+/// it. The standard library has no time zones, and pulling in a date crate for
+/// one `localtime_r` call is not worth it.
+fn local_time(ms: i64) -> Option<libc::tm> {
+    let secs = libc::time_t::try_from(ms.div_euclid(1000)).ok()?;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: both pointers are valid for the call; localtime_r fills `tm` and
+    // returns it, or returns null and leaves it unspecified.
+    let filled = unsafe { libc::localtime_r(&secs, tm.as_mut_ptr()) };
+    // SAFETY: a non-null return means `tm` was fully written.
+    (!filled.is_null()).then(|| unsafe { tm.assume_init() })
 }
 
 /// e.g. `ck3-test events`.
@@ -138,6 +173,15 @@ mod tests {
         assert_eq!(duration(4_200), "4s");
         assert_eq!(duration(192_000), "3m 12s");
         assert_eq!(duration(3_723_000), "1h 02m");
+        assert_eq!(duration(273_600_000), "3d 04h");
+    }
+
+    #[test]
+    fn clock_names_the_day_only_when_needed() {
+        let now = crate::store::now_ms();
+        assert_eq!(clock(now, now).len(), "14:05".len());
+        assert_eq!(clock(now + 3 * 86_400_000, now).len(), "Fri 14:05".len());
+        assert_eq!(clock(now + 20 * 86_400_000, now).split(' ').count(), 3);
     }
 
     #[test]

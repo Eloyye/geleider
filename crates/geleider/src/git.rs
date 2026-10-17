@@ -1,7 +1,7 @@
 //! Working out which Project and worktree a caller's directory belongs to.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 use anyhow::{Context, Result, bail};
 
@@ -28,6 +28,17 @@ pub fn locate<'a>(config: &'a Config, cwd: &Path) -> Result<Location<'a>> {
             continue;
         };
         if project_common == common_dir {
+            // A `.git` file can point any directory at the clone's repository, so
+            // the shared repository alone does not make it the Project's. Only the
+            // clone and the worktrees it registered are.
+            if !worktrees(&clone)?.contains(&worktree) {
+                bail!(
+                    "{} is not the clone or a worktree of project `{name}` \
+                     (see `git -C {} worktree list`)",
+                    worktree.display(),
+                    clone.display()
+                );
+            }
             return Ok(Location {
                 project_name: name,
                 project,
@@ -48,28 +59,54 @@ pub fn locate<'a>(config: &'a Config, cwd: &Path) -> Result<Location<'a>> {
     )
 }
 
-/// The worktree root and the shared `.git` directory of the repo at `dir`.
-fn repo_dirs(dir: &Path) -> Result<(PathBuf, PathBuf)> {
-    let output = Command::new("git")
+/// Runs git in `dir`. The background process runs outside any sandbox, while
+/// `dir` comes from the caller and may hold a repository an agent wrote, so git's
+/// settings that run commands are switched off and it never prompts.
+fn git(dir: &Path, args: &[&str]) -> Result<Output> {
+    Command::new("git")
         .arg("-C")
         .arg(dir)
         .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .context("running git")
+}
+
+/// git's output, or its error message if it failed.
+fn git_stdout(dir: &Path, args: &[&str]) -> Result<String> {
+    let output = git(dir, args)?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn canonical(path: &str) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+}
+
+/// The worktree root and the shared `.git` directory of the repo at `dir`.
+fn repo_dirs(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    let text = git_stdout(
+        dir,
+        &[
             "rev-parse",
             "--path-format=absolute",
             "--show-toplevel",
             "--git-common-dir",
-        ])
-        .output()
-        .context("running git")?;
-    if !output.status.success() {
-        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
+        ],
+    )?;
     let mut lines = text.lines();
     let (Some(top), Some(common)) = (lines.next(), lines.next()) else {
         bail!("unexpected output from git rev-parse");
     };
-    let canonical = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
     Ok((canonical(top), canonical(common)))
 }
 
@@ -78,23 +115,28 @@ pub fn worktree(cwd: &Path) -> Option<PathBuf> {
     repo_dirs(cwd).ok().map(|(root, _)| root)
 }
 
+/// The clone itself and every worktree it has registered.
+fn worktrees(clone: &Path) -> Result<Vec<PathBuf>> {
+    let text = git_stdout(clone, &["worktree", "list", "--porcelain"])?;
+    Ok(text
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(canonical)
+        .collect())
+}
+
 /// The branch checked out in `worktree`, or `None` on a detached HEAD.
 pub fn branch(worktree: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree)
-        .args(["symbolic-ref", "--short", "-q", "HEAD"])
-        .output()
-        .ok()?;
-    let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (output.status.success() && !name.is_empty()).then_some(name)
+    let name = git_stdout(worktree, &["symbolic-ref", "--short", "-q", "HEAD"]).ok()?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn git(dir: &Path, args: &[&str]) {
+    fn run_git(dir: &Path, args: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
             .arg(dir)
@@ -113,8 +155,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let clone = dir.path().join("queendom");
         std::fs::create_dir(&clone).unwrap();
-        git(&clone, &["init", "-q", "-b", "main"]);
-        git(
+        run_git(&clone, &["init", "-q", "-b", "main"]);
+        run_git(
             &clone,
             &[
                 "-c",
@@ -129,7 +171,7 @@ mod tests {
             ],
         );
         let wt = dir.path().join("wt-feat");
-        git(
+        run_git(
             &clone,
             &[
                 "worktree",
@@ -155,5 +197,52 @@ mod tests {
         assert_eq!(found.branch.as_deref(), Some("feat/x"));
 
         assert!(locate(&config, dir.path()).is_err());
+        let found = locate(&config, &clone).unwrap();
+        assert_eq!(found.branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_directory_pointed_at_the_clone_is_not_one_of_its_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("queendom");
+        std::fs::create_dir(&clone).unwrap();
+        run_git(&clone, &["init", "-q", "-b", "main"]);
+
+        // What an agent could write anywhere it may write: a worktree-style git
+        // dir whose `commondir` names the clone's repository.
+        let fake_gitdir = dir.path().join("fake-gitdir");
+        std::fs::create_dir(&fake_gitdir).unwrap();
+        std::fs::write(fake_gitdir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            fake_gitdir.join("commondir"),
+            format!("{}\n", clone.join(".git").display()),
+        )
+        .unwrap();
+        let crafted = dir.path().join("crafted");
+        std::fs::create_dir(&crafted).unwrap();
+        std::fs::write(
+            crafted.join(".git"),
+            format!("gitdir: {}\n", fake_gitdir.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            fake_gitdir.join("gitdir"),
+            crafted.join(".git").display().to_string(),
+        )
+        .unwrap();
+        // git itself takes it as sharing the clone's repository.
+        let (_, common) = repo_dirs(&crafted).unwrap();
+        assert_eq!(common, std::fs::canonicalize(clone.join(".git")).unwrap());
+
+        let config = Config::parse(&format!(
+            "[projects.queendom]\nrepo = \"Eloyye/queendom\"\npath = \"{}\"\n",
+            clone.display()
+        ))
+        .unwrap();
+        let err = locate(&config, &crafted).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("not the clone or a worktree"),
+            "{err:#}"
+        );
     }
 }

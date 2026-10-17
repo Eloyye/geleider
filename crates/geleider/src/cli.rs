@@ -4,12 +4,14 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use serde::Serialize;
 
 use crate::lease::Holder;
 use crate::paths::{self, Paths};
 use crate::protocol::{self, Request, RunInfo, Status};
 use crate::report;
 use crate::store::{RunState, now_ms};
+use crate::usage::{SubscriptionUsage, WindowView};
 
 /// Finished Runs `geleider queue --all` shows.
 const RECENT: usize = 20;
@@ -30,11 +32,7 @@ pub fn submit(
     };
     let info = protocol::call(paths, &request)?.into_run()?;
     if !wait {
-        if json {
-            println!("{}", serde_json::to_string_pretty(&info)?);
-        } else {
-            println!("{}", one_line(&info));
-        }
+        print_as(json, &info, || one_line(&info) + "\n")?;
         return Ok(0);
     }
     eprintln!("{}", one_line(&info));
@@ -80,26 +78,37 @@ pub fn show(paths: &Paths, id: i64, json: bool) -> Result<i32> {
 pub fn queue(paths: &Paths, all: bool, json: bool) -> Result<i32> {
     let finished = if all { RECENT } else { 0 };
     let runs = protocol::call(paths, &Request::ListRuns { finished })?.into_runs()?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&runs)?);
-    } else if runs.is_empty() {
-        println!("No runs queued or running.");
-    } else {
-        for info in &runs {
-            println!("{}", one_line(info));
+    print_as(json, &runs, || {
+        if runs.is_empty() {
+            return "No runs queued or running.\n".into();
         }
-    }
+        runs.iter().map(|info| one_line(info) + "\n").collect()
+    })?;
     Ok(0)
 }
 
 pub fn status(paths: &Paths, json: bool) -> Result<i32> {
     let status = protocol::call(paths, &Request::Status)?.into_status()?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&status)?);
-    } else {
-        print!("{}", render_status(&status));
-    }
+    print_as(json, &status, || render_status(&status))?;
     Ok(0)
+}
+
+pub fn usage(paths: &Paths, json: bool) -> Result<i32> {
+    let subscriptions = protocol::call(paths, &Request::Usage)?.into_usage()?;
+    print_as(json, &subscriptions, || {
+        render_usage(&subscriptions, now_ms())
+    })?;
+    Ok(0)
+}
+
+/// Prints `value` as JSON for scripts, or `text` for people.
+fn print_as(json: bool, value: &impl Serialize, text: impl FnOnce() -> String) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    } else {
+        print!("{}", text());
+    }
+    Ok(())
 }
 
 fn render_status(status: &Status) -> String {
@@ -175,7 +184,49 @@ fn render_status(status: &Status) -> String {
             out.push_str(&format!("  {}\n", one_line(info)));
         }
     }
+    if !status.subscriptions.is_empty() {
+        out.push('\n');
+        out.push_str(&render_usage(&status.subscriptions, now_ms()));
+    }
     out
+}
+
+pub fn render_usage(subscriptions: &[SubscriptionUsage], now: i64) -> String {
+    let mut out = String::from("Subscriptions\n");
+    for usage in subscriptions {
+        out.push_str(&format!("  {}  ({})\n", usage.plan, usage.source));
+        if usage.windows.is_empty() {
+            out.push_str(&format!("    {}\n", usage.subscription.no_data_hint()));
+        }
+        for window in &usage.windows {
+            out.push_str(&format!("    {}\n", window_line(window, now)));
+        }
+    }
+    out
+}
+
+/// e.g. `5h  23% used, resets 14:05 (in 2h 10m)  updated 3m ago`.
+fn window_line(window: &WindowView, now: i64) -> String {
+    let state = match (window.used_percent, window.resets_at) {
+        (Some(used), Some(at)) => format!(
+            "{used:>3.0}% used, resets {} (in {})",
+            report::clock(at, now),
+            report::duration(at - now)
+        ),
+        (Some(used), None) => format!("{used:>3.0}% used"),
+        (None, Some(at)) => format!("reset at {}, no data since", report::clock(at, now)),
+        (None, None) => "unknown".into(),
+    };
+    let age = report::duration(window.age_ms);
+    let freshness = if window.stale {
+        format!(
+            "last known at {} ({age} ago)",
+            report::clock(window.observed_at, now)
+        )
+    } else {
+        format!("updated {age} ago")
+    };
+    format!("{:<3} {state}  {freshness}", window.window)
 }
 
 /// e.g. `#12 running  ck3-test events  queendom  feat/x  for 3m 12s`.
@@ -209,30 +260,31 @@ pub fn one_line(info: &RunInfo) -> String {
 }
 
 fn print_result(info: &RunInfo, json: bool) -> Result<()> {
-    if json {
-        println!("{}", serde_json::to_string_pretty(info)?);
-        return Ok(());
-    }
+    print_as(json, info, || render_result(info))
+}
+
+/// A Run's one-line summary, its details and, once it has finished, its log tail.
+fn render_result(info: &RunInfo) -> String {
     let run = &info.run;
-    println!("{}", one_line(info));
-    println!("  worktree   {}", paths::display(&run.worktree));
+    let mut out = format!("{}\n", one_line(info));
+    out.push_str(&format!("  worktree   {}\n", paths::display(&run.worktree)));
     if let Some(code) = run.exit_code {
-        println!("  exit code  {code}");
+        out.push_str(&format!("  exit code  {code}\n"));
     }
     if let Some(ms) = run.duration_ms() {
-        println!("  duration   {}", report::duration(ms));
+        out.push_str(&format!("  duration   {}\n", report::duration(ms)));
     }
     if let Some(error) = &run.error {
-        println!("  error      {error}");
+        out.push_str(&format!("  error      {error}\n"));
     }
-    println!(
-        "  log        {}",
+    out.push_str(&format!(
+        "  log        {}\n",
         paths::display(&PathBuf::from(&run.log_path))
-    );
+    ));
     if let Some(tail) = info.log_tail.as_deref().filter(|t| !t.is_empty()) {
-        println!("\n{tail}");
+        out.push_str(&format!("\n{tail}\n"));
     }
-    Ok(())
+    out
 }
 
 /// The Run's own exit code; 1 when it has none (lost, or never started).

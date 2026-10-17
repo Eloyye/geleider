@@ -125,6 +125,8 @@ command = "sh -c 'echo hello \"$0\" from \"$PWD\"; exit 3' {{name}}"
                     std::env::var("PATH").unwrap_or_default()
                 ),
             )
+            // Never the real Codex's session logs.
+            .env("CODEX_HOME", self.root().join("codex"))
             .current_dir(self.repo());
         cmd
     }
@@ -717,4 +719,162 @@ fn a_shared_mcp_process_keeps_session_destinations_separate_and_results_survive_
         serde_json::from_slice::<Value>(&out.stdout).unwrap()[0]["run_id"],
         ids[0]
     );
+}
+
+/// What Claude Code passes its status line, with the given 5-hour and 7-day usage.
+fn claude_status_input(five_hour: f64, seven_day: f64, now: i64) -> String {
+    serde_json::json!({
+        "model": { "display_name": "Opus" },
+        "rate_limits": {
+            "five_hour": { "used_percentage": five_hour, "resets_at": now + 3 * 3600 },
+            "seven_day": { "used_percentage": seven_day, "resets_at": now + 4 * 86_400 }
+        }
+    })
+    .to_string()
+}
+
+fn statusline(env: &Env, args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+
+    let mut child = env
+        .command()
+        .arg("statusline")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn status_shows_both_subscriptions_with_their_age() {
+    let env = Env::new("fakegame-usage");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    // A Codex session two hours ago left its limits in its session log.
+    let day = env.root().join("codex/sessions/2026/10/16");
+    std::fs::create_dir_all(&day).unwrap();
+    let written_at = Command::new("date")
+        .args([
+            "-u",
+            "-r",
+            &(now - 7200).to_string(),
+            "+%Y-%m-%dT%H:%M:%S.000Z",
+        ])
+        .output()
+        .unwrap();
+    let entry = serde_json::json!({
+        "timestamp": String::from_utf8_lossy(&written_at.stdout).trim(),
+        "type": "event_msg",
+        "payload": { "type": "token_count", "info": null, "rate_limits": {
+            "limit_id": "codex",
+            "primary": { "used_percent": 31.0, "window_minutes": 300, "resets_at": now + 3600 },
+            "secondary": { "used_percent": 9.0, "window_minutes": 10080, "resets_at": now + 86_400 }
+        }}
+    });
+    std::fs::write(
+        day.join("rollout-2026-10-16T07-00-00-x.jsonl"),
+        format!("{entry}\n"),
+    )
+    .unwrap();
+
+    // A Claude Code CLI session renders its status line.
+    let out = statusline(&env, &[], &claude_status_input(23.5, 41.0, now));
+    assert!(out.status.success());
+    let line = String::from_utf8_lossy(&out.stdout);
+    assert!(line.starts_with("Opus · 5h 24% until "), "{line}");
+
+    // A status line the user already had keeps its output.
+    let out = statusline(
+        &env,
+        &["--wrap", "read -r input; echo \"mine: ${#input}\"; exit 3"],
+        &claude_status_input(25.0, 41.0, now),
+    );
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("mine: "));
+
+    let status = env.geleider(&["status", "--json"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    let subscriptions = status["subscriptions"].as_array().unwrap();
+    let windows = |i: usize| -> Vec<(String, f64, bool)> {
+        subscriptions[i]["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| {
+                (
+                    w["window"].as_str().unwrap().to_string(),
+                    w["used_percent"].as_f64().unwrap(),
+                    w["stale"].as_bool().unwrap(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(subscriptions[0]["plan"], "Claude Pro");
+    assert_eq!(
+        windows(0),
+        [("5h".into(), 25.0, false), ("7d".into(), 41.0, false)]
+    );
+    assert_eq!(subscriptions[1]["plan"], "ChatGPT Plus");
+    // Two hours old, so last known rather than current.
+    assert_eq!(
+        windows(1),
+        [("5h".into(), 31.0, true), ("7d".into(), 9.0, true)]
+    );
+    assert_eq!(
+        subscriptions[1]["windows"][0]["resets_at"].as_i64(),
+        Some((now + 3600) * 1000)
+    );
+
+    let text = String::from_utf8_lossy(&env.geleider(&["status"]).stdout).to_string();
+    assert!(text.contains("Claude Pro"), "{text}");
+    assert!(text.contains(" 25% used, resets "), "{text}");
+    assert!(text.contains("updated "), "{text}");
+    assert!(text.contains("last known at "), "{text}");
+    assert!(text.contains("(2h 00m ago)"), "{text}");
+
+    // The MCP tool returns the same numbers.
+    let mut mcp = env
+        .command()
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let requests = [
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "t"}, "capabilities": {}}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "usage", "arguments": {}}}),
+    ];
+    let mut stdin = mcp.stdin.take().unwrap();
+    for request in requests {
+        use std::io::Write;
+        writeln!(stdin, "{request}").unwrap();
+    }
+    drop(stdin);
+    let out = mcp.wait_with_output().unwrap();
+    let reply: Value = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|r| r["id"] == 2)
+        .unwrap();
+    let usage = &reply["result"]["structuredContent"]["subscriptions"];
+    assert_eq!(usage[0]["windows"][0]["used_percent"], 25.0, "{reply}");
+    assert_eq!(usage[1]["windows"][1]["used_percent"], 9.0, "{reply}");
 }
