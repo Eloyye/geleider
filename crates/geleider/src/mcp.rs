@@ -74,7 +74,8 @@ impl Server {
                     "serverInfo": { "name": "geleider", "version": env!("CARGO_PKG_VERSION") },
                     "instructions": "Use geleider to run Jobs that need a shared Resource (such as a game \
                         used by integration tests). Submit with submit_run; it returns at once with the Run id \
-                        and queue position. Then check with get_run until the Run has finished.",
+                        and queue position. Then check with get_run until the Run has finished. \
+                        usage shows how much of each Subscription (Claude Pro, ChatGPT Plus) is used.",
                 })
             }
             "ping" => json!({}),
@@ -146,12 +147,14 @@ impl Server {
                 },
             },
             "status" => Request::Status,
+            "usage" => Request::Usage,
             _ => bail!("unknown tool `{name}`"),
         };
         let value = match call(&request)? {
             Reply::Run(run) => serde_json::to_value(*run)?,
             Reply::Runs { runs } => json!({ "runs": runs }),
             Reply::Status(status) => serde_json::to_value(status)?,
+            Reply::Usage { subscriptions } => json!({ "subscriptions": subscriptions }),
         };
         Ok(value)
     }
@@ -196,7 +199,15 @@ fn tools() -> Value {
         },
         {
             "name": "status",
-            "description": "Every Resource with its slots and current Lease holders, plus running and queued Runs.",
+            "description": "Every Resource with its slots and current Lease holders, running and queued Runs, \
+                and Subscription usage as the usage tool reports it.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "usage",
+            "description": "How much of each Subscription (Claude Pro, ChatGPT Plus) is used in each Limit window \
+                (5h, 7d): used percentage, reset time (Unix ms) and how old the numbers are. A window marked \
+                stale is last known, not current; used_percent is null once it has reset with no data since.",
             "inputSchema": { "type": "object", "properties": {} }
         }
     ])
@@ -251,7 +262,10 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["submit_run", "get_run", "list_runs", "status"]);
+        assert_eq!(
+            names,
+            ["submit_run", "get_run", "list_runs", "status", "usage"]
+        );
 
         let result = server
             .handle(

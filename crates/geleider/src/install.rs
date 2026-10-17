@@ -1,7 +1,10 @@
 //! `geleider install` / `uninstall`: the launchd login service for the background
-//! process, and the MCP server entry in each Harness's config. Only geleider's
-//! own entries are ever added, changed or removed.
+//! process, the MCP server entry in each Harness's config, and Claude Code's status
+//! line. Only geleider's own entries are ever added, changed or removed; a status
+//! line the user already had is wrapped, not replaced.
 
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -12,6 +15,8 @@ use crate::paths::{self, Paths};
 
 const LABEL: &str = "com.github.eloyye.geleider";
 const SERVER: &str = "geleider";
+/// Claude Code's user settings, under the home directory; its `statusLine` lives here.
+const CLAUDE_SETTINGS: &str = ".claude/settings.json";
 
 /// The result of merging geleider's entry into a config file.
 #[derive(Debug, PartialEq, Eq)]
@@ -39,6 +44,12 @@ pub fn install(paths: &Paths) -> Result<()> {
         let outcome = harness.apply(|text| (harness.add)(text, &exe));
         report(harness.name, &harness.path, outcome, "registered");
     }
+    let settings = home.join(CLAUDE_SETTINGS);
+    let ours = status_line_command(&exe)?;
+    let outcome = apply(&settings, home.join(".claude").is_dir(), |text| {
+        statusline_add(text, &ours)
+    });
+    report_status_line(&settings, outcome, false);
     println!(
         "\nDeclare Projects, Resources and Jobs in {} — Jobs come only from that file.",
         paths::display(&paths.config)
@@ -53,6 +64,11 @@ pub fn uninstall() -> Result<()> {
             let outcome = harness.apply(|text| (harness.remove)(text));
             report(harness.name, &harness.path, outcome, "removed");
         }
+    }
+    let settings = home.join(CLAUDE_SETTINGS);
+    if settings.exists() {
+        let outcome = apply(&settings, true, statusline_remove);
+        report_status_line(&settings, outcome, true);
     }
     let plist = plist_path(&home);
     let _ = launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
@@ -75,23 +91,33 @@ struct Harness {
 
 impl Harness {
     fn apply(&self, merge: impl FnOnce(Option<&str>) -> Result<Merge>) -> Result<Option<Merge>> {
-        if !self.present {
-            return Ok(None);
-        }
-        let existing = match std::fs::read_to_string(&self.path) {
-            Ok(text) => Some(text),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => {
-                return Err(err).with_context(|| format!("reading {}", self.path.display()));
-            }
-        };
-        let merged = merge(existing.as_deref())
-            .with_context(|| format!("updating {}", self.path.display()))?;
-        if let Merge::Write(text) = &merged {
-            write_atomically(&self.path, text, existing.is_some())?;
-        }
-        Ok(Some(merged))
+        apply(&self.path, self.present, merge)
     }
+}
+
+/// Merges geleider's entry into the config file at `path`, if its Harness is
+/// installed.
+fn apply(
+    path: &Path,
+    present: bool,
+    merge: impl FnOnce(Option<&str>) -> Result<Merge>,
+) -> Result<Option<Merge>> {
+    if !present {
+        return Ok(None);
+    }
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading {}", path.display()));
+        }
+    };
+    let merged =
+        merge(existing.as_deref()).with_context(|| format!("updating {}", path.display()))?;
+    if let Merge::Write(text) = &merged {
+        write_atomically(path, text, existing.is_some())?;
+    }
+    Ok(Some(merged))
 }
 
 fn harnesses(home: &Path) -> Vec<Harness> {
@@ -127,6 +153,33 @@ fn harnesses(home: &Path) -> Vec<Harness> {
             remove: opencode_remove,
         },
     ]
+}
+
+fn report_status_line(path: &Path, outcome: Result<Option<Merge>>, removing: bool) {
+    let path = paths::display(path);
+    match outcome {
+        Ok(None) => {}
+        Ok(Some(Merge::Write(text))) => {
+            let wrapping = !removing && wraps_a_status_line(&text);
+            println!(
+                "Claude Code: status line {} in {path}",
+                match (removing, wrapping) {
+                    (true, _) => "restored",
+                    (false, true) => "set, wrapping your existing one",
+                    (false, false) => "set",
+                }
+            )
+        }
+        Ok(Some(Merge::Unchanged)) if !removing => {
+            println!("Claude Code: status line in {path} already up to date")
+        }
+        Ok(Some(Merge::Unchanged)) => {}
+        Ok(Some(Merge::Foreign)) => println!(
+            "Claude Code: {path} has a `statusLine` geleider cannot wrap; left it alone, so \
+             Claude usage will not update"
+        ),
+        Err(err) => println!("Claude Code: {err:#}"),
+    }
 }
 
 fn report(name: &str, path: &Path, outcome: Result<Option<Merge>>, verb: &str) {
@@ -165,13 +218,22 @@ fn claude_remove(existing: Option<&str>) -> Result<Merge> {
 }
 
 fn claude_is_ours(entry: &Value) -> bool {
-    let args: Vec<&str> = entry["args"]
+    is_ours(entry["command"].as_str(), &strings(&entry["args"]))
+}
+
+/// The strings in a JSON array; nothing if it is not one.
+fn strings(value: &Value) -> Vec<&str> {
+    value
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .collect();
-    is_ours(entry["command"].as_str(), &args)
+        .collect()
+}
+
+/// A JSON config file's new text, formatted the way the Harnesses write it.
+fn json_write(doc: &Value) -> Result<Merge> {
+    Ok(Merge::Write(serde_json::to_string_pretty(doc)? + "\n"))
 }
 
 // OpenCode: servers live under `mcp`, with the command as one array.
@@ -189,13 +251,7 @@ fn opencode_remove(existing: Option<&str>) -> Result<Merge> {
 }
 
 fn opencode_is_ours(entry: &Value) -> bool {
-    let command: Vec<&str> = entry["command"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    match command.split_first() {
+    match strings(&entry["command"]).split_first() {
         Some((program, args)) => is_ours(Some(program), args),
         None => false,
     }
@@ -232,7 +288,7 @@ fn json_set(
         _ => {}
     }
     servers.insert(SERVER.to_string(), entry);
-    Ok(Merge::Write(serde_json::to_string_pretty(&doc)? + "\n"))
+    json_write(&doc)
 }
 
 fn json_remove(existing: Option<&str>, table: &[&str], ours: fn(&Value) -> bool) -> Result<Merge> {
@@ -255,7 +311,7 @@ fn json_remove(existing: Option<&str>, table: &[&str], ours: fn(&Value) -> bool)
         Some(current) if !ours(current) => Ok(Merge::Foreign),
         Some(_) => {
             servers.remove(SERVER);
-            Ok(Merge::Write(serde_json::to_string_pretty(&doc)? + "\n"))
+            json_write(&doc)
         }
     }
 }
@@ -341,23 +397,163 @@ fn codex_is_ours(entry: &toml_edit::Item) -> bool {
     is_ours(command, &args)
 }
 
+// Claude Code's status line: `statusLine` in ~/.claude/settings.json. It is the only
+// place Claude Code reports a Subscription's usage limits. An existing status line
+// is kept as `--wrap <its command>`, so it still prints exactly what it did and
+// `uninstall` can put it back.
+
+/// The command Claude Code runs. The env overrides travel with it, since Claude
+/// Code starts it with its own environment.
+fn status_line_command(exe: &Path) -> Result<String> {
+    let env = ["GELEIDER_CONFIG", "GELEIDER_STATE_DIR"]
+        .into_iter()
+        .filter_map(|key| Some((key, std::env::var(key).ok()?)));
+    Ok(command_with_env(env, exe_str(exe)?))
+}
+
+/// e.g. `GELEIDER_STATE_DIR='/a b' /usr/local/bin/geleider statusline`. Only the
+/// value is quoted, so the shell still sees an assignment.
+fn command_with_env<'a>(env: impl IntoIterator<Item = (&'a str, String)>, exe: &str) -> String {
+    let mut words: Vec<String> = env
+        .into_iter()
+        .map(|(key, value)| format!("{key}={}", shell_words::quote(&value)))
+        .collect();
+    words.push(shell_words::quote(exe).into_owned());
+    words.push("statusline".into());
+    words.join(" ")
+}
+
+/// For a command geleider wrote, the status line it wraps, if any.
+fn our_status_line(command: &str) -> Option<Option<String>> {
+    let words = shell_words::split(command).ok()?;
+    let mut words = words
+        .into_iter()
+        .skip_while(|w| w.split_once('=').is_some_and(|(k, _)| !k.contains('/')));
+    let program = words.next()?;
+    if Path::new(&program).file_name()? != SERVER || words.next()? != "statusline" {
+        return None;
+    }
+    match (words.next(), words.next(), words.next()) {
+        (None, _, _) => Some(None),
+        (Some(flag), Some(wrapped), None) if flag == "--wrap" => Some(Some(wrapped)),
+        _ => None,
+    }
+}
+
+/// Whether the settings `text` geleider wrote keep a status line of the user's.
+fn wraps_a_status_line(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|doc| our_status_line(doc["statusLine"]["command"].as_str()?))
+        .is_some_and(|wrapped| wrapped.is_some())
+}
+
+fn statusline_add(existing: Option<&str>, ours: &str) -> Result<Merge> {
+    let mut doc = parse_json(existing)?;
+    let settings = doc
+        .as_object_mut()
+        .context("settings are not a JSON object")?;
+    let current = settings.get("statusLine").cloned();
+    let entry = match current {
+        None | Some(Value::Null) => json!({ "type": "command", "command": ours }),
+        Some(Value::Object(mut entry)) => {
+            let Some(command) = entry.get("command").and_then(Value::as_str) else {
+                return Ok(Merge::Foreign);
+            };
+            let wrapped = match our_status_line(command) {
+                Some(wrapped) => wrapped,
+                None => Some(command.to_string()),
+            };
+            let command = match wrapped {
+                Some(wrapped) => format!("{ours} --wrap {}", shell_words::quote(&wrapped)),
+                None => ours.to_string(),
+            };
+            entry.insert("command".into(), Value::String(command));
+            Value::Object(entry)
+        }
+        Some(_) => return Ok(Merge::Foreign),
+    };
+    if settings.get("statusLine") == Some(&entry) {
+        return Ok(Merge::Unchanged);
+    }
+    settings.insert("statusLine".into(), entry);
+    json_write(&doc)
+}
+
+fn statusline_remove(existing: Option<&str>) -> Result<Merge> {
+    let Some(existing) = existing else {
+        return Ok(Merge::Unchanged);
+    };
+    let mut doc = parse_json(Some(existing))?;
+    let Some(settings) = doc.as_object_mut() else {
+        return Ok(Merge::Unchanged);
+    };
+    let Some(Value::Object(entry)) = settings.get_mut("statusLine") else {
+        return Ok(Merge::Unchanged);
+    };
+    let wrapped = match entry
+        .get("command")
+        .and_then(Value::as_str)
+        .and_then(our_status_line)
+    {
+        None => return Ok(Merge::Unchanged),
+        Some(wrapped) => wrapped,
+    };
+    match wrapped {
+        Some(command) => {
+            entry.insert("command".into(), Value::String(command));
+        }
+        None => {
+            settings.remove("statusLine");
+        }
+    }
+    json_write(&doc)
+}
+
+/// Replaces `path` with `text` in one step, keeping a backup of the old file.
+/// These files can hold credentials (`~/.claude.json` can hold an API key), so
+/// the new file and the backup are created with the original's permissions, or
+/// owner-only for a new file, never briefly readable by others. A leftover temp
+/// or backup file, or a symlink planted at its name, is removed rather than
+/// written through.
 fn write_atomically(path: &Path, text: &str, keep_backup: bool) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    let mode = std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
     if keep_backup {
-        let mut backup = path.as_os_str().to_owned();
-        backup.push(".geleider-backup");
-        std::fs::copy(path, &backup)?;
+        let original = std::fs::read(path)?;
+        write_new(&sibling(path, ".geleider-backup"), &original, mode)?;
     }
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(".geleider-tmp");
-    let temp = PathBuf::from(temp);
-    std::fs::write(&temp, text)?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        std::fs::set_permissions(&temp, meta.permissions())?;
-    }
+    let temp = sibling(path, ".geleider-tmp");
+    write_new(&temp, text.as_bytes(), mode)?;
     std::fs::rename(&temp, path).with_context(|| format!("writing {}", path.display()))
+}
+
+/// `path` with `suffix` added to its file name.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Writes a fresh file with `mode`, replacing whatever was at `path`.
+fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            return Err(err).with_context(|| format!("removing {}", path.display()));
+        }
+        _ => {}
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 // launchd
@@ -367,7 +563,9 @@ fn plist_path(home: &Path) -> PathBuf {
 }
 
 fn domain() -> String {
-    // SAFETY: getuid has no preconditions and cannot fail.
+    // The standard library has no way to ask for the user id, and `getuid` is the
+    // smallest unsafe block that does.
+    // SAFETY: getuid takes no arguments, has no preconditions and cannot fail.
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
@@ -394,13 +592,15 @@ fn install_service(home: &Path, exe: &Path) -> Result<()> {
         "PATH".to_string(),
         std::env::var("PATH").unwrap_or_default(),
     )];
-    for key in ["GELEIDER_CONFIG", "GELEIDER_STATE_DIR"] {
+    for key in ["GELEIDER_CONFIG", "GELEIDER_STATE_DIR", "CODEX_HOME"] {
         if let Ok(value) = std::env::var(key) {
             env.push((key.to_string(), value));
         }
     }
     let plist = plist_path(home);
-    std::fs::create_dir_all(plist.parent().expect("has parent"))?;
+    if let Some(dir) = plist.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     std::fs::write(&plist, plist_xml(exe, &env, &logs.join("daemon.log")))?;
 
     let _ = launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
@@ -467,6 +667,14 @@ const STARTER_CONFIG: &str = r#"# geleider config. Jobs are declared only here, 
 #
 # notifications = true      # macOS notifications when Runs start after waiting or finish
 # pr_comments = true        # post each Run's result on the branch's open PR
+#
+# [subscriptions]
+# notify_resets = 80        # notify when a Limit window resets after reaching this % used; false for never
+# [subscriptions.claude]    # from Claude Code's status line, in CLI sessions only
+# plan = "Claude Pro"
+# [subscriptions.chatgpt]   # from Codex's session logs; shared with OpenCode's OpenAI login
+# plan = "ChatGPT Plus"
+# enabled = true
 #
 # [resources.ck3]
 # slots = 1                 # how many processes may use it at once
@@ -603,6 +811,141 @@ mod tests {
         assert_eq!(doc["$schema"], "https://opencode.ai/config.json");
         assert!(opencode_add(Some("{ // comment\n}"), Path::new(EXE)).is_err());
         assert!(written(opencode_remove(Some(&text)).unwrap()).contains("\"mcp\": {}"));
+    }
+
+    #[test]
+    fn status_line_is_set_and_removed() {
+        let ours = format!("{EXE} statusline");
+        let text = written(statusline_add(Some(r#"{"model": "opus"}"#), &ours).unwrap());
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["model"], "opus");
+        assert_eq!(
+            doc["statusLine"],
+            json!({ "type": "command", "command": ours })
+        );
+        assert_eq!(
+            statusline_add(Some(&text), &ours).unwrap(),
+            Merge::Unchanged
+        );
+
+        let removed: Value =
+            serde_json::from_str(&written(statusline_remove(Some(&text)).unwrap())).unwrap();
+        assert_eq!(removed, json!({ "model": "opus" }));
+        // No settings file yet.
+        assert!(written(statusline_add(None, &ours).unwrap()).contains(&ours));
+    }
+
+    #[test]
+    fn an_existing_status_line_is_wrapped_and_restored() {
+        let ours = format!("{EXE} statusline");
+        let mine = r#"~/bin/my line.sh --color "a b" | tr a-z A-Z"#;
+        let existing =
+            json!({ "statusLine": { "type": "command", "command": mine, "padding": 2 } });
+        let text = written(statusline_add(Some(&existing.to_string()), &ours).unwrap());
+        let doc: Value = serde_json::from_str(&text).unwrap();
+        let command = doc["statusLine"]["command"].as_str().unwrap();
+        assert_eq!(our_status_line(command), Some(Some(mine.to_string())));
+        assert_eq!(doc["statusLine"]["padding"], 2);
+        assert_eq!(
+            statusline_add(Some(&text), &ours).unwrap(),
+            Merge::Unchanged
+        );
+
+        // Reinstalling from a new path keeps the wrapped line.
+        let moved = written(statusline_add(Some(&text), "/opt/geleider statusline").unwrap());
+        let doc: Value = serde_json::from_str(&moved).unwrap();
+        let command = doc["statusLine"]["command"].as_str().unwrap();
+        assert!(
+            command.starts_with("/opt/geleider statusline --wrap "),
+            "{command}"
+        );
+        assert_eq!(our_status_line(command), Some(Some(mine.to_string())));
+
+        let restored: Value =
+            serde_json::from_str(&written(statusline_remove(Some(&moved)).unwrap())).unwrap();
+        assert_eq!(restored, existing);
+        // A status line geleider did not write is left alone on uninstall.
+        assert_eq!(
+            statusline_remove(Some(&existing.to_string())).unwrap(),
+            Merge::Unchanged
+        );
+    }
+
+    #[test]
+    fn status_line_command_keeps_env_as_assignments() {
+        let command = command_with_env(
+            [("GELEIDER_STATE_DIR", "/a b".to_string())],
+            "/x y/geleider",
+        );
+        assert_eq!(
+            command,
+            "GELEIDER_STATE_DIR='/a b' '/x y/geleider' statusline"
+        );
+        assert_eq!(our_status_line(&command), Some(None));
+        let out = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &command.replace("'/x y/geleider' statusline", "printenv GELEIDER_STATE_DIR"),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "/a b\n");
+    }
+
+    #[test]
+    fn status_line_command_is_recognised() {
+        assert_eq!(
+            our_status_line("/usr/local/bin/geleider statusline"),
+            Some(None)
+        );
+        assert_eq!(
+            our_status_line("GELEIDER_STATE_DIR='/a b' /x/geleider statusline"),
+            Some(None)
+        );
+        assert_eq!(our_status_line("/x/geleider status"), None);
+        assert_eq!(our_status_line("ccstatusline"), None);
+        assert_eq!(
+            our_status_line("/x/geleider statusline --wrap 'echo hi'"),
+            Some(Some("echo hi".into()))
+        );
+    }
+
+    #[test]
+    fn writes_keep_permissions_and_never_follow_planted_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        std::fs::write(&path, "{\"primaryApiKey\": \"secret\"}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Symlinks at the temp and backup names, aimed at a file elsewhere.
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, sibling(&path, ".geleider-tmp")).unwrap();
+        std::os::unix::fs::symlink(&target, sibling(&path, ".geleider-backup")).unwrap();
+
+        write_atomically(&path, "{}\n", true).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        for file in [path.clone(), sibling(&path, ".geleider-backup")] {
+            let meta = std::fs::symlink_metadata(&file).unwrap();
+            assert!(meta.is_file());
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o600,
+                "{}",
+                file.display()
+            );
+        }
+        assert!(
+            std::fs::read_to_string(sibling(&path, ".geleider-backup"))
+                .unwrap()
+                .contains("secret")
+        );
+
+        let fresh = dir.path().join("new.json");
+        write_atomically(&fresh, "{}", false).unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

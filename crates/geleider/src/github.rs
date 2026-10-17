@@ -71,12 +71,8 @@ impl Gh {
             .stderr(Stdio::piped())
             .spawn()
             .context("running gh (is the GitHub CLI installed and on PATH?)")?;
-        if let Some(input) = input {
-            child
-                .stdin
-                .take()
-                .expect("piped")
-                .write_all(input.as_bytes())?;
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            stdin.write_all(input.as_bytes())?;
         }
         let output = child.wait_with_output()?;
         if !output.status.success() {

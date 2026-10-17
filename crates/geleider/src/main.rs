@@ -10,7 +10,9 @@ mod paths;
 mod procs;
 mod protocol;
 mod report;
+mod statusline;
 mod store;
+mod usage;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -60,10 +62,23 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Resources with their slots and current holders, plus running and queued Runs.
+    /// Resources with their slots and current holders, running and queued Runs, and
+    /// how much of each Subscription is used in each Limit window.
     Status {
         #[arg(long)]
         json: bool,
+    },
+    /// How much of each Subscription is used in each Limit window, and when each resets.
+    Usage {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Claude Code's status line, set by `install`: reads Claude Code's JSON on stdin,
+    /// passes its usage limits to geleider and prints a status line.
+    Statusline {
+        /// A status line to run with the same input and show instead of geleider's own.
+        #[arg(long)]
+        wrap: Option<String>,
     },
     /// Run the background process in the foreground.
     Daemon,
@@ -100,6 +115,8 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Wait { id, json } => cli::wait_for(&paths, cli::parse_run_id(&id)?, json),
         Cmd::Queue { all, json } => cli::queue(&paths, all, json),
         Cmd::Status { json } => cli::status(&paths, json),
+        Cmd::Usage { json } => cli::usage(&paths, json),
+        Cmd::Statusline { wrap } => statusline::run(&paths, wrap.as_deref()),
         Cmd::Daemon => daemon::run(paths).map(|()| 0),
         Cmd::Mcp => mcp::serve(&paths).map(|()| 0),
         Cmd::Install => install::install(&paths).map(|()| 0),

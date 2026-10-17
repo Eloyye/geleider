@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::lease::Holder;
 use crate::paths::Paths;
 use crate::store::Run;
+use crate::usage::{Reading, Subscription, SubscriptionUsage};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -31,14 +32,26 @@ pub enum Request {
         finished: usize,
     },
     Status,
+    /// What a Harness just reported about a Subscription's Limit windows.
+    ReportUsage {
+        subscription: Subscription,
+        readings: Vec<Reading>,
+    },
+    /// Every Subscription's Limit windows.
+    Usage,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case")]
 pub enum Reply {
     Run(Box<RunInfo>),
-    Runs { runs: Vec<RunInfo> },
+    Runs {
+        runs: Vec<RunInfo>,
+    },
     Status(Status),
+    Usage {
+        subscriptions: Vec<SubscriptionUsage>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +69,8 @@ pub struct Status {
     pub resources: Vec<ResourceStatus>,
     /// Running, then queued Runs.
     pub runs: Vec<RunInfo>,
+    #[serde(default)]
+    pub subscriptions: Vec<SubscriptionUsage>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -78,11 +93,18 @@ pub fn encode_reply(reply: Result<Reply>) -> String {
         Ok(reply) => Envelope::Ok(reply),
         Err(err) => Envelope::Error(format!("{err:#}")),
     };
-    serde_json::to_string(&envelope).expect("replies serialize")
+    serde_json::to_string(&envelope).unwrap_or_else(|err| {
+        let error = Envelope::Error(format!("encoding the reply: {err}"));
+        serde_json::to_string(&error).unwrap_or_default()
+    })
 }
 
 /// Sends one request to the background process and waits for its reply.
 pub fn call(paths: &Paths, request: &Request) -> Result<Reply> {
+    call_within(paths, request, Duration::from_secs(30))
+}
+
+pub fn call_within(paths: &Paths, request: &Request, timeout: Duration) -> Result<Reply> {
     let socket = paths.socket();
     let mut stream = UnixStream::connect(&socket).map_err(|err| {
         anyhow!(
@@ -91,7 +113,8 @@ pub fn call(paths: &Paths, request: &Request) -> Result<Reply> {
             socket.display()
         )
     })?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
     let mut line = serde_json::to_string(request)?;
     line.push('\n');
     stream.write_all(line.as_bytes())?;
@@ -113,21 +136,38 @@ impl Reply {
     pub fn into_run(self) -> Result<RunInfo> {
         match self {
             Reply::Run(run) => Ok(*run),
-            _ => bail!("unexpected reply from the background process"),
+            other => other.unexpected(),
         }
     }
 
     pub fn into_runs(self) -> Result<Vec<RunInfo>> {
         match self {
             Reply::Runs { runs } => Ok(runs),
-            _ => bail!("unexpected reply from the background process"),
+            other => other.unexpected(),
+        }
+    }
+
+    pub fn into_usage(self) -> Result<Vec<SubscriptionUsage>> {
+        match self {
+            Reply::Usage { subscriptions } => Ok(subscriptions),
+            other => other.unexpected(),
         }
     }
 
     pub fn into_status(self) -> Result<Status> {
         match self {
             Reply::Status(status) => Ok(status),
-            _ => bail!("unexpected reply from the background process"),
+            other => other.unexpected(),
         }
+    }
+
+    fn unexpected<T>(&self) -> Result<T> {
+        let kind = match self {
+            Reply::Run(_) => "run",
+            Reply::Runs { .. } => "runs",
+            Reply::Status(_) => "status",
+            Reply::Usage { .. } => "usage",
+        };
+        bail!("unexpected `{kind}` reply from the background process")
     }
 }
