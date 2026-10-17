@@ -23,11 +23,14 @@ pub struct FinishedWorktree {
     pub pr_url: String,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Inventory {
     pub finished_worktrees: Vec<FinishedWorktree>,
     pub cleanup_warnings: Vec<String>,
+    /// `status` answered before its first scan finished, so nothing is listed yet.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub cleanup_pending: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

@@ -52,6 +52,9 @@ const ATTESTATION_TTL: Duration = Duration::from_secs(10 * 60);
 const ATTESTATION_WAIT: Duration = Duration::from_millis(500);
 /// Activity datagrams waiting to be recorded; more are dropped, like a full socket.
 const ACTIVITY_BACKLOG: usize = 256;
+/// How long `status` waits for the Finished-worktree scan it starts. A slower
+/// scan finishes in the background and the reply shows the one before it.
+const STATUS_SCAN_WAIT: Duration = Duration::from_secs(2);
 
 /// Locks `mutex` even if a thread panicked while holding it. The state behind
 /// geleider's locks lives in SQLite or is rebuilt from the process table, so one
@@ -91,6 +94,7 @@ pub fn run(paths: Paths) -> Result<()> {
         notifier: Box::new(MacNotifier),
         github: Box::new(Gh),
         prs: CachedPullRequests::default(),
+        scan: Scan::default(),
         claims_file: paths.claims(),
         claim_quiet: env_ms("GELEIDER_CLAIM_QUIET_MS").unwrap_or(claim::QUIET_AFTER),
     });
@@ -130,6 +134,7 @@ struct Daemon {
     notifier: Box<dyn Notifier>,
     github: Box<dyn GitHub + Send + Sync>,
     prs: CachedPullRequests,
+    scan: Scan,
     /// Where start hooks read every Claim.
     claims_file: PathBuf,
     /// How long a holder may be quiet before its Claim is flagged.
@@ -164,6 +169,20 @@ impl Core {
             self.store.list(0)?,
         ))
     }
+}
+
+/// The latest Finished-worktree scan for `status`, which runs `git` in every
+/// worktree and may wait on GitHub, so it never holds up the reply.
+#[derive(Default)]
+struct Scan {
+    state: Mutex<ScanState>,
+    done: Condvar,
+}
+
+#[derive(Default)]
+struct ScanState {
+    latest: Option<cleanup::Inventory>,
+    running: bool,
 }
 
 /// Something that happened to a Run that people should hear about.
@@ -230,6 +249,37 @@ impl Daemon {
             .finished_worktrees
             .retain(|wt| cleanup::validate(&config, &sessions, &runs, wt).is_ok());
         Ok(inventory)
+    }
+
+    /// Starts a cached scan unless one is running, then returns the newest
+    /// complete scan within [`STATUS_SCAN_WAIT`].
+    fn recent_finished(self: &Arc<Self>) -> cleanup::Inventory {
+        let mut state = lock(&self.scan.state);
+        if !state.running {
+            state.running = true;
+            let daemon = Arc::clone(self);
+            std::thread::spawn(move || {
+                let inventory = daemon
+                    .finished(false)
+                    .unwrap_or_else(|err| cleanup::Inventory {
+                        cleanup_warnings: vec![format!("worktrees: {err:#}")],
+                        ..Default::default()
+                    });
+                let mut state = lock(&daemon.scan.state);
+                state.latest = Some(inventory);
+                state.running = false;
+                daemon.scan.done.notify_all();
+            });
+        }
+        let (state, _) = self
+            .scan
+            .done
+            .wait_timeout_while(state, STATUS_SCAN_WAIT, |s| s.running)
+            .unwrap_or_else(PoisonError::into_inner);
+        state.latest.clone().unwrap_or_else(|| cleanup::Inventory {
+            cleanup_pending: true,
+            ..Default::default()
+        })
     }
 
     /// Removes the worktrees the user confirmed that are still Finished now.
@@ -689,13 +739,18 @@ impl Daemon {
             })
             .collect();
         drop(core);
+        let mut finished = self.recent_finished();
+        // The scan may predate a Session or Run that started in a worktree since.
+        finished
+            .finished_worktrees
+            .retain(|wt| !cleanup::busy(&wt.worktree, &sessions, &runs));
         Ok(Reply::Status(Status {
             sessions,
             claims,
             resources,
             runs: runs.into_iter().map(|r| info(r, &queued, false)).collect(),
             subscriptions: self.usage()?,
-            finished: self.finished(false)?,
+            finished,
         }))
     }
 

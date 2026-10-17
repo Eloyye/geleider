@@ -124,6 +124,9 @@ notifies again. `notifications = false` also disables CI notifications.
 `geleider status` lists Finished worktrees across every configured Project's
 `git worktree list`, whichever Harness created them. PR lookups are cached for
 five minutes; unavailable GitHub data is reported and never permits cleanup.
+The check runs in the background so `status` stays fast: it waits up to two
+seconds for it, then shows the previous result, or "still being checked" before
+the first one finishes. `geleider clean` always checks GitHub afresh.
 
 ```sh
 geleider clean  # show the list, then ask "Remove these worktrees? [y/N]"

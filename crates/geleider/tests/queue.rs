@@ -1149,6 +1149,50 @@ fn finished_worktrees_are_listed_but_only_removed_after_explicit_confirmation() 
 }
 
 #[test]
+fn status_answers_promptly_while_github_hangs_and_lists_the_worktree_once_it_answers() {
+    let env = Env::new("fakegame-clean-slow");
+    fake_branch_pr(&env, "MERGED");
+    // A `gh` that hangs, as with an unreachable GitHub, until the test lets it answer.
+    fake_program(
+        &env,
+        "gh",
+        r#"#!/usr/bin/env python3
+import pathlib,time
+root = pathlib.Path(__file__).parent.parent
+while not (root / 'gh-answer').exists(): time.sleep(0.05)
+print((root / 'branch-pr.json').read_text())
+"#,
+    );
+    let wt = env.root().join("finished");
+    git(
+        &env.repo(),
+        &["worktree", "add", "-qb", "done", wt.to_str().unwrap()],
+    );
+    let status = |args: &[&str]| {
+        let start = Instant::now();
+        let out = env.geleider(args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(start.elapsed() < Duration::from_secs(10), "{args:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let json: Value = serde_json::from_str(&status(&["status", "--json"])).unwrap();
+    assert_eq!(json["cleanup_pending"], true, "{json}");
+    assert_eq!(json["finished_worktrees"], serde_json::json!([]), "{json}");
+    assert!(status(&["status"]).contains("still being checked"));
+
+    std::fs::write(env.root().join("gh-answer"), "").unwrap();
+    wait_until(Duration::from_secs(10), || {
+        let json: Value = serde_json::from_str(&status(&["status", "--json"])).unwrap();
+        json["finished_worktrees"].as_array().unwrap().len() == 1
+            && json.get("cleanup_pending").is_none()
+    });
+}
+
+#[test]
 fn cleanup_rechecks_pr_and_session_state_after_the_confirmation_prompt() {
     use serde_json::json;
     use std::io::{BufRead, BufReader, Write};

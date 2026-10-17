@@ -164,7 +164,9 @@ fn confirmed(input: &mut impl BufRead) -> Result<bool> {
 
 fn render_finished(inventory: &Inventory) -> String {
     let mut out = String::from("Finished worktrees\n");
-    if inventory.finished_worktrees.is_empty() {
+    if inventory.cleanup_pending {
+        out.push_str("  (still being checked; `geleider clean` checks now)\n");
+    } else if inventory.finished_worktrees.is_empty() {
         out.push_str("  (none)\n");
     }
     // Worktree paths and branch names are chosen by Sessions and are shown before
