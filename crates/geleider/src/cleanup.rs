@@ -2,12 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::git;
 use crate::github::{PrState, PullRequests};
+use crate::paths;
 use crate::session::{Session, SessionState};
 use crate::store::Run;
 
@@ -58,54 +59,22 @@ pub fn discover(
 ) -> Inventory {
     let mut inventory = Inventory::default();
     for (name, project) in &config.projects {
-        let mut scan = || -> Result<Vec<FinishedWorktree>> {
-            let clone = project.clone_path()?;
-            let mut finished = Vec::new();
-            for wt in git::worktrees(&clone)? {
-                if wt.protected || busy(&wt.path, sessions, runs) || !git::clean(&wt.path)? {
-                    continue;
-                }
-                let Some(branch) = wt.branch else { continue };
-                let prs = match github.pull_requests(&project.repo, &branch) {
-                    Ok(prs) => prs,
-                    Err(err) => {
-                        inventory
-                            .cleanup_warnings
-                            .push(format!("{name} {branch}: {err:#}"));
-                        continue;
-                    }
-                };
-                if prs.iter().any(|pr| pr.state == PrState::Open) {
-                    continue;
-                }
-                let Some(pr) = prs
-                    .iter()
-                    .filter(|pr| !pr.is_cross_repository)
-                    .max_by_key(|pr| pr.number)
-                else {
-                    continue;
-                };
-                // GitHub retains the PR head after merging/deleting its branch.
-                // Exact equality proves all local commits were pushed, including
-                // with squash merges, without trusting stale remote-tracking refs.
-                if pr.head_ref_oid != wt.head {
-                    continue;
-                }
-                finished.push(FinishedWorktree {
-                    project: name.clone(),
-                    worktree: wt.path,
-                    branch,
-                    head: wt.head,
-                    pr: pr.number,
-                    pr_state: pr.state,
-                    pr_url: pr.url.clone(),
-                });
+        let scan = project
+            .clone_path()
+            .and_then(|clone| git::worktrees(&clone));
+        let worktrees = match scan {
+            Ok(worktrees) => worktrees,
+            Err(err) => {
+                inventory.cleanup_warnings.push(format!("{name}: {err:#}"));
+                continue;
             }
-            Ok(finished)
         };
-        match scan() {
-            Ok(finished) => inventory.finished_worktrees.extend(finished),
-            Err(err) => inventory.cleanup_warnings.push(format!("{name}: {err:#}")),
+        for wt in worktrees {
+            match finished(name, &project.repo, wt, sessions, runs, github) {
+                Ok(Some(found)) => inventory.finished_worktrees.push(found),
+                Ok(None) => {}
+                Err(err) => inventory.cleanup_warnings.push(format!("{name} {err:#}")),
+            }
         }
     }
     inventory
@@ -115,6 +84,55 @@ pub fn discover(
         .finished_worktrees
         .dedup_by(|a, b| a.worktree == b.worktree);
     inventory
+}
+
+/// `wt` as a Finished worktree, or `None` if anything may still need it. Local
+/// checks come first, so only idle, clean worktrees cost a GitHub query.
+fn finished(
+    project: &str,
+    repo: &str,
+    wt: git::Worktree,
+    sessions: &[Session],
+    runs: &[Run],
+    github: &dyn PullRequests,
+) -> Result<Option<FinishedWorktree>> {
+    if wt.protected || busy(&wt.path, sessions, runs) {
+        return Ok(None);
+    }
+    let Some(branch) = wt.branch.clone() else {
+        return Ok(None);
+    };
+    if !git::clean(&wt).with_context(|| paths::display(&wt.path))? {
+        return Ok(None);
+    }
+    let prs = github
+        .pull_requests(repo, &branch)
+        .with_context(|| branch.clone())?;
+    if prs.iter().any(|pr| pr.state == PrState::Open) {
+        return Ok(None);
+    }
+    let Some(pr) = prs
+        .into_iter()
+        .filter(|pr| !pr.is_cross_repository)
+        .max_by_key(|pr| pr.number)
+    else {
+        return Ok(None);
+    };
+    // GitHub retains the PR head after merging/deleting its branch. Exact
+    // equality proves all local commits were pushed, including with squash
+    // merges, without trusting stale remote-tracking refs.
+    if pr.head_ref_oid != wt.head {
+        return Ok(None);
+    }
+    Ok(Some(FinishedWorktree {
+        project: project.to_string(),
+        worktree: wt.path,
+        branch,
+        head: wt.head,
+        pr: pr.number,
+        pr_state: pr.state,
+        pr_url: pr.url,
+    }))
 }
 
 /// Final local check with the latest Session/Run records, immediately before
@@ -155,7 +173,7 @@ pub fn validate(
     if wt.protected
         || wt.head != approved.head
         || wt.branch.as_ref() != Some(&approved.branch)
-        || !git::clean(&wt.path)?
+        || !git::clean(wt)?
     {
         bail!("worktree changed or is protected");
     }
@@ -374,6 +392,58 @@ mod tests {
         assert!(found.finished_worktrees.is_empty());
         assert_eq!(found.cleanup_warnings.len(), 1);
         assert!(wt.exists());
+    }
+
+    /// A repository the Session wrote inside its worktree, with a clean filter
+    /// that leaves `marker` behind if git ever runs it.
+    fn filtered_repo(dir: &Path, marker: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.name", "test"]);
+        git(dir, &["config", "user.email", "test@example.test"]);
+        let command = format!("touch '{}'; cat", marker.display());
+        git(dir, &["config", "filter.pwn.clean", &command]);
+        std::fs::write(dir.join(".gitattributes"), "* filter=pwn\n").unwrap();
+        std::fs::write(dir.join("tracked"), "original").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "filtered"]);
+        // Setting up ran the filter; a stale stat makes `status` run it again.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(dir.join("tracked"), "original").unwrap();
+    }
+
+    #[test]
+    fn scanning_never_runs_commands_from_config_a_session_wrote() {
+        let f = Fixture::new();
+        let marker = f.dir.path().join("filter-ran");
+        let gh = f.pr(PrState::Merged);
+
+        // An embedded repository committed as a gitlink.
+        let wt = f.worktree("done");
+        filtered_repo(&wt.join("sub"), &marker);
+        git(&wt, &["add", "sub"]);
+        git(&wt, &["commit", "-qm", "gitlink"]);
+        std::fs::write(wt.join("sub/tracked"), "original").unwrap();
+        let _ = std::fs::remove_file(&marker);
+        assert!(f.scan(&gh, &[]).finished_worktrees.is_empty());
+        assert!(!marker.exists(), "status entered a Session's submodule");
+
+        // The worktree's `.git` file pointed at a repository with a filter.
+        let wt = f.worktree("redirected");
+        let evil = f.dir.path().join("evil");
+        filtered_repo(&evil, &marker);
+        std::fs::write(wt.join("tracked"), "original").unwrap();
+        std::fs::write(wt.join(".gitattributes"), "* filter=pwn\n").unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!("gitdir: {}\n", evil.join(".git").display()),
+        )
+        .unwrap();
+        let mut gh = f.pr(PrState::Merged);
+        gh.prs[0].head_ref_oid = git(&evil, &["rev-parse", "HEAD"]);
+        let _ = std::fs::remove_file(&marker);
+        assert!(f.scan(&gh, &[]).finished_worktrees.is_empty());
+        assert!(!marker.exists(), "git followed a Session's `.git` file");
     }
 
     #[test]

@@ -4,12 +4,14 @@
 
 use std::collections::BTreeMap;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::command;
 
 /// Branch PR history, shared by CI watching and Finished-worktree discovery.
 pub trait PullRequests {
@@ -36,6 +38,16 @@ pub enum PrState {
     Merged,
 }
 
+impl std::fmt::Display for PrState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PrState::Open => "open",
+            PrState::Closed => "closed",
+            PrState::Merged => "merged",
+        })
+    }
+}
+
 type CachedPrs = (Instant, std::result::Result<Vec<PullRequest>, String>);
 
 /// Status polling shares this cache with CI watching, including failed queries,
@@ -45,27 +57,32 @@ pub struct CachedPullRequests {
     entries: Mutex<BTreeMap<(String, String), CachedPrs>>,
 }
 
-impl PullRequests for CachedPullRequests {
-    fn pull_requests(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>> {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        entries.retain(|_, (at, _)| at.elapsed() < crate::ci::INTERVAL);
-        let (_, result) = entries
-            .entry((repo.into(), branch.into()))
-            .or_insert_with(|| {
-                (
-                    Instant::now(),
-                    Gh.pull_requests(repo, branch)
-                        .map_err(|err| format!("{err:#}")),
-                )
-            });
-        result.clone().map_err(anyhow::Error::msg)
+impl CachedPullRequests {
+    fn entries(&self) -> MutexGuard<'_, BTreeMap<(String, String), CachedPrs>> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-use crate::command;
+impl PullRequests for CachedPullRequests {
+    fn pull_requests(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>> {
+        let key = (repo.to_string(), branch.to_string());
+        let cached = {
+            let mut entries = self.entries();
+            entries.retain(|_, (at, _)| at.elapsed() < crate::ci::INTERVAL);
+            entries.get(&key).map(|(_, result)| result.clone())
+        };
+        // `gh` runs without the lock, so one slow query holds up no other branch.
+        let result = cached.unwrap_or_else(|| {
+            let fetched = Gh
+                .pull_requests(repo, branch)
+                .map_err(|err| format!("{err:#}"));
+            self.entries()
+                .insert(key, (Instant::now(), fetched.clone()));
+            fetched
+        });
+        result.map_err(anyhow::Error::msg)
+    }
+}
 
 /// How long one `gh` call may take before it is killed.
 const GH_TIMEOUT: Duration = Duration::from_secs(30);

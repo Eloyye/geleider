@@ -3,6 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use serde_json::{Value, json};
+
 use crate::config::Config;
 use crate::github::{PrState, PullRequest};
 use crate::session::Session;
@@ -62,45 +64,49 @@ pub fn failures(pr: &PullRequest) -> Vec<Failure> {
     pr.status_check_rollup
         .iter()
         .filter_map(|check| {
-            let (name, attempt) = match check["__typename"].as_str()? {
-                "CheckRun"
-                    if check["status"] == "COMPLETED"
-                        && matches!(
-                            check["conclusion"].as_str(),
-                            Some("FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE")
-                        ) =>
-                {
-                    (
-                        check["name"].as_str()?,
-                        serde_json::json!([
-                            check["detailsUrl"],
-                            check["startedAt"],
-                            check["completedAt"]
-                        ]),
-                    )
-                }
-                "StatusContext" if matches!(check["state"].as_str(), Some("FAILURE" | "ERROR")) => {
-                    (
-                        check["context"].as_str()?,
-                        serde_json::json!([check["targetUrl"], check["createdAt"]]),
-                    )
-                }
-                _ => return None,
-            };
+            let (name, attempt) = failed_attempt(check)?;
             Some(Failure {
-                id: serde_json::json!([pr.head_ref_oid, check["__typename"], name, attempt])
-                    .to_string(),
+                id: json!([pr.head_ref_oid, check["__typename"], name, attempt]).to_string(),
                 name: name.to_string(),
             })
         })
         .collect()
 }
 
+/// A failed check's name and what identifies this run of it, or `None` if it
+/// has not failed (yet).
+fn failed_attempt(check: &Value) -> Option<(&str, Value)> {
+    match check["__typename"].as_str()? {
+        "CheckRun" => {
+            let failed = matches!(
+                check["conclusion"].as_str(),
+                Some("FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE")
+            );
+            if check["status"] != "COMPLETED" || !failed {
+                return None;
+            }
+            let attempt = json!([
+                check["detailsUrl"],
+                check["startedAt"],
+                check["completedAt"]
+            ]);
+            Some((check["name"].as_str()?, attempt))
+        }
+        "StatusContext" => {
+            if !matches!(check["state"].as_str(), Some("FAILURE" | "ERROR")) {
+                return None;
+            }
+            let attempt = json!([check["targetUrl"], check["createdAt"]]);
+            Some((check["context"].as_str()?, attempt))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::Store;
-    use serde_json::json;
 
     #[test]
     fn failures_notify_once_across_polls_and_restart_but_new_attempts_notify() {

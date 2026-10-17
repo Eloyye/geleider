@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
@@ -30,6 +30,7 @@ use crate::protocol::{self, Reply, Request, ResourceStatus, RunInfo, Status};
 use crate::report::{self, MacNotifier, Notifier, TAIL_LINES};
 use crate::session::{Activity, Harness, Session, SessionState};
 use crate::store::{NewRun, Run, RunState, Store, now_ms};
+use crate::text;
 use crate::usage::{self, Reading, ResetCheck, Subscription, SubscriptionUsage, Window};
 use crate::{ci, cleanup};
 
@@ -153,6 +154,16 @@ impl Core {
         let held = lease::leases(&config.resources, &running, snapshot);
         Ok((config, held))
     }
+
+    /// The current config with every Session and Run: what decides whether a
+    /// worktree is still in use.
+    fn worktree_users(&mut self) -> Result<(Config, Vec<Session>, Vec<Run>)> {
+        Ok((
+            self.config.get()?.clone(),
+            self.store.sessions()?,
+            self.store.list(0)?,
+        ))
+    }
 }
 
 /// Something that happened to a Run that people should hear about.
@@ -192,9 +203,15 @@ impl Daemon {
                     .store
                     .new_ci_failure(&repo, pr.number, &failure.id)?;
                 if new {
+                    // Branch and check names are chosen by Sessions and workflows.
                     self.notifier.notify(
                         &format!("geleider: CI failed on {repo} #{}", pr.number),
-                        &format!("{}: {}\n{}", branch, failure.name, pr.url),
+                        &format!(
+                            "{}: {}\n{}",
+                            text::one_line(&branch),
+                            text::one_line(&failure.name),
+                            pr.url
+                        ),
                     );
                 }
             }
@@ -202,36 +219,21 @@ impl Daemon {
         Ok(())
     }
 
+    /// Finished worktrees, rechecked against Sessions and Runs recorded while
+    /// GitHub was being asked. `fresh` skips the PR cache, as removal requires.
     fn finished(&self, fresh: bool) -> Result<cleanup::Inventory> {
-        let (config, sessions, runs) = {
-            let mut core = lock(&self.core);
-            (
-                core.config.get()?.clone(),
-                core.store.sessions()?,
-                core.store.list(0)?,
-            )
-        };
+        let (config, sessions, runs) = lock(&self.core).worktree_users()?;
         let github: &dyn PullRequests = if fresh { &Gh } else { &self.prs };
         let mut inventory = cleanup::discover(&config, &sessions, &runs, github);
-        let (config, sessions, runs) = {
-            let mut core = lock(&self.core);
-            (
-                core.config.get()?.clone(),
-                core.store.sessions()?,
-                core.store.list(0)?,
-            )
-        };
+        let (config, sessions, runs) = lock(&self.core).worktree_users()?;
         inventory
             .finished_worktrees
             .retain(|wt| cleanup::validate(&config, &sessions, &runs, wt).is_ok());
         Ok(inventory)
     }
 
-    fn clean(
-        &self,
-        worktrees: Vec<cleanup::FinishedWorktree>,
-        cwd: &std::path::Path,
-    ) -> Result<Reply> {
+    /// Removes the worktrees the user confirmed that are still Finished now.
+    fn clean(&self, worktrees: Vec<cleanup::FinishedWorktree>, cwd: &Path) -> Result<Reply> {
         // Refresh GitHub after the user confirms; no cached PR state authorizes removal.
         let current = self.finished(true)?;
         let mut cleaned = cleanup::Cleaned::default();
@@ -243,17 +245,11 @@ impl Daemon {
                 ));
                 continue;
             }
-            // Serialize the final local check/removal with incoming Session and
-            // Run records. Do not hold this lock during GitHub calls above.
+            // Holding the lock serializes the final check and removal with
+            // incoming Session and Run records; no GitHub call happens under it.
             let mut core = lock(&self.core);
-            let config = core.config.get()?.clone();
-            match cleanup::remove(
-                &config,
-                &core.store.sessions()?,
-                &core.store.list(0)?,
-                &approved,
-                cwd,
-            ) {
+            let (config, sessions, runs) = core.worktree_users()?;
+            match cleanup::remove(&config, &sessions, &runs, &approved, cwd) {
                 Ok(()) => cleaned.removed.push(approved.worktree),
                 Err(err) => cleaned.skipped.push(format!("{path}: {err:#}")),
             }

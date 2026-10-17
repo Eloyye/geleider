@@ -1,7 +1,7 @@
 //! The command-line side of submitting and checking Runs, and of Claims.
 
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -145,10 +145,10 @@ pub fn clean(paths: &Paths) -> Result<i32> {
     )?
     .into_cleaned()?;
     for path in &cleaned.removed {
-        println!("Removed {}", paths::display(path));
+        println!("Removed {}", shown_path(path));
     }
     for reason in &cleaned.skipped {
-        eprintln!("Skipped {reason}");
+        eprintln!("Skipped {}", text::one_line(reason));
     }
     Ok(i32::from(!cleaned.skipped.is_empty()))
 }
@@ -167,20 +167,26 @@ fn render_finished(inventory: &Inventory) -> String {
     if inventory.finished_worktrees.is_empty() {
         out.push_str("  (none)\n");
     }
+    // Worktree paths and branch names are chosen by Sessions and are shown before
+    // a confirmation prompt, so each stays on its own line with no escapes.
     for wt in &inventory.finished_worktrees {
         out.push_str(&format!(
-            "  {}  {}  PR #{} ({:?})  {}\n",
+            "  {}  {}  PR #{} ({})  {}\n",
             wt.project,
-            wt.branch,
+            text::one_line(&wt.branch),
             wt.pr,
             wt.pr_state,
-            paths::display(&wt.worktree)
+            shown_path(&wt.worktree)
         ));
     }
     for warning in &inventory.cleanup_warnings {
-        out.push_str(&format!("  Could not check {warning}\n"));
+        out.push_str(&format!("  Could not check {}\n", text::one_line(warning)));
     }
     out
+}
+
+fn shown_path(path: &Path) -> String {
+    text::one_line(&paths::display(path))
 }
 
 /// Claims `issue` for the Session working in this worktree. The CLI names no

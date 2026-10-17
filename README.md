@@ -141,7 +141,10 @@ squash merge or deletion of the remote branch. A newer open PR on a reused
 branch prevents cleanup. The primary clone, configured Project directory,
 locked worktrees, detached worktrees, and the directory invoking `clean` are
 kept. Worktrees with index flags that hide changes (including sparse checkouts)
-are kept too. Local branches are retained after worktree removal.
+are kept too, as are worktrees containing submodules and worktrees whose `.git`
+file no longer points back to the clone. geleider reads each worktree through
+the clone's own record of it, so config a Session wrote never runs. Local
+branches are retained after worktree removal.
 
 ## Subscription usage
 
