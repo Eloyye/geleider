@@ -1,10 +1,68 @@
-//! Posting a Run's result on its branch's open PR: one comment per Job per PR,
-//! edited in place on later Runs.
+//! Branch PR history and CI checks, plus Run result comments edited in place.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Branch PR history, shared by CI watching and Finished-worktree discovery.
+pub trait PullRequests {
+    fn pull_requests(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>>;
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequest {
+    pub number: u64,
+    pub state: PrState,
+    pub head_ref_oid: String,
+    pub is_cross_repository: bool,
+    pub url: String,
+    #[serde(default)]
+    pub status_check_rollup: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum PrState {
+    Open,
+    Closed,
+    Merged,
+}
+
+type CachedPrs = (Instant, std::result::Result<Vec<PullRequest>, String>);
+
+/// Status polling shares this cache with CI watching, including failed queries,
+/// so frequent `status` calls do not repeatedly query GitHub while it is offline.
+#[derive(Default)]
+pub struct CachedPullRequests {
+    entries: Mutex<BTreeMap<(String, String), CachedPrs>>,
+}
+
+impl PullRequests for CachedPullRequests {
+    fn pull_requests(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        entries.retain(|_, (at, _)| at.elapsed() < crate::ci::INTERVAL);
+        let (_, result) = entries
+            .entry((repo.into(), branch.into()))
+            .or_insert_with(|| {
+                (
+                    Instant::now(),
+                    Gh.pull_requests(repo, branch)
+                        .map_err(|err| format!("{err:#}")),
+                )
+            });
+        result.clone().map_err(anyhow::Error::msg)
+    }
+}
 
 /// What geleider needs from GitHub, so tests can stand in for `gh`.
 pub trait GitHub {
@@ -57,6 +115,37 @@ pub fn post_result(
 
 /// [`GitHub`] through the `gh` command, signed in as the user.
 pub struct Gh;
+
+impl PullRequests for Gh {
+    fn pull_requests(&self, repo: &str, branch: &str) -> Result<Vec<PullRequest>> {
+        let out = self.run(
+            &[
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--limit",
+                "100",
+                "--json",
+                "number,state,headRefOid,isCrossRepository,url,statusCheckRollup",
+            ],
+            None,
+        )?;
+        let prs: Vec<PullRequest> = serde_json::from_str(&out).context("decoding branch PRs")?;
+        // A truncated history cannot prove that there is no open PR for cleanup.
+        if prs.len() >= 100 {
+            bail!("too many PRs for branch `{branch}` to inspect safely");
+        }
+        Ok(prs
+            .into_iter()
+            .filter(|pr| !pr.is_cross_repository)
+            .collect())
+    }
+}
 
 impl Gh {
     fn run(&self, args: &[&str], input: Option<&str>) -> Result<String> {

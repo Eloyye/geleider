@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::attest::Destination;
+use crate::cleanup::{Cleaned, FinishedWorktree, Inventory};
 use crate::lease::Holder;
 use crate::paths::Paths;
 use crate::session::{Session, SessionKey};
@@ -37,6 +38,12 @@ pub enum Request {
         finished: usize,
     },
     Status,
+    FinishedWorktrees,
+    /// The exact list the CLI displayed and the user confirmed.
+    Clean {
+        worktrees: Vec<FinishedWorktree>,
+        cwd: PathBuf,
+    },
     SessionResults {
         session: SessionKey,
         ack: Option<i64>,
@@ -58,6 +65,8 @@ pub enum Reply {
         runs: Vec<RunInfo>,
     },
     Status(Status),
+    Worktrees(Inventory),
+    Cleaned(Cleaned),
     Usage {
         subscriptions: Vec<SubscriptionUsage>,
     },
@@ -85,6 +94,8 @@ pub struct Status {
     pub runs: Vec<RunInfo>,
     #[serde(default)]
     pub subscriptions: Vec<SubscriptionUsage>,
+    #[serde(default, flatten)]
+    pub finished: Inventory,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -147,6 +158,19 @@ pub fn call_within(paths: &Paths, request: &Request, timeout: Duration) -> Resul
 }
 
 impl Reply {
+    pub fn into_worktrees(self) -> Result<Inventory> {
+        match self {
+            Reply::Worktrees(inventory) => Ok(inventory),
+            other => other.unexpected(),
+        }
+    }
+
+    pub fn into_cleaned(self) -> Result<Cleaned> {
+        match self {
+            Reply::Cleaned(cleaned) => Ok(cleaned),
+            other => other.unexpected(),
+        }
+    }
     pub fn into_run(self) -> Result<RunInfo> {
         match self {
             Reply::Run(run) => Ok(*run),
@@ -180,6 +204,8 @@ impl Reply {
             Reply::Run(_) => "run",
             Reply::Runs { .. } => "runs",
             Reply::Status(_) => "status",
+            Reply::Worktrees(_) => "worktrees",
+            Reply::Cleaned(_) => "cleaned",
             Reply::Usage { .. } => "usage",
         };
         bail!("unexpected `{kind}` reply from the background process")

@@ -17,7 +17,7 @@ const BUILTINS: &[&str] = &["worktree"];
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// macOS notifications when a Run finishes or a queued Run starts.
+    /// macOS notifications for Runs and CI failures on Session PRs.
     #[serde(default = "yes")]
     pub notifications: bool,
     /// Post each Run's result on the branch's open PR.

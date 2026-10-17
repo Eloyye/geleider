@@ -1008,3 +1008,260 @@ fn an_attestation_expires_if_its_submission_comes_too_late() {
     assert_eq!(mcp.submit(prompt)["session"]["id"], "caller");
     mcp.stop();
 }
+
+fn fake_program(env: &Env, name: &str, source: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = env.root().join("bin").join(name);
+    std::fs::write(&path, source).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn fake_branch_pr(env: &Env, state: &str) -> Value {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(env.repo())
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let head = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    let pr = serde_json::json!({"number":6,"state":state,"headRefOid":head,
+        "isCrossRepository":false,"url":"https://github.com/example/demo/pull/6",
+        "statusCheckRollup":[{"__typename":"CheckRun","name":"test","status":"COMPLETED",
+            "conclusion":"FAILURE","detailsUrl":"job/1","startedAt":"t0","completedAt":"t1"}]});
+    std::fs::write(
+        env.root().join("branch-pr.json"),
+        serde_json::to_string(&vec![&pr]).unwrap(),
+    )
+    .unwrap();
+    fake_program(
+        env,
+        "gh",
+        r#"#!/usr/bin/env python3
+import sys,json,pathlib
+root = pathlib.Path(__file__).parent.parent
+assert sys.argv[1:3] == ['pr','list'], sys.argv
+with (root / 'gh-calls').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
+if (root / 'gh-offline').exists(): sys.exit(1)
+print((root / 'branch-pr.json').read_text())
+"#,
+    );
+    pr
+}
+
+fn clean_input(env: &Env, input: &str) -> Output {
+    use std::io::Write;
+    let mut child = env
+        .command()
+        .arg("clean")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn finished_worktrees_are_listed_but_only_removed_after_explicit_confirmation() {
+    let env = Env::new("fakegame-clean");
+    fake_branch_pr(&env, "MERGED");
+    let wt = env.root().join("finished worktree");
+    git(
+        &env.repo(),
+        &["worktree", "add", "-qb", "done", wt.to_str().unwrap()],
+    );
+    let status: Value =
+        serde_json::from_slice(&env.geleider(&["status", "--json"]).stdout).unwrap();
+    assert_eq!(
+        status["finished_worktrees"].as_array().unwrap().len(),
+        1,
+        "{status}"
+    );
+    let text = String::from_utf8(env.geleider(&["status"]).stdout).unwrap();
+    assert!(
+        text.contains("Finished worktrees") && text.contains("done"),
+        "{text}"
+    );
+    // Status uses the same cached lookup, regardless of how often it is called.
+    assert_eq!(
+        std::fs::read_to_string(env.root().join("gh-calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    for input in ["", "\n", "no\n"] {
+        let out = clean_input(&env, input);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(wt.exists());
+    }
+    let out = clean_input(&env, "yes\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!wt.exists());
+    assert!(env.repo().exists());
+}
+
+#[test]
+fn cleanup_rechecks_pr_and_session_state_after_the_confirmation_prompt() {
+    use serde_json::json;
+    use std::io::{BufRead, BufReader, Write};
+    let env = Env::new("fakegame-clean-race");
+    fake_branch_pr(&env, "MERGED");
+    let wt = env.root().join("finished");
+    git(
+        &env.repo(),
+        &["worktree", "add", "-qb", "done", wt.to_str().unwrap()],
+    );
+    for change in ["reopen", "session", "offline", "dirty"] {
+        fake_branch_pr(&env, "MERGED");
+        let mut child = env
+            .command()
+            .arg("clean")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        // Seeing the displayed candidate means the initial scan has completed.
+        loop {
+            line.clear();
+            assert!(stdout.read_line(&mut line).unwrap() > 0);
+            if line.contains("PR #6") {
+                break;
+            }
+        }
+        match change {
+            "reopen" => {
+                fake_branch_pr(&env, "OPEN");
+            }
+            "session" => {
+                hook(
+                    &env,
+                    "codex",
+                    "SessionStart",
+                    json!({"session_id":"new-session","cwd":wt}),
+                );
+                wait_until(Duration::from_secs(5), || {
+                    sessions(&env)
+                        .iter()
+                        .any(|s| s["id"] == "new-session" && s["state"] == "idle")
+                });
+            }
+            "offline" => {
+                std::fs::write(env.root().join("gh-offline"), "").unwrap();
+            }
+            "dirty" => {
+                std::fs::write(wt.join("new-file"), "new work").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(!out.status.success(), "{change}");
+        assert!(wt.exists(), "{change}");
+        if change == "session" {
+            hook(
+                &env,
+                "codex",
+                "SessionEnd",
+                json!({"session_id":"new-session","cwd":wt}),
+            );
+            wait_until(Duration::from_secs(5), || {
+                sessions(&env).iter().all(|s| s["state"] == "ended")
+            });
+        }
+        if change == "offline" {
+            std::fs::remove_file(env.root().join("gh-offline")).unwrap();
+        }
+    }
+}
+
+#[test]
+fn ci_notifications_go_only_to_the_user_and_do_not_repeat_after_restart() {
+    use serde_json::json;
+    let mut env = Env::new("fakegame-ci");
+    let mut pr = fake_branch_pr(&env, "OPEN");
+    fake_program(
+        &env,
+        "osascript",
+        r#"#!/usr/bin/env python3
+import sys,json,pathlib
+root = pathlib.Path(__file__).parent.parent
+with (root / 'notifications').open('a') as f: f.write(json.dumps(sys.argv[1:])+'\n')
+"#,
+    );
+    // A notification must never queue a message back into a Session.
+    fake_program(
+        &env,
+        "codex",
+        r#"#!/bin/sh
+touch "$(dirname "$0")/../unexpected-session-message"
+exit 1
+"#,
+    );
+    let config_path = env.root().join("config.toml");
+    let config = std::fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("notifications = false", "notifications = true");
+    std::fs::write(config_path, config).unwrap();
+    hook(
+        &env,
+        "codex",
+        "SessionStart",
+        json!({"session_id":"ci-session","cwd":env.repo()}),
+    );
+    wait_until(Duration::from_secs(5), || !sessions(&env).is_empty());
+    env.kill_daemon();
+    env.start_daemon();
+    let notification_path = env.root().join("notifications");
+    let count = || {
+        std::fs::read_to_string(&notification_path)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    wait_until(Duration::from_secs(5), || count() == 1);
+    let calls_path = env.root().join("gh-calls");
+    let calls = || {
+        std::fs::read_to_string(&calls_path)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let before = calls();
+    env.kill_daemon();
+    env.start_daemon();
+    wait_until(Duration::from_secs(5), || calls() > before);
+    assert_eq!(count(), 1);
+    pr["headRefOid"] = json!("another-pushed-commit");
+    std::fs::write(
+        env.root().join("branch-pr.json"),
+        serde_json::to_string(&vec![pr]).unwrap(),
+    )
+    .unwrap();
+    env.kill_daemon();
+    env.start_daemon();
+    wait_until(Duration::from_secs(5), || count() == 2);
+    let notices = std::fs::read_to_string(env.root().join("notifications")).unwrap();
+    assert!(
+        notices.contains("CI failed") && notices.contains("#6"),
+        "{notices}"
+    );
+    assert!(!env.root().join("unexpected-session-message").exists());
+}

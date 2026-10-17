@@ -17,7 +17,7 @@ use crate::attest::{Attestations, Destination};
 use crate::config::{Config, ConfigCache};
 use crate::delivery::{self, Retries};
 use crate::git;
-use crate::github::{self, Gh, GitHub, Posted};
+use crate::github::{self, CachedPullRequests, Gh, GitHub, Posted, PullRequests};
 use crate::hook::{Datagram, MAX_DATAGRAM_BYTES};
 use crate::lease::{self, Lease, QueuedRun, RunningRun};
 use crate::paths::{self, Paths};
@@ -27,6 +27,7 @@ use crate::report::{self, MacNotifier, Notifier, TAIL_LINES};
 use crate::session::{Activity, Harness, Session, SessionState};
 use crate::store::{NewRun, Run, RunState, Store, now_ms};
 use crate::usage::{self, Reading, ResetCheck, Subscription, SubscriptionUsage, Window};
+use crate::{ci, cleanup};
 
 /// How often the background process reads Codex's session logs and looks for
 /// Limit windows that have reset.
@@ -83,6 +84,7 @@ pub fn run(paths: Paths) -> Result<()> {
         attestations: Attestations::new(attestation_ttl()),
         notifier: Box::new(MacNotifier),
         github: Box::new(Gh),
+        prs: CachedPullRequests::default(),
     });
     eprintln!("geleider: listening on {}", paths::display(&socket));
 
@@ -92,6 +94,8 @@ pub fn run(paths: Paths) -> Result<()> {
     std::thread::spawn(move || delivery.delivery_loop());
     let scheduler = Arc::clone(&daemon);
     std::thread::spawn(move || scheduler.schedule_loop());
+    let ci = Arc::clone(&daemon);
+    std::thread::spawn(move || ci.ci_loop());
 
     for stream in listener.incoming() {
         match stream {
@@ -114,6 +118,7 @@ struct Daemon {
     attestations: Attestations,
     notifier: Box<dyn Notifier>,
     github: Box<dyn GitHub + Send + Sync>,
+    prs: CachedPullRequests,
 }
 
 struct Core {
@@ -142,6 +147,104 @@ enum Event {
 }
 
 impl Daemon {
+    fn ci_loop(&self) {
+        let mut poller = ci::Poller::default();
+        loop {
+            if let Err(err) = self.poll_ci(&mut poller) {
+                eprintln!("geleider: checking CI: {err:#}");
+            }
+            std::thread::sleep(ci::TICK);
+        }
+    }
+
+    fn poll_ci(&self, poller: &mut ci::Poller) -> Result<()> {
+        let (config, sessions) = {
+            let mut core = lock(&self.core);
+            (core.config.get()?.clone(), core.store.sessions()?)
+        };
+        if !config.notifications {
+            return Ok(());
+        }
+        let Some((repo, branch)) = poller.next(&config, &sessions, Instant::now(), ci::INTERVAL)
+        else {
+            return Ok(());
+        };
+        // Network calls never hold the queue/Session lock.
+        for pr in self.prs.pull_requests(&repo, &branch)? {
+            for failure in ci::failures(&pr) {
+                let new = lock(&self.core)
+                    .store
+                    .new_ci_failure(&repo, pr.number, &failure.id)?;
+                if new {
+                    self.notifier.notify(
+                        &format!("geleider: CI failed on {repo} #{}", pr.number),
+                        &format!("{}: {}\n{}", branch, failure.name, pr.url),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finished(&self, fresh: bool) -> Result<cleanup::Inventory> {
+        let (config, sessions, runs) = {
+            let mut core = lock(&self.core);
+            (
+                core.config.get()?.clone(),
+                core.store.sessions()?,
+                core.store.list(0)?,
+            )
+        };
+        let github: &dyn PullRequests = if fresh { &Gh } else { &self.prs };
+        let mut inventory = cleanup::discover(&config, &sessions, &runs, github);
+        let (config, sessions, runs) = {
+            let mut core = lock(&self.core);
+            (
+                core.config.get()?.clone(),
+                core.store.sessions()?,
+                core.store.list(0)?,
+            )
+        };
+        inventory
+            .finished_worktrees
+            .retain(|wt| cleanup::validate(&config, &sessions, &runs, wt).is_ok());
+        Ok(inventory)
+    }
+
+    fn clean(
+        &self,
+        worktrees: Vec<cleanup::FinishedWorktree>,
+        cwd: &std::path::Path,
+    ) -> Result<Reply> {
+        // Refresh GitHub after the user confirms; no cached PR state authorizes removal.
+        let current = self.finished(true)?;
+        let mut cleaned = cleanup::Cleaned::default();
+        for approved in worktrees {
+            let path = approved.worktree.display().to_string();
+            if !current.finished_worktrees.contains(&approved) {
+                cleaned.skipped.push(format!(
+                    "{path}: no longer a Finished worktree (or PR state unavailable)"
+                ));
+                continue;
+            }
+            // Serialize the final local check/removal with incoming Session and
+            // Run records. Do not hold this lock during GitHub calls above.
+            let mut core = lock(&self.core);
+            let config = core.config.get()?.clone();
+            match cleanup::remove(
+                &config,
+                &core.store.sessions()?,
+                &core.store.list(0)?,
+                &approved,
+                cwd,
+            ) {
+                Ok(()) => cleaned.removed.push(approved.worktree),
+                Err(err) => cleaned.skipped.push(format!("{path}: {err:#}")),
+            }
+        }
+        Ok(Reply::Cleaned(cleaned))
+    }
+
     /// Records hook datagrams. Any process of this user can write to the socket,
     /// so each datagram is validated again here, not only by the hook.
     /// Attestations are taken at once; activity, which runs git, is recorded in
@@ -479,6 +582,8 @@ impl Daemon {
 
     fn handle(self: &Arc<Self>, request: Request) -> Result<Reply> {
         match request {
+            Request::FinishedWorktrees => Ok(Reply::Worktrees(self.finished(true)?)),
+            Request::Clean { worktrees, cwd } => self.clean(worktrees, &cwd),
             Request::Submit {
                 cwd,
                 job,
@@ -539,6 +644,7 @@ impl Daemon {
                     resources,
                     runs: runs.into_iter().map(|r| info(r, &queued, false)).collect(),
                     subscriptions: self.usage()?,
+                    finished: self.finished(false)?,
                 }))
             }
             Request::ReportUsage {

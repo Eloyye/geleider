@@ -1,4 +1,6 @@
 mod attest;
+mod ci;
+mod cleanup;
 mod cli;
 mod config;
 mod daemon;
@@ -68,11 +70,13 @@ enum Cmd {
         json: bool,
     },
     /// Sessions by Project, Resources and their holders, running and queued Runs,
-    /// and how much of each Subscription is used in each Limit window.
+    /// Subscription Limit windows and Finished worktrees.
     Status {
         #[arg(long)]
         json: bool,
     },
+    /// List Finished worktrees and remove them only after explicit confirmation.
+    Clean,
     /// Report a Harness lifecycle event from JSON on stdin. Always succeeds.
     Hook {
         harness: session::Harness,
@@ -138,6 +142,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Wait { id, json } => cli::wait_for(&paths, cli::parse_run_id(&id)?, json),
         Cmd::Queue { all, json } => cli::queue(&paths, all, json),
         Cmd::Status { json } => cli::status(&paths, json),
+        Cmd::Clean => cli::clean(&paths),
         // Handled above, before anything that can fail.
         Cmd::Hook { .. } => Ok(0),
         Cmd::SessionResults { harness, id, ack } => cli::session_results(&paths, harness, &id, ack),

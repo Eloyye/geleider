@@ -165,6 +165,8 @@ impl Server {
             Reply::Runs { runs } => json!({ "runs": runs }),
             Reply::Status(status) => serde_json::to_value(status)?,
             Reply::Usage { subscriptions } => json!({ "subscriptions": subscriptions }),
+            Reply::Worktrees(inventory) => serde_json::to_value(inventory)?,
+            Reply::Cleaned(cleaned) => serde_json::to_value(cleaned)?,
         };
         Ok(value)
     }
@@ -213,7 +215,7 @@ fn tools() -> Value {
         {
             "name": "status",
             "description": "Sessions grouped by Project (waiting first), every Resource with its slots and current Lease holders, running and queued Runs, \
-                and Subscription usage as the usage tool reports it.",
+                Subscription usage as the usage tool reports it, and Finished worktrees eligible for confirmed CLI cleanup.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
