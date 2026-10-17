@@ -10,6 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::attest::Destination;
+use crate::claim::{Claim, ClaimStatus, IssueRef};
 use crate::cleanup::{Cleaned, FinishedWorktree, Inventory};
 use crate::lease::Holder;
 use crate::paths::Paths;
@@ -55,6 +56,24 @@ pub enum Request {
     },
     /// Every Subscription's Limit windows.
     Usage,
+    /// Claim `issue` for the calling Session, from the worktree containing `cwd`.
+    Claim {
+        cwd: PathBuf,
+        issue: IssueRef,
+        /// The calling Session. Only one a hook attested is believed; otherwise
+        /// it is the only live Session in the worktree.
+        #[serde(default)]
+        session: Option<Destination>,
+    },
+    /// End the Claim on `issue`. Only its holder may, unless `force`.
+    Release {
+        cwd: PathBuf,
+        issue: IssueRef,
+        #[serde(default)]
+        session: Option<Destination>,
+        #[serde(default)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,6 +88,11 @@ pub enum Reply {
     Cleaned(Cleaned),
     Usage {
         subscriptions: Vec<SubscriptionUsage>,
+    },
+    Claim {
+        claim: Claim,
+        /// What happened, for people and agents.
+        message: String,
     },
 }
 
@@ -89,6 +113,8 @@ pub struct RunInfo {
 pub struct Status {
     #[serde(default)]
     pub sessions: Vec<Session>,
+    #[serde(default)]
+    pub claims: Vec<ClaimStatus>,
     pub resources: Vec<ResourceStatus>,
     /// Running, then queued Runs.
     pub runs: Vec<RunInfo>,
@@ -192,6 +218,13 @@ impl Reply {
         }
     }
 
+    pub fn into_claim(self) -> Result<(Claim, String)> {
+        match self {
+            Reply::Claim { claim, message } => Ok((claim, message)),
+            other => other.unexpected(),
+        }
+    }
+
     pub fn into_status(self) -> Result<Status> {
         match self {
             Reply::Status(status) => Ok(status),
@@ -207,6 +240,7 @@ impl Reply {
             Reply::Worktrees(_) => "worktrees",
             Reply::Cleaned(_) => "cleaned",
             Reply::Usage { .. } => "usage",
+            Reply::Claim { .. } => "claim",
         };
         bail!("unexpected `{kind}` reply from the background process")
     }

@@ -1,7 +1,9 @@
 mod attest;
 mod ci;
+mod claim;
 mod cleanup;
 mod cli;
+mod command;
 mod config;
 mod daemon;
 mod delivery;
@@ -19,6 +21,7 @@ mod report;
 mod session;
 mod statusline;
 mod store;
+mod text;
 mod usage;
 
 use anyhow::Result;
@@ -69,14 +72,34 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Sessions by Project, Resources and their holders, running and queued Runs,
-    /// Subscription Limit windows and Finished worktrees.
+    /// Sessions by Project, Claims, Resources and their holders, running and queued
+    /// Runs, how much of each Subscription is used in each Limit window, and
+    /// Finished worktrees.
     Status {
         #[arg(long)]
         json: bool,
     },
     /// List Finished worktrees and remove them only after explicit confirmation.
     Clean,
+    /// Claim an issue for the Session working in this worktree: assigns it to you
+    /// on GitHub and comments naming the Session. Fails, naming the holder, if
+    /// another Session holds it or it is assigned already.
+    Claim {
+        /// `5`, `#5` or `owner/name#5`.
+        issue: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// End a Claim: unassigns you and comments that the Claim was released.
+    Release {
+        /// `5`, `#5`, or `owner/name#5` from outside the Project.
+        issue: String,
+        /// Release a Claim another Session holds.
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Report a Harness lifecycle event from JSON on stdin. Always succeeds.
     Hook {
         harness: session::Harness,
@@ -117,7 +140,8 @@ fn main() {
     let code = match run(Cli::parse()) {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("geleider: {err:#}");
+            // Errors can quote paths and branches a Session chose.
+            eprintln!("geleider: {}", text::printable(&format!("{err:#}")));
             1
         }
     };
@@ -143,6 +167,8 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Queue { all, json } => cli::queue(&paths, all, json),
         Cmd::Status { json } => cli::status(&paths, json),
         Cmd::Clean => cli::clean(&paths),
+        Cmd::Claim { issue, json } => cli::claim(&paths, &issue, json),
+        Cmd::Release { issue, force, json } => cli::release(&paths, &issue, force, json),
         // Handled above, before anything that can fail.
         Cmd::Hook { .. } => Ok(0),
         Cmd::SessionResults { harness, id, ack } => cli::session_results(&paths, harness, &id, ack),

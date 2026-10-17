@@ -1,10 +1,11 @@
-//! Branch PR history and CI checks, plus Run result comments edited in place.
+//! GitHub through `gh`: branch PR history and CI checks, posting a Run's result
+//! on its branch's open PR (one comment per Job per PR, edited in place on later
+//! Runs), and the issue assignments and comments that show Claims.
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -64,13 +65,72 @@ impl PullRequests for CachedPullRequests {
     }
 }
 
+use crate::command;
+
+/// How long one `gh` call may take before it is killed.
+const GH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// What geleider needs from GitHub, so tests can stand in for `gh`.
 pub trait GitHub {
     fn open_pr(&self, repo: &str, branch: &str) -> Result<Option<u64>>;
     /// The id of the PR's comment that starts with `marker`, if there is one.
     fn find_comment(&self, repo: &str, pr: u64, marker: &str) -> Result<Option<u64>>;
-    fn create_comment(&self, repo: &str, pr: u64, body: &str) -> Result<()>;
+    /// Comments on an issue or a PR, which share one number space.
+    fn create_comment(&self, repo: &str, number: u64, body: &str) -> Result<()>;
     fn edit_comment(&self, repo: &str, comment: u64, body: &str) -> Result<()>;
+    fn issue(&self, repo: &str, number: u64) -> Result<Issue>;
+    /// The login `gh` is signed in as.
+    fn viewer(&self) -> Result<String>;
+    /// Adds or removes `login` as an assignee, returning the issue afterwards.
+    fn set_assignee(&self, repo: &str, number: u64, login: &str, assigned: bool) -> Result<Issue>;
+}
+
+/// What a Claim needs to know about an issue.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Issue {
+    pub open: bool,
+    pub assignees: Vec<String>,
+    /// GitHub serves PRs as issues too.
+    pub pull_request: bool,
+}
+
+impl Issue {
+    fn from_json(text: &str) -> Result<Self> {
+        #[derive(serde::Deserialize)]
+        struct Login {
+            login: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            state: String,
+            #[serde(default)]
+            assignees: Vec<Login>,
+            #[serde(default)]
+            pull_request: Option<serde_json::Value>,
+        }
+        let raw: Raw = serde_json::from_str(text).context("decoding the issue from gh")?;
+        Ok(Self {
+            open: raw.state == "open",
+            assignees: raw.assignees.into_iter().map(|l| l.login).collect(),
+            pull_request: raw.pull_request.is_some_and(|p| !p.is_null()),
+        })
+    }
+}
+
+/// A repository name is put into GitHub API paths, so it must be exactly
+/// `owner/name`, with nothing such as `..` that could change the path.
+pub fn check_repo(repo: &str) -> Result<()> {
+    let part = |p: &str| {
+        !p.is_empty()
+            && p != "."
+            && p != ".."
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    match repo.split_once('/') {
+        Some((owner, name)) if part(owner) && part(name) => Ok(()),
+        _ => bail!("`{repo}` is not a GitHub repository (expected owner/name)"),
+    }
 }
 
 /// The hidden first line that marks a Job's result comment.
@@ -149,21 +209,12 @@ impl PullRequests for Gh {
 
 impl Gh {
     fn run(&self, args: &[&str], input: Option<&str>) -> Result<String> {
-        let mut child = Command::new("gh")
-            .args(args)
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("running gh (is the GitHub CLI installed and on PATH?)")?;
-        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-            stdin.write_all(input.as_bytes())?;
-        }
-        let output = child.wait_with_output()?;
+        let output = command::output_within(
+            Command::new("gh").args(args),
+            input.map(str::as_bytes),
+            GH_TIMEOUT,
+        )
+        .context("is the GitHub CLI installed and on PATH?")?;
         if !output.status.success() {
             bail!(
                 "gh {}: {}",
@@ -215,14 +266,14 @@ impl GitHub for Gh {
         Ok(out.lines().next().and_then(|id| id.trim().parse().ok()))
     }
 
-    fn create_comment(&self, repo: &str, pr: u64, body: &str) -> Result<()> {
+    fn create_comment(&self, repo: &str, number: u64, body: &str) -> Result<()> {
         let input = serde_json::json!({ "body": body }).to_string();
         self.run(
             &[
                 "api",
                 "-X",
                 "POST",
-                &format!("repos/{repo}/issues/{pr}/comments"),
+                &format!("repos/{repo}/issues/{number}/comments"),
                 "--input",
                 "-",
             ],
@@ -245,6 +296,36 @@ impl GitHub for Gh {
             Some(&input),
         )?;
         Ok(())
+    }
+
+    fn issue(&self, repo: &str, number: u64) -> Result<Issue> {
+        Issue::from_json(&self.run(&["api", &format!("repos/{repo}/issues/{number}")], None)?)
+    }
+
+    fn viewer(&self) -> Result<String> {
+        let out = self.run(&["api", "user"], None)?;
+        let user: serde_json::Value = serde_json::from_str(&out).context("decoding gh api user")?;
+        user["login"]
+            .as_str()
+            .map(str::to_string)
+            .context("gh api user returned no login")
+    }
+
+    fn set_assignee(&self, repo: &str, number: u64, login: &str, assigned: bool) -> Result<Issue> {
+        let input = serde_json::json!({ "assignees": [login] }).to_string();
+        let method = if assigned { "POST" } else { "DELETE" };
+        let out = self.run(
+            &[
+                "api",
+                "-X",
+                method,
+                &format!("repos/{repo}/issues/{number}/assignees"),
+                "--input",
+                "-",
+            ],
+            Some(&input),
+        )?;
+        Issue::from_json(&out)
     }
 }
 
@@ -288,6 +369,33 @@ mod tests {
             entry.2 = body.to_string();
             Ok(())
         }
+        fn issue(&self, _repo: &str, _number: u64) -> Result<Issue> {
+            bail!("no issues here")
+        }
+        fn viewer(&self) -> Result<String> {
+            bail!("no issues here")
+        }
+        fn set_assignee(&self, _: &str, _: u64, _: &str, _: bool) -> Result<Issue> {
+            bail!("no issues here")
+        }
+    }
+
+    #[test]
+    fn issues_are_read_from_the_rest_api() {
+        let issue = Issue::from_json(
+            r#"{"state":"open","assignees":[{"login":"me"}],"pull_request":null,"title":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            issue,
+            Issue {
+                open: true,
+                assignees: vec!["me".into()],
+                pull_request: false
+            }
+        );
+        let pr = Issue::from_json(r#"{"state":"closed","pull_request":{"url":"u"}}"#).unwrap();
+        assert!(!pr.open && pr.pull_request && pr.assignees.is_empty());
     }
 
     #[test]

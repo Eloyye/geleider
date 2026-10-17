@@ -1,12 +1,15 @@
-//! Runs, kept in SQLite so the queue survives the background process restarting.
+//! Runs, Sessions, Claims and usage, kept in SQLite so they survive the background
+//! process restarting.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Params, Row, params};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::claim::Claim;
 use crate::session::{Harness, Session, SessionKey, SessionState};
 use crate::usage::{Subscription, Window};
 
@@ -171,6 +174,10 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS sessions (
             harness TEXT NOT NULL, id TEXT NOT NULL, updated_at INTEGER NOT NULL,
             record TEXT NOT NULL, PRIMARY KEY (harness, id)
+        );
+        CREATE TABLE IF NOT EXISTS claims (
+            repo TEXT NOT NULL, issue INTEGER NOT NULL, claimed_at INTEGER NOT NULL,
+            record TEXT NOT NULL, PRIMARY KEY (repo, issue)
         );",
         )?;
         std::fs::create_dir_all(&logs)?;
@@ -289,21 +296,15 @@ impl Store {
     }
 
     pub fn session(&self, key: &SessionKey) -> Result<Option<Session>> {
-        let text: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT record FROM sessions WHERE harness = ?1 AND id = ?2",
-                params![key.harness.as_str(), key.id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        text.map(|s| serde_json::from_str(&s).map_err(Into::into))
-            .transpose()
+        self.record(
+            "SELECT record FROM sessions WHERE harness = ?1 AND id = ?2",
+            params![key.harness.as_str(), key.id],
+        )
     }
 
     /// Every recorded Session, by Project with waiting ones first.
     pub fn sessions(&self) -> Result<Vec<Session>> {
-        let mut sessions = self.query_sessions("SELECT record FROM sessions")?;
+        let mut sessions: Vec<Session> = self.records("SELECT record FROM sessions", [])?;
         sessions.sort_by(|a, b| {
             a.project
                 .cmp(&b.project)
@@ -318,8 +319,9 @@ impl Store {
 
     /// Sessions that have not ended, in no particular order.
     pub fn live_sessions(&self) -> Result<Vec<Session>> {
-        self.query_sessions(
+        self.records(
             "SELECT record FROM sessions WHERE json_extract(record, '$.state') <> 'ended'",
+            [],
         )
     }
 
@@ -331,10 +333,42 @@ impl Store {
         )?)
     }
 
-    fn query_sessions(&self, sql: &str) -> Result<Vec<Session>> {
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    /// Records a Claim. A held Claim is never replaced: it must end first.
+    pub fn insert_claim(&self, claim: &Claim) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO claims (repo, issue, claimed_at, record) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                claim.repo,
+                sql_issue(claim.issue)?,
+                claim.claimed_at,
+                serde_json::to_string(claim)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim(&self, repo: &str, issue: u64) -> Result<Option<Claim>> {
+        self.record(
+            "SELECT record FROM claims WHERE repo = ?1 AND issue = ?2",
+            params![repo, sql_issue(issue)?],
+        )
+    }
+
+    /// Every held Claim, oldest first.
+    pub fn claims(&self) -> Result<Vec<Claim>> {
+        self.records(
+            "SELECT record FROM claims ORDER BY claimed_at, repo, issue",
+            [],
+        )
+    }
+
+    /// Ends `claim`, unless it already ended and the issue was claimed again.
+    /// Returns whether it was still held.
+    pub fn end_claim(&self, claim: &Claim) -> Result<bool> {
+        Ok(self.conn.execute(
+            "DELETE FROM claims WHERE repo = ?1 AND issue = ?2 AND claimed_at = ?3",
+            params![claim.repo, sql_issue(claim.issue)?, claim.claimed_at],
+        )? > 0)
     }
 
     /// Finished Runs whose result a `harness` Session has not acknowledged, oldest first.
@@ -415,7 +449,23 @@ impl Store {
         Ok(())
     }
 
-    fn query(&self, sql: &str, params: impl rusqlite::Params) -> Result<Vec<Run>> {
+    /// The one JSON `record` column `sql` selects, if a row matches.
+    fn record<T: DeserializeOwned>(&self, sql: &str, params: impl Params) -> Result<Option<T>> {
+        let text: Option<String> = self
+            .conn
+            .query_row(sql, params, |row| row.get(0))
+            .optional()?;
+        Ok(text.map(|t| serde_json::from_str(&t)).transpose()?)
+    }
+
+    /// The JSON `record` column of every row `sql` selects.
+    fn records<T: DeserializeOwned>(&self, sql: &str, params: impl Params) -> Result<Vec<T>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params, |row| row.get::<_, String>(0))?;
+        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    }
+
+    fn query(&self, sql: &str, params: impl Params) -> Result<Vec<Run>> {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params, from_row)?;
         let mut runs = Vec::new();
@@ -471,6 +521,11 @@ fn from_row(row: &Row<'_>) -> rusqlite::Result<Result<Run>> {
             log_path: log_path.into(),
         })
     })())
+}
+
+/// An issue number as SQLite stores it.
+fn sql_issue(issue: u64) -> Result<i64> {
+    i64::try_from(issue).with_context(|| format!("issue #{issue} is out of range"))
 }
 
 pub fn now_ms() -> i64 {
@@ -571,6 +626,37 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["new-ended", "old-idle"]);
+    }
+
+    #[test]
+    fn a_held_claim_is_kept_until_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("db"), dir.path().join("runs")).unwrap();
+        let claim = Claim {
+            repo: "o/r".into(),
+            issue: 5,
+            project: "demo".into(),
+            session: SessionKey::new(Harness::Claude, "abc").unwrap(),
+            worktree: "/wt".into(),
+            branch: Some("feat/x".into()),
+            git_dir: "/clone/.git".into(),
+            assignee: "me".into(),
+            claimed_at: 10,
+        };
+        store.insert_claim(&claim).unwrap();
+        let other = Claim {
+            session: SessionKey::new(Harness::Codex, "def").unwrap(),
+            claimed_at: 20,
+            ..claim.clone()
+        };
+        assert!(store.insert_claim(&other).is_err());
+        assert_eq!(store.claim("o/r", 5).unwrap(), Some(claim.clone()));
+        assert!(store.claim("o/r", 6).unwrap().is_none());
+        // An end meant for an earlier Claim on the issue leaves this one alone.
+        assert!(!store.end_claim(&other).unwrap());
+        assert_eq!(store.claims().unwrap(), std::slice::from_ref(&claim));
+        assert!(store.end_claim(&claim).unwrap());
+        assert!(store.claims().unwrap().is_empty());
     }
 
     #[test]

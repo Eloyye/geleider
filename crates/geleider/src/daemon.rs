@@ -1,5 +1,5 @@
 //! `geleider daemon`: the background process that owns the queue, starts Runs
-//! when their Resource has a free slot, and reports their results.
+//! when their Resource has a free slot, reports their results, and keeps Claims.
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -7,13 +7,17 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
+mod claims;
+
 use crate::attest::{Attestations, Destination};
+use crate::claim::{self, ClaimStatus};
 use crate::config::{Config, ConfigCache};
 use crate::delivery::{self, Retries};
 use crate::git;
@@ -79,13 +83,17 @@ pub fn run(paths: Paths) -> Result<()> {
             store: Store::open(&paths.database(), paths.run_logs())?,
             config: ConfigCache::new(paths.config.clone()),
             children: HashSet::new(),
+            claiming: HashSet::new(),
         }),
         wake: (Mutex::new(false), Condvar::new()),
         attestations: Attestations::new(attestation_ttl()),
         notifier: Box::new(MacNotifier),
         github: Box::new(Gh),
         prs: CachedPullRequests::default(),
+        claims_file: paths.claims(),
+        claim_quiet: env_ms("GELEIDER_CLAIM_QUIET_MS").unwrap_or(claim::QUIET_AFTER),
     });
+    daemon.publish_claims(&self::lock(&daemon.core).store);
     eprintln!("geleider: listening on {}", paths::display(&socket));
 
     let ingress = Arc::clone(&daemon);
@@ -96,6 +104,8 @@ pub fn run(paths: Paths) -> Result<()> {
     std::thread::spawn(move || scheduler.schedule_loop());
     let ci = Arc::clone(&daemon);
     std::thread::spawn(move || ci.ci_loop());
+    let claims = Arc::clone(&daemon);
+    std::thread::spawn(move || claims.claims_loop());
 
     for stream in listener.incoming() {
         match stream {
@@ -119,6 +129,10 @@ struct Daemon {
     notifier: Box<dyn Notifier>,
     github: Box<dyn GitHub + Send + Sync>,
     prs: CachedPullRequests,
+    /// Where start hooks read every Claim.
+    claims_file: PathBuf,
+    /// How long a holder may be quiet before its Claim is flagged.
+    claim_quiet: Duration,
 }
 
 struct Core {
@@ -127,6 +141,8 @@ struct Core {
     /// Runs this process started and is waiting on. Other running Runs were
     /// started before a restart and are watched through the process table.
     children: HashSet<i64>,
+    /// Issues being claimed on GitHub right now, so two Sessions can't both.
+    claiming: HashSet<(String, u64)>,
 }
 
 impl Core {
@@ -617,36 +633,7 @@ impl Daemon {
                     runs: next.into_iter().map(|r| info(r, &queued, false)).collect(),
                 })
             }
-            Request::Status => {
-                let snapshot = Snapshot::take()?;
-                let mut core = lock(&self.core);
-                let (config, held) = core.leases(&snapshot)?;
-                let resources = config
-                    .resources
-                    .iter()
-                    .map(|(name, r)| ResourceStatus {
-                        name: name.clone(),
-                        slots: r.slots,
-                        process: r.process.clone(),
-                        holders: held
-                            .iter()
-                            .filter(|l| l.resource == *name)
-                            .map(|l| l.holder.clone())
-                            .collect(),
-                    })
-                    .collect();
-                let queued = queued_runs(&core.store)?;
-                let runs = core.store.list(0)?;
-                let sessions = core.store.sessions()?;
-                drop(core);
-                Ok(Reply::Status(Status {
-                    sessions,
-                    resources,
-                    runs: runs.into_iter().map(|r| info(r, &queued, false)).collect(),
-                    subscriptions: self.usage()?,
-                    finished: self.finished(false)?,
-                }))
-            }
+            Request::Status => self.status(),
             Request::ReportUsage {
                 subscription,
                 readings,
@@ -659,7 +646,61 @@ impl Daemon {
             Request::Usage => Ok(Reply::Usage {
                 subscriptions: self.usage()?,
             }),
+            Request::Claim {
+                cwd,
+                issue,
+                session,
+            } => self.claim(&cwd, &issue, session),
+            Request::Release {
+                cwd,
+                issue,
+                session,
+                force,
+            } => self.release(&cwd, &issue, session, force),
         }
+    }
+
+    /// Sessions, Claims, Resources with their holders, Runs and usage.
+    fn status(self: &Arc<Self>) -> Result<Reply> {
+        let snapshot = Snapshot::take()?;
+        let mut core = lock(&self.core);
+        let (config, held) = core.leases(&snapshot)?;
+        let resources = config
+            .resources
+            .iter()
+            .map(|(name, r)| ResourceStatus {
+                name: name.clone(),
+                slots: r.slots,
+                process: r.process.clone(),
+                holders: held
+                    .iter()
+                    .filter(|l| l.resource == *name)
+                    .map(|l| l.holder.clone())
+                    .collect(),
+            })
+            .collect();
+        let queued = queued_runs(&core.store)?;
+        let runs = core.store.list(0)?;
+        let sessions = core.store.sessions()?;
+        let now = now_ms();
+        let claims = core
+            .store
+            .claims()?
+            .into_iter()
+            .map(|c| {
+                let holder = sessions.iter().find(|s| s.key == c.session);
+                ClaimStatus::new(c, holder, self.claim_quiet, now)
+            })
+            .collect();
+        drop(core);
+        Ok(Reply::Status(Status {
+            sessions,
+            claims,
+            resources,
+            runs: runs.into_iter().map(|r| info(r, &queued, false)).collect(),
+            subscriptions: self.usage()?,
+            finished: self.finished(false)?,
+        }))
     }
 
     /// Reads the newest Codex numbers, so what is shown is never older than its
@@ -802,10 +843,15 @@ impl Daemon {
 }
 
 fn attestation_ttl() -> Duration {
-    std::env::var("GELEIDER_ATTESTATION_TTL_MS")
+    env_ms("GELEIDER_ATTESTATION_TTL_MS").unwrap_or(ATTESTATION_TTL)
+}
+
+/// A duration in milliseconds from the environment, which tests use to shorten waits.
+fn env_ms(name: &str) -> Option<Duration> {
+    std::env::var(name)
         .ok()
         .and_then(|ms| ms.parse().ok())
-        .map_or(ATTESTATION_TTL, Duration::from_millis)
+        .map(Duration::from_millis)
 }
 
 /// What `activity` alone says about its Session: where it is and what it is doing.

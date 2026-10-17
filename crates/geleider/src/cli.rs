@@ -1,4 +1,4 @@
-//! The command-line side of submitting and checking Runs.
+//! The command-line side of submitting and checking Runs, and of Claims.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use crate::claim::{ClaimStatus, IssueRef};
 use crate::cleanup::Inventory;
 use crate::lease::Holder;
 use crate::paths::{self, Paths};
@@ -14,6 +15,7 @@ use crate::protocol::{self, Request, RunInfo, Status};
 use crate::report;
 use crate::session::{Harness, SessionKey, SessionState};
 use crate::store::{RunState, now_ms};
+use crate::text;
 use crate::usage::{SubscriptionUsage, WindowView};
 
 /// Finished Runs `geleider queue --all` shows.
@@ -181,6 +183,34 @@ fn render_finished(inventory: &Inventory) -> String {
     out
 }
 
+/// Claims `issue` for the Session working in this worktree. The CLI names no
+/// Session: the daemon takes the only live one in the worktree.
+pub fn claim(paths: &Paths, issue: &str, json: bool) -> Result<i32> {
+    let request = Request::Claim {
+        cwd: std::env::current_dir()?,
+        issue: IssueRef::parse(issue)?,
+        session: None,
+    };
+    claim_reply(paths, &request, json)
+}
+
+pub fn release(paths: &Paths, issue: &str, force: bool, json: bool) -> Result<i32> {
+    let request = Request::Release {
+        cwd: std::env::current_dir()?,
+        issue: IssueRef::parse(issue)?,
+        session: None,
+        force,
+    };
+    claim_reply(paths, &request, json)
+}
+
+fn claim_reply(paths: &Paths, request: &Request, json: bool) -> Result<i32> {
+    let (claim, message) = protocol::call(paths, request)?.into_claim()?;
+    let value = serde_json::json!({ "claim": claim, "message": message });
+    print_as(json, &value, || format!("{message}\n"))?;
+    Ok(0)
+}
+
 pub fn usage(paths: &Paths, json: bool) -> Result<i32> {
     let subscriptions = protocol::call(paths, &Request::Usage)?.into_usage()?;
     print_as(json, &subscriptions, || {
@@ -189,12 +219,14 @@ pub fn usage(paths: &Paths, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-/// Prints `value` as JSON for scripts, or `text` for people.
+/// Prints `value` as JSON for scripts, or `text` for people. Branches, paths,
+/// args and logs in `text` come from Sessions, so terminal escapes in them are
+/// dropped; JSON escapes them itself.
 fn print_as(json: bool, value: &impl Serialize, text: impl FnOnce() -> String) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(value)?);
     } else {
-        print!("{}", text());
+        print!("{}", text::printable(&text()));
     }
     Ok(())
 }
@@ -229,6 +261,7 @@ fn render_status(status: &Status) -> String {
             report::duration(now_ms() - session.last_activity)
         ));
     }
+    out.push_str(&render_claims(&status.claims, now_ms()));
     out.push_str("\nResources\n");
     if status.resources.is_empty() {
         out.push_str("  (none configured)\n");
@@ -278,6 +311,40 @@ fn render_status(status: &Status) -> String {
     }
     out.push('\n');
     out.push_str(&render_finished(&status.finished));
+    out
+}
+
+/// e.g. `Eloyye/geleider#5  codex 019a…  codex/issue-5-x  claimed 3h 10m ago, active 2m 05s ago`.
+fn render_claims(claims: &[ClaimStatus], now: i64) -> String {
+    let mut out = String::from("\nClaims\n");
+    if claims.is_empty() {
+        out.push_str("  (none)\n");
+    }
+    for status in claims {
+        let claim = &status.claim;
+        let quiet = report::duration(now - status.last_activity);
+        let activity = match (status.quiet, status.session_state) {
+            (true, state) => format!(
+                "QUIET for {quiet}{}: check on it, or `geleider release {} --force`",
+                if state == Some(SessionState::Ended) {
+                    ", Session ended"
+                } else {
+                    ""
+                },
+                claim.name()
+            ),
+            (false, Some(SessionState::Ended)) => format!("Session ended {quiet} ago"),
+            (false, _) => format!("active {quiet} ago"),
+        };
+        out.push_str(&format!(
+            "  {}  {} {}  {}  claimed {} ago, {activity}\n",
+            claim.name(),
+            claim.session.harness.as_str(),
+            claim.session.id,
+            claim.branch.as_deref().unwrap_or("(detached)"),
+            report::duration(now - claim.claimed_at),
+        ));
+    }
     out
 }
 

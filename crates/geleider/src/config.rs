@@ -183,9 +183,8 @@ impl Config {
             }
         }
         for (project_name, project) in &self.projects {
-            if project.repo.split('/').count() != 2 {
-                bail!("project `{project_name}`: repo must look like `owner/name`");
-            }
+            crate::github::check_repo(&project.repo)
+                .with_context(|| format!("project `{project_name}`"))?;
             for (job_name, job) in &project.jobs {
                 let at = || format!("job `{job_name}` in project `{project_name}`");
                 if !self.resources.contains_key(&job.resource) {
@@ -279,6 +278,10 @@ impl Project {
                 known.join(", ")
             );
         };
+        // Args are shown in `geleider status`, notifications and PR comments.
+        if let Some(arg) = args.iter().find(|a| crate::text::has_hidden(a)) {
+            bail!("job args cannot contain control or invisible characters: {arg:?}");
+        }
         if args.len() != job.args.len() {
             let usage: Vec<String> = job.args.iter().map(|a| format!("<{a}>")).collect();
             bail!(
@@ -301,8 +304,11 @@ impl Project {
             argv.push(substitute(&word, &values)?);
         }
         // A relative program path such as `scripts/test.sh` means one in the worktree.
-        if argv[0].contains('/') && Path::new(&argv[0]).is_relative() {
-            argv[0] = worktree.join(&argv[0]).display().to_string();
+        if let Some(program) = argv.first_mut()
+            && program.contains('/')
+            && Path::new(program.as_str()).is_relative()
+        {
+            *program = worktree.join(&*program).display().to_string();
         }
         Ok(Rendered {
             resource: job.resource.clone(),
@@ -413,6 +419,22 @@ mod tests {
                 "/Games/Crusader Kings III",
             ]
         );
+    }
+
+    #[test]
+    fn args_cannot_hide_terminal_escapes_and_repos_cannot_leave_their_path() {
+        let config = Config::parse(QUEENDOM).unwrap();
+        let project = &config.projects["queendom"];
+        for arg in ["\u{1b}]52;c;aGk=\u{7}", "a\u{202e}b"] {
+            let err = project
+                .render("ck3-test", &[arg.into()], Path::new("/wt"))
+                .unwrap_err();
+            assert!(err.to_string().contains("control or invisible"), "{err}");
+        }
+        for repo in ["../x", "o/r/x", "o/..", "o/r?x"] {
+            let text = QUEENDOM.replace("Eloyye/queendom", repo);
+            assert!(Config::parse(&text).is_err(), "{repo}");
+        }
     }
 
     #[test]

@@ -89,6 +89,14 @@ if (args[0] === 'session-results') {
       input: { job: "offline", session: { harness: "opencode", id: "victim" } } };
     await hooks.get("execute.before")(offline);
     assert.deepEqual(offline.input, { job: "offline", cwd: "/other-worktree" });
+    // A claim names its Session the same way; other tools are left alone.
+    const claim = { id: "call-4", sessionID: "root", tool: "geleider_claim",
+      input: { issue: 5, session: { harness: "codex", id: "victim" } } };
+    await hooks.get("execute.before")(claim);
+    assert.deepEqual(claim.input.session, { harness: "opencode", id: "root", nonce: "n-root" });
+    const read = { id: "call-5", sessionID: "root", tool: "geleider_status", input: { session: "kept" } };
+    await hooks.get("execute.before")(read);
+    assert.deepEqual(read.input, { session: "kept" });
     events.push({ type: "permission.asked", data: { sessionID: "root", id: "permission" } });
     events.push({ type: "session.idle", data: { sessionID: "child" } });
     events.push({ type: "form.created", data: { form: { sessionID: "root", id: "question" } } });

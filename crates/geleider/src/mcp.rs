@@ -1,6 +1,6 @@
 //! `geleider mcp`: an MCP server over stdio that lets a Session submit and check
-//! Runs. It only forwards to the background process, which runs the Job outside
-//! the Harness's sandbox.
+//! Runs, and claim issues. It only forwards to the background process, which runs
+//! the Job outside the Harness's sandbox.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::claim::IssueRef;
 use crate::paths::Paths;
 use crate::protocol::{self, Reply, Request};
 
@@ -76,7 +77,9 @@ impl Server {
                         used by integration tests). Submit with submit_run; it returns at once with the Run id \
                         and queue position. geleider's hooks attest the calling Session on each submission, so Codex and OpenCode receive the result automatically; \
                         the reply's `delivery` says whether this one will be. If it is off, check get_run; Claude Code should use geleider run --wait. \
-                        usage shows how much of each Subscription (Claude Pro, ChatGPT Plus) is used.",
+                        usage shows how much of each Subscription (Claude Pro, ChatGPT Plus) is used. \
+                        Before your first write on a GitHub issue, claim it with claim: only one Session works on \
+                        an issue at a time, and claim fails, naming the holder, if another Session has it.",
                 })
             }
             "ping" => json!({}),
@@ -125,10 +128,7 @@ impl Server {
                     value => serde_json::from_value(value.clone())
                         .context("`args` must be a list of strings")?,
                 };
-                let cwd = match args["cwd"].as_str() {
-                    Some(cwd) => PathBuf::from(cwd),
-                    None => std::env::current_dir()?,
-                };
+                let cwd = cwd(args)?;
                 let submitter = format!("mcp:{}", self.client.as_deref().unwrap_or("unknown"));
                 Request::Submit {
                     cwd,
@@ -138,12 +138,7 @@ impl Server {
                     // Never infer a Session from clientInfo, cwd, or server env:
                     // desktop apps may share this process between conversations.
                     // The daemon keeps this only if a hook attested its nonce.
-                    session: args
-                        .get("session")
-                        .filter(|s| !s.is_null())
-                        .map(|s| serde_json::from_value(s.clone()))
-                        .transpose()
-                        .context("`session` must contain harness, id and nonce")?,
+                    session: session(args)?,
                 }
             }
             "get_run" => Request::GetRun {
@@ -156,6 +151,17 @@ impl Server {
                     0
                 },
             },
+            "claim" => Request::Claim {
+                cwd: cwd(args)?,
+                issue: issue(args)?,
+                session: session(args)?,
+            },
+            "release" => Request::Release {
+                cwd: cwd(args)?,
+                issue: issue(args)?,
+                session: session(args)?,
+                force: false,
+            },
             "status" => Request::Status,
             "usage" => Request::Usage,
             _ => bail!("unknown tool `{name}`"),
@@ -167,9 +173,45 @@ impl Server {
             Reply::Usage { subscriptions } => json!({ "subscriptions": subscriptions }),
             Reply::Worktrees(inventory) => serde_json::to_value(inventory)?,
             Reply::Cleaned(cleaned) => serde_json::to_value(cleaned)?,
+            Reply::Claim { claim, message } => json!({ "claim": claim, "message": message }),
         };
         Ok(value)
     }
+}
+
+fn cwd(args: &Value) -> Result<PathBuf> {
+    match args["cwd"].as_str() {
+        Some(cwd) => Ok(PathBuf::from(cwd)),
+        None => Ok(std::env::current_dir()?),
+    }
+}
+
+/// The calling Session as the hook set it.
+fn session(args: &Value) -> Result<Option<crate::attest::Destination>> {
+    args.get("session")
+        .filter(|s| !s.is_null())
+        .map(|s| serde_json::from_value(s.clone()))
+        .transpose()
+        .context("`session` must contain harness, id and nonce")
+}
+
+/// `issue` as a number, or as text such as `#5` or `owner/name#5`.
+fn issue(args: &Value) -> Result<IssueRef> {
+    match &args["issue"] {
+        Value::Number(n) => IssueRef::parse(&n.to_string()),
+        Value::String(text) => IssueRef::parse(text),
+        _ => bail!("`issue` is required"),
+    }
+}
+
+/// The `session` argument the hooks fill in on submit_run, claim and release.
+fn session_schema(effect: &str) -> Value {
+    json!({ "type": "object", "description": format!("Set by geleider's Harness hook; do not pass it. {effect}"),
+        "properties": { "harness": { "type": "string", "enum": ["claude", "codex", "opencode"] }, "id": { "type": "string", "minLength": 1 }, "nonce": { "type": "string" } }, "required": ["harness", "id"], "additionalProperties": false })
+}
+
+fn cwd_schema() -> Value {
+    json!({ "type": "string", "description": "A directory in your worktree. Defaults to this server's working directory." })
 }
 
 fn tools() -> Value {
@@ -185,9 +227,8 @@ fn tools() -> Value {
                 "properties": {
                     "job": { "type": "string", "description": "Job name, e.g. `ck3-test`." },
                     "args": { "type": "array", "items": { "type": "string" }, "description": "The Job's positional args." },
-                    "cwd": { "type": "string", "description": "A directory in your worktree. Defaults to this server's working directory." },
-                    "session": { "type": "object", "description": "Set by geleider's Harness hook; do not pass it. Any value you write is replaced, and one no hook attested turns result delivery off.",
-                        "properties": { "harness": { "type": "string", "enum": ["claude", "codex", "opencode"] }, "id": { "type": "string", "minLength": 1 }, "nonce": { "type": "string" } }, "required": ["harness", "id"], "additionalProperties": false }
+                    "cwd": cwd_schema(),
+                    "session": session_schema("Any value you write is replaced, and one no hook attested turns result delivery off.")
                 },
                 "required": ["job"]
             }
@@ -213,8 +254,39 @@ fn tools() -> Value {
             }
         },
         {
+            "name": "claim",
+            "description": "Claim a GitHub issue for this Session before your first write on it. Only one Session, in any Harness, \
+                works on an issue at a time. On success the issue is assigned to the user with a comment naming this Session; \
+                the Claim lasts until the issue closes or you release it. Fails, naming the holder, if another Session holds \
+                the issue or it is already assigned: then don't work on it, tell the user.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "issue": { "type": ["integer", "string"], "description": "Issue number in this worktree's Project, e.g. 5 or \"#5\"." },
+                    "cwd": cwd_schema(),
+                    "session": session_schema("Any value you write is replaced or ignored.")
+                },
+                "required": ["issue"]
+            }
+        },
+        {
+            "name": "release",
+            "description": "Release this Session's Claim on an issue you are no longer working on: unassigns the user and comments \
+                that the Claim was released. Only the Session holding a Claim can release it. A Claim also ends by itself when \
+                the issue closes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "issue": { "type": ["integer", "string"], "description": "Issue number, e.g. 5, \"#5\" or \"owner/name#5\"." },
+                    "cwd": cwd_schema(),
+                    "session": session_schema("Any value you write is replaced or ignored.")
+                },
+                "required": ["issue"]
+            }
+        },
+        {
             "name": "status",
-            "description": "Sessions grouped by Project (waiting first), every Resource with its slots and current Lease holders, running and queued Runs, \
+            "description": "Sessions grouped by Project (waiting first), Claims with their holders (quiet ones flagged), every Resource with its slots and current Lease holders, running and queued Runs, \
                 Subscription usage as the usage tool reports it, and Finished worktrees eligible for confirmed CLI cleanup.",
             "inputSchema": { "type": "object", "properties": {} }
         },
@@ -279,7 +351,15 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["submit_run", "get_run", "list_runs", "status", "usage"]
+            [
+                "submit_run",
+                "get_run",
+                "list_runs",
+                "claim",
+                "release",
+                "status",
+                "usage"
+            ]
         );
 
         let result = server
@@ -293,6 +373,16 @@ mod tests {
         assert_eq!(
             seen.borrow()[0],
             json!({"op": "submit", "cwd": "/wt", "job": "ck3-test", "args": ["events"], "submitter": "mcp:codex", "session": null})
+        );
+
+        server.handle(
+            json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                   "params": {"name": "claim", "arguments": {"issue": "#5", "cwd": "/wt"}}}),
+            &call,
+        );
+        assert_eq!(
+            seen.borrow()[1],
+            json!({"op": "claim", "cwd": "/wt", "issue": {"repo": null, "number": 5}, "session": null})
         );
 
         let unknown = server
