@@ -26,6 +26,12 @@ const fs = require('node:fs');
 const args = process.argv.slice(2);
 const input = fs.readFileSync(0, 'utf8');
 fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify({ args, input: input ? JSON.parse(input) : null }) + '\\n');
+if (args[0] === 'hook' && input && JSON.parse(input).tool_input) {
+  const hook = JSON.parse(input);
+  if (hook.tool_input.job === 'offline') process.exit(1);
+  const updatedInput = { ...hook.tool_input, session: { harness: 'opencode', id: hook.session_id, nonce: 'n-' + hook.session_id } };
+  console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', updatedInput } }));
+}
 if (args[0] === 'session-results') {
   if (args.includes('--ack')) fs.writeFileSync(${JSON.stringify(resultsPath)}, '[]');
   console.log(fs.readFileSync(${JSON.stringify(resultsPath)}, 'utf8'));
@@ -65,17 +71,27 @@ if (args[0] === 'session-results') {
     cleanup = await plugin.setup(ctx);
     const call = { id: "call", sessionID: "child", tool: "geleider_submit_run", input: { job: "test" } };
     await hooks.get("execute.before")(call);
-    assert.deepEqual(call.input.session, { harness: "opencode", id: "root" });
+    assert.deepEqual(call.input.session, { harness: "opencode", id: "root", nonce: "n-root" });
     assert.equal(call.input.cwd, "/root-worktree");
+    const calls = async () => (await readFile(callsPath, "utf8")).trim().split("\n").map(JSON.parse);
+    // The child's call is attested for its root, without reporting the child's state.
+    const attested = (await calls()).find((c) => c.input?.tool_use_id === "call");
+    assert.deepEqual(attested.args, ["hook", "opencode", "tool.before"]);
+    assert.equal(attested.input.session_id, "root");
+    assert.equal(attested.input.agent_id, "child");
     const other = { id: "call-2", sessionID: "other", tool: "geleider_submit_run",
       input: { job: "test", session: { harness: "codex", id: "victim" } } };
     await hooks.get("execute.before")(other);
-    assert.deepEqual(other.input.session, { harness: "opencode", id: "other" });
+    assert.deepEqual(other.input.session, { harness: "opencode", id: "other", nonce: "n-other" });
     assert.equal(other.input.cwd, "/other-worktree");
+    // Without geleider's attestation the call goes ahead with no destination.
+    const offline = { id: "call-3", sessionID: "other", tool: "geleider_submit_run",
+      input: { job: "offline", session: { harness: "opencode", id: "victim" } } };
+    await hooks.get("execute.before")(offline);
+    assert.deepEqual(offline.input, { job: "offline", cwd: "/other-worktree" });
     events.push({ type: "permission.asked", data: { sessionID: "root", id: "permission" } });
     events.push({ type: "session.idle", data: { sessionID: "child" } });
     events.push({ type: "form.created", data: { form: { sessionID: "root", id: "question" } } });
-    const calls = async () => (await readFile(callsPath, "utf8")).trim().split("\n").map(JSON.parse);
     await until(async () => (await calls()).some((c) => c.args[2] === "form.created"));
     assert.ok(!(await calls()).some((c) => c.args[2] === "session.idle"));
     await until(() => deliveryAttempts > 0);
