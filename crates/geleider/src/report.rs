@@ -78,7 +78,7 @@ fn local_time(ms: i64) -> Option<libc::tm> {
     (!filled.is_null()).then(|| unsafe { tm.assume_init() })
 }
 
-/// e.g. `ck3-test events`.
+/// e.g. `playmode-test combat`.
 pub fn title(run: &Run) -> String {
     std::iter::once(run.job.as_str())
         .chain(run.args.iter().map(String::as_str))
@@ -191,9 +191,9 @@ mod tests {
             id: 1,
             project: "p".into(),
             repo: "o/r".into(),
-            job: "ck3-test".into(),
+            job: "playmode-test".into(),
             args: vec!["x` [click](https://e.vil) @org/team `".into()],
-            resource: "ck3".into(),
+            resource: "unity".into(),
             worktree: "/wt".into(),
             branch: None,
             argv: Vec::new(),
@@ -211,7 +211,9 @@ mod tests {
         };
         let body = comment_body(&run, "");
         assert!(
-            body.contains("### ❌ `` ck3-test x` [click](https://e.vil) @org/team ` `` failed"),
+            body.contains(
+                "### ❌ `` playmode-test x` [click](https://e.vil) @org/team ` `` failed"
+            ),
             "{body}"
         );
         assert!(body.contains("> `starting x  <img src=x>`"), "{body}");

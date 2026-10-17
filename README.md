@@ -4,7 +4,7 @@ Coordinates coding-agent work on one Mac across Claude Code, Codex and OpenCode.
 
 ## Resource Leases and the Job queue
 
-A Session in any Harness submits a Job that needs a Resource, such as integration tests that launch CK3. geleider queues each Run, starts it outside any sandbox once a slot is free, and reports the result. No two Runs share a one-slot Resource, and a game you start by hand holds a slot too.
+A Session in any Harness submits a Job that needs a Resource, such as Unity PlayMode tests that launch the Unity Editor. geleider queues each Run, starts it outside any sandbox once a slot is free, and reports the result. No two Runs share a one-slot Resource, and an Editor you open by hand holds a slot too.
 
 ```sh
 cargo install --path crates/geleider
@@ -14,32 +14,32 @@ geleider install      # launchd login service + MCP server in Claude Code, Codex
 Then declare Projects, Resources and Jobs in `~/.config/geleider/config.toml`. Jobs come only from this file, never from a Project's repo:
 
 ```toml
-[resources.ck3]
+[resources.unity]
 slots = 1
-process = "ck3"           # every running process with this name holds a Lease
+process = "Unity"         # every running process with this name holds a Lease
 
-[projects.queendom]
-repo = "Eloyye/queendom"
-path = "~/code/queendom"  # the clone; its worktrees belong to the Project too
-vars = { ck3_dir = "/path/to/Crusader Kings III" }
+[projects.lanternfall]
+repo = "Eloyye/lanternfall"
+path = "~/code/lanternfall"  # the clone; its worktrees belong to the Project too
+vars = { unity = "/Applications/Unity/Hub/Editor/6000.0.23f1/Unity.app/Contents/MacOS/Unity" }
 
-[projects.queendom.jobs.ck3-test]
-resource = "ck3"
+[projects.lanternfall.jobs.playmode-test]
+resource = "unity"
 args = ["suite"]
 # Split like a shell would but never run through one, so args cannot inject
 # commands. A relative program path is relative to the worktree. {worktree} is built in.
-command = "scripts/test-engine.sh {suite} {ck3_dir}"
+command = "scripts/run-playmode.sh {suite} {unity}"
 ```
 
 From any worktree of the Project:
 
 ```sh
-geleider run ck3-test events          # returns at once with the Run id and queue position
-geleider run ck3-test events --wait   # blocks, then exits with the Run's exit code
-geleider show 12                      # state, exit code, duration, log path and tail
+geleider run playmode-test combat         # returns at once with the Run id and queue position
+geleider run playmode-test combat --wait  # blocks, then exits with the Run's exit code
+geleider show 12                          # state, exit code, duration, log path and tail
 geleider wait 12
 geleider queue [--all]
-geleider status                       # Sessions, Claims, Resources and their holders, Runs
+geleider status                           # Sessions, Claims, Resources and their holders, Runs
 ```
 
 The MCP server (`geleider mcp`) offers the same as the tools `submit_run`, `get_run`, `list_runs` and `status`, plus `claim`, `release` and `usage` (see below). In Codex, `geleider install` pre-approves these tools (`default_tools_approval_mode = "approve"`), since `codex exec` cannot ask. They can only queue Jobs from geleider's own config, and the Session itself stays in its sandbox, but see [Trust boundary](#trust-boundary). Set it to `"prompt"` in `~/.codex/config.toml` to be asked each time; reinstalling keeps your choice.
@@ -50,7 +50,7 @@ State lives in `~/Library/Application Support/geleider/`: the SQLite database, t
 
 ### Trust boundary
 
-A Run executes outside any sandbox, in the submitting Session's worktree. geleider fixes *which* command runs, but the files it runs, such as `scripts/test-engine.sh` and the tests it calls, come from that worktree, and a Session can edit them. So a Session that can submit a Job can run code outside its sandbox, with your network access and files. Only declare Jobs for Projects whose Sessions you would trust with that, and leave Codex's approval mode at `"prompt"` if you want to see each submission first. In addition:
+A Run executes outside any sandbox, in the submitting Session's worktree. geleider fixes *which* command runs, but the files it runs, such as `scripts/run-playmode.sh` and the tests it calls, come from that worktree, and a Session can edit them. So a Session that can submit a Job can run code outside its sandbox, with your network access and files. Only declare Jobs for Projects whose Sessions you would trust with that, and leave Codex's approval mode at `"prompt"` if you want to see each submission first. In addition:
 
 - A Run only starts in the Project's clone or in a worktree that clone has registered (`git worktree list`). A directory merely pointed at the clone's repository through a hand-written `.git` file is refused.
 - geleider runs git in the caller's directory with `core.fsmonitor` and hooks switched off, so repository settings an agent wrote cannot run commands.

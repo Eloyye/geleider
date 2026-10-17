@@ -29,7 +29,7 @@ pub enum Holder {
     Run {
         id: i64,
     },
-    /// A process geleider did not start, such as the game opened by hand.
+    /// A process geleider did not start, such as the Unity Editor opened by hand.
     Process {
         pid: u32,
         name: String,
@@ -164,93 +164,103 @@ mod tests {
 
     #[test]
     fn one_slot_runs_one_at_a_time_in_order() {
-        let res = resources(&[("ck3", 1, "ck3")]);
-        let q = queued(&[(3, "ck3"), (2, "ck3")]);
+        let res = resources(&[("unity", 1, "Unity")]);
+        let q = queued(&[(3, "unity"), (2, "unity")]);
         assert_eq!(runs_to_start(&res, &[], &q), vec![2]);
 
         let running = [RunningRun {
             id: 2,
-            resource: "ck3".into(),
+            resource: "unity".into(),
             pid: Some(100),
         }];
         let held = leases(&res, &running, &Snapshot::default());
         assert_eq!(
-            runs_to_start(&res, &held, &queued(&[(3, "ck3")])),
+            runs_to_start(&res, &held, &queued(&[(3, "unity")])),
             Vec::<i64>::new()
         );
     }
 
     #[test]
     fn hand_started_process_holds_a_lease_and_blocks_the_queue() {
-        let res = resources(&[("ck3", 1, "ck3")]);
-        let snapshot = Snapshot::from_processes([process(1, 0, "launchd"), process(500, 1, "ck3")]);
+        let res = resources(&[("unity", 1, "Unity")]);
+        let snapshot =
+            Snapshot::from_processes([process(1, 0, "launchd"), process(500, 1, "Unity")]);
         let held = leases(&res, &[], &snapshot);
         assert_eq!(
             held,
             vec![Lease {
-                resource: "ck3".into(),
+                resource: "unity".into(),
                 holder: Holder::Process {
                     pid: 500,
-                    name: "ck3".into()
+                    name: "Unity".into()
                 }
             }]
         );
-        assert!(runs_to_start(&res, &held, &queued(&[(1, "ck3")])).is_empty());
+        assert!(runs_to_start(&res, &held, &queued(&[(1, "unity")])).is_empty());
 
-        // Once the game quits the Lease is gone and the Run starts.
+        // Once the Editor quits the Lease is gone and the Run starts.
         let held = leases(
             &res,
             &[],
             &Snapshot::from_processes([process(1, 0, "launchd")]),
         );
-        assert_eq!(runs_to_start(&res, &held, &queued(&[(1, "ck3")])), vec![1]);
+        assert_eq!(
+            runs_to_start(&res, &held, &queued(&[(1, "unity")])),
+            vec![1]
+        );
     }
 
     #[test]
     fn process_started_by_a_run_shares_the_runs_lease() {
-        let res = resources(&[("ck3", 1, "ck3")]);
-        // Run 7 is a script (pid 200) that launched the game (pid 202) via a shell.
+        let res = resources(&[("unity", 1, "Unity")]);
+        // Run 7 is a script (pid 200) that launched the Editor (pid 202) via a shell.
         let snapshot = Snapshot::from_processes([
-            process(200, 1, "test-engine.sh"),
+            process(200, 1, "run-playmode.sh"),
             process(201, 200, "bash"),
-            process(202, 201, "ck3"),
+            process(202, 201, "Unity"),
         ]);
         let running = [RunningRun {
             id: 7,
-            resource: "ck3".into(),
+            resource: "unity".into(),
             pid: Some(200),
         }];
         let held = leases(&res, &running, &snapshot);
         assert_eq!(
             held,
             vec![Lease {
-                resource: "ck3".into(),
+                resource: "unity".into(),
                 holder: Holder::Run { id: 7 }
             }]
         );
     }
 
     #[test]
-    fn game_orphaned_by_a_finished_run_still_holds_a_lease() {
-        let res = resources(&[("ck3", 1, "ck3")]);
-        let snapshot = Snapshot::from_processes([process(202, 1, "ck3")]);
+    fn editor_orphaned_by_a_finished_run_still_holds_a_lease() {
+        let res = resources(&[("unity", 1, "Unity")]);
+        let snapshot = Snapshot::from_processes([process(202, 1, "Unity")]);
         let held = leases(&res, &[], &snapshot);
         assert_eq!(held.len(), 1);
-        assert!(runs_to_start(&res, &held, &queued(&[(8, "ck3")])).is_empty());
+        assert!(runs_to_start(&res, &held, &queued(&[(8, "unity")])).is_empty());
     }
 
     #[test]
     fn resources_are_independent_and_respect_slot_counts() {
-        let res = resources(&[("ck3", 1, "ck3"), ("sim", 2, "Simulator")]);
-        let snapshot = Snapshot::from_processes([process(9, 1, "ck3")]);
+        let res = resources(&[("unity", 1, "Unity"), ("sim", 2, "Simulator")]);
+        let snapshot = Snapshot::from_processes([process(9, 1, "Unity")]);
         let held = leases(&res, &[], &snapshot);
-        let q = queued(&[(1, "ck3"), (2, "sim"), (3, "sim"), (4, "sim"), (5, "gone")]);
+        let q = queued(&[
+            (1, "unity"),
+            (2, "sim"),
+            (3, "sim"),
+            (4, "sim"),
+            (5, "gone"),
+        ]);
         assert_eq!(runs_to_start(&res, &held, &q), vec![2, 3]);
     }
 
     #[test]
     fn queue_position_counts_only_the_same_resource() {
-        let q = queued(&[(1, "ck3"), (2, "sim"), (3, "ck3")]);
+        let q = queued(&[(1, "unity"), (2, "sim"), (3, "unity")]);
         assert_eq!(queue_position(&q, 3), Some(2));
         assert_eq!(queue_position(&q, 2), Some(1));
         assert_eq!(queue_position(&q, 4), None);

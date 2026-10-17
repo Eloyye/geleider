@@ -541,14 +541,14 @@ mod tests {
 
     fn new_run(job: &str) -> NewRun {
         NewRun {
-            project: "queendom".into(),
-            repo: "Eloyye/queendom".into(),
+            project: "lanternfall".into(),
+            repo: "Eloyye/lanternfall".into(),
             job: job.into(),
-            args: vec!["events".into()],
-            resource: "ck3".into(),
+            args: vec!["combat".into()],
+            resource: "unity".into(),
             worktree: "/wt".into(),
             branch: Some("feat/x".into()),
-            argv: vec!["/wt/test.sh".into(), "events".into()],
+            argv: vec!["/wt/test.sh".into(), "combat".into()],
             submitter: "cli".into(),
             session: None,
         }
@@ -663,8 +663,8 @@ mod tests {
     fn runs_move_through_their_states() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("db"), dir.path().join("runs")).unwrap();
-        let a = store.insert(new_run("ck3-test")).unwrap();
-        let b = store.insert(new_run("ck3-test")).unwrap();
+        let a = store.insert(new_run("playmode-test")).unwrap();
+        let b = store.insert(new_run("playmode-test")).unwrap();
         assert_eq!(a.state, RunState::Queued);
         assert_eq!(a.log_path, dir.path().join("runs/1.log"));
         assert_eq!(store.with_state(RunState::Queued).unwrap().len(), 2);

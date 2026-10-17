@@ -111,7 +111,7 @@ fn percent_or_false<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f64
 #[serde(deny_unknown_fields)]
 pub struct Resource {
     pub slots: u32,
-    /// Name of the executable that uses this Resource, e.g. `ck3`. Every running
+    /// Name of the executable that uses this Resource, e.g. `Unity`. Every running
     /// process with this name holds a Lease.
     pub process: String,
 }
@@ -382,90 +382,90 @@ fn walk<'a>(word: &'a str, mut f: impl FnMut(Piece<'a>) -> Result<()>) -> Result
 mod tests {
     use super::*;
 
-    const QUEENDOM: &str = r#"
-        [resources.ck3]
+    const LANTERNFALL: &str = r#"
+        [resources.unity]
         slots = 1
-        process = "ck3"
+        process = "Unity"
 
-        [projects.queendom]
-        repo = "Eloyye/queendom"
-        path = "/code/queendom"
-        vars = { ck3_dir = "/Games/Crusader Kings III" }
+        [projects.lanternfall]
+        repo = "Eloyye/lanternfall"
+        path = "/code/lanternfall"
+        vars = { unity = "/Unity/Unity.app/Contents/MacOS/Unity" }
 
-        [projects.queendom.jobs.ck3-test]
-        resource = "ck3"
+        [projects.lanternfall.jobs.playmode-test]
+        resource = "unity"
         args = ["suite"]
-        command = "scripts/test-engine.sh {suite} {ck3_dir}"
+        command = "scripts/run-playmode.sh {suite} {unity}"
     "#;
 
     #[test]
     fn renders_args_vars_and_relative_program() {
-        let config = Config::parse(QUEENDOM).unwrap();
-        let project = &config.projects["queendom"];
+        let config = Config::parse(LANTERNFALL).unwrap();
+        let project = &config.projects["lanternfall"];
         let rendered = project
             .render(
-                "ck3-test",
-                &["events; rm -rf /".into()],
+                "playmode-test",
+                &["combat; rm -rf /".into()],
                 Path::new("/wt/feat"),
             )
             .unwrap();
-        assert_eq!(rendered.resource, "ck3");
+        assert_eq!(rendered.resource, "unity");
         assert_eq!(
             rendered.argv,
             vec![
-                "/wt/feat/scripts/test-engine.sh",
+                "/wt/feat/scripts/run-playmode.sh",
                 // An arg stays one word, whatever it contains: no shell runs it.
-                "events; rm -rf /",
-                "/Games/Crusader Kings III",
+                "combat; rm -rf /",
+                "/Unity/Unity.app/Contents/MacOS/Unity",
             ]
         );
     }
 
     #[test]
     fn args_cannot_hide_terminal_escapes_and_repos_cannot_leave_their_path() {
-        let config = Config::parse(QUEENDOM).unwrap();
-        let project = &config.projects["queendom"];
+        let config = Config::parse(LANTERNFALL).unwrap();
+        let project = &config.projects["lanternfall"];
         for arg in ["\u{1b}]52;c;aGk=\u{7}", "a\u{202e}b"] {
             let err = project
-                .render("ck3-test", &[arg.into()], Path::new("/wt"))
+                .render("playmode-test", &[arg.into()], Path::new("/wt"))
                 .unwrap_err();
             assert!(err.to_string().contains("control or invisible"), "{err}");
         }
         for repo in ["../x", "o/r/x", "o/..", "o/r?x"] {
-            let text = QUEENDOM.replace("Eloyye/queendom", repo);
+            let text = LANTERNFALL.replace("Eloyye/lanternfall", repo);
             assert!(Config::parse(&text).is_err(), "{repo}");
         }
     }
 
     #[test]
     fn rejects_unknown_job_and_wrong_arg_count() {
-        let config = Config::parse(QUEENDOM).unwrap();
-        let project = &config.projects["queendom"];
+        let config = Config::parse(LANTERNFALL).unwrap();
+        let project = &config.projects["lanternfall"];
         let err = project.render("deploy", &[], Path::new("/wt")).unwrap_err();
         assert!(err.to_string().contains("no job `deploy`"), "{err}");
         let err = project
-            .render("ck3-test", &[], Path::new("/wt"))
+            .render("playmode-test", &[], Path::new("/wt"))
             .unwrap_err();
         assert!(err.to_string().contains("takes 1 arg"), "{err}");
     }
 
     #[test]
     fn validates_placeholders_and_resources() {
-        let unknown_placeholder = QUEENDOM.replace("{ck3_dir}", "{game_dir}");
+        let unknown_placeholder = LANTERNFALL.replace("{unity}", "{unity_path}");
         let err = Config::parse(&unknown_placeholder).unwrap_err();
         assert!(
-            format!("{err:#}").contains("unknown placeholder `{game_dir}`"),
+            format!("{err:#}").contains("unknown placeholder `{unity_path}`"),
             "{err:#}"
         );
 
-        let unknown_resource = QUEENDOM.replace("resource = \"ck3\"", "resource = \"gpu\"");
+        let unknown_resource = LANTERNFALL.replace("resource = \"unity\"", "resource = \"gpu\"");
         let err = Config::parse(&unknown_resource).unwrap_err();
         assert!(
             format!("{err:#}").contains("unknown resource `gpu`"),
             "{err:#}"
         );
 
-        let zero_slots = QUEENDOM.replace("slots = 1", "slots = 0");
+        let zero_slots = LANTERNFALL.replace("slots = 1", "slots = 0");
         assert!(Config::parse(&zero_slots).is_err());
     }
 

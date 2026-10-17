@@ -304,7 +304,7 @@ mod tests {
     #[test]
     fn finds_project_from_a_worktree_subdirectory() {
         let dir = tempfile::tempdir().unwrap();
-        let clone = dir.path().join("queendom");
+        let clone = dir.path().join("lanternfall");
         std::fs::create_dir(&clone).unwrap();
         run_git(&clone, &["init", "-q", "-b", "main"]);
         run_git(
@@ -337,13 +337,13 @@ mod tests {
 
         let config = Config::parse(&format!(
             "[projects.other]\nrepo = \"a/b\"\npath = \"{}\"\n\
-             [projects.queendom]\nrepo = \"Eloyye/queendom\"\npath = \"{}\"\n",
+             [projects.lanternfall]\nrepo = \"Eloyye/lanternfall\"\npath = \"{}\"\n",
             dir.path().display(),
             clone.display()
         ))
         .unwrap();
         let found = locate(&config, &wt.join("sub")).unwrap();
-        assert_eq!(found.project_name, "queendom");
+        assert_eq!(found.project_name, "lanternfall");
         assert_eq!(found.worktree, std::fs::canonicalize(&wt).unwrap());
         assert_eq!(found.branch.as_deref(), Some("feat/x"));
 
@@ -355,7 +355,7 @@ mod tests {
     #[test]
     fn a_directory_pointed_at_the_clone_is_not_one_of_its_worktrees() {
         let dir = tempfile::tempdir().unwrap();
-        let clone = dir.path().join("queendom");
+        let clone = dir.path().join("lanternfall");
         std::fs::create_dir(&clone).unwrap();
         run_git(&clone, &["init", "-q", "-b", "main"]);
 
@@ -386,7 +386,7 @@ mod tests {
         assert_eq!(common, std::fs::canonicalize(clone.join(".git")).unwrap());
 
         let config = Config::parse(&format!(
-            "[projects.queendom]\nrepo = \"Eloyye/queendom\"\npath = \"{}\"\n",
+            "[projects.lanternfall]\nrepo = \"Eloyye/lanternfall\"\npath = \"{}\"\n",
             clone.display()
         ))
         .unwrap();

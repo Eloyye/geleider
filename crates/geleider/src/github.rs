@@ -426,8 +426,8 @@ mod tests {
             post_result(&gh, "o/r", Some("feat/x"), job, &body(job, text)).unwrap()
         };
 
-        assert_eq!(post("ck3-test", "failed"), Posted::Created(7));
-        assert_eq!(post("ck3-test", "passed"), Posted::Edited(7));
+        assert_eq!(post("playmode-test", "failed"), Posted::Created(7));
+        assert_eq!(post("playmode-test", "passed"), Posted::Edited(7));
         assert_eq!(post("lint", "passed"), Posted::Created(7));
 
         let comments = gh.comments.borrow();

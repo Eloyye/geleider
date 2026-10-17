@@ -394,7 +394,7 @@ fn window_line(window: &WindowView, now: i64) -> String {
     format!("{:<3} {state}  {freshness}", window.window)
 }
 
-/// e.g. `#12 running  ck3-test events  queendom  feat/x  for 3m 12s`.
+/// e.g. `#12 running  playmode-test combat  lanternfall  feat/x  for 3m 12s`.
 pub fn one_line(info: &RunInfo) -> String {
     let run = &info.run;
     let detail = match run.state {
