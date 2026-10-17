@@ -3,6 +3,8 @@
 //! line. Only geleider's own entries are ever added, changed or removed; a status
 //! line the user already had is wrapped, not replaced.
 
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -158,7 +160,7 @@ fn report_status_line(path: &Path, outcome: Result<Option<Merge>>, removing: boo
     match outcome {
         Ok(None) => {}
         Ok(Some(Merge::Write(text))) => {
-            let wrapping = !removing && text.contains(" statusline --wrap ");
+            let wrapping = !removing && wraps_a_status_line(&text);
             println!(
                 "Claude Code: status line {} in {path}",
                 match (removing, wrapping) {
@@ -216,13 +218,22 @@ fn claude_remove(existing: Option<&str>) -> Result<Merge> {
 }
 
 fn claude_is_ours(entry: &Value) -> bool {
-    let args: Vec<&str> = entry["args"]
+    is_ours(entry["command"].as_str(), &strings(&entry["args"]))
+}
+
+/// The strings in a JSON array; nothing if it is not one.
+fn strings(value: &Value) -> Vec<&str> {
+    value
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .collect();
-    is_ours(entry["command"].as_str(), &args)
+        .collect()
+}
+
+/// A JSON config file's new text, formatted the way the Harnesses write it.
+fn json_write(doc: &Value) -> Result<Merge> {
+    Ok(Merge::Write(serde_json::to_string_pretty(doc)? + "\n"))
 }
 
 // OpenCode: servers live under `mcp`, with the command as one array.
@@ -240,13 +251,7 @@ fn opencode_remove(existing: Option<&str>) -> Result<Merge> {
 }
 
 fn opencode_is_ours(entry: &Value) -> bool {
-    let command: Vec<&str> = entry["command"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    match command.split_first() {
+    match strings(&entry["command"]).split_first() {
         Some((program, args)) => is_ours(Some(program), args),
         None => false,
     }
@@ -283,7 +288,7 @@ fn json_set(
         _ => {}
     }
     servers.insert(SERVER.to_string(), entry);
-    Ok(Merge::Write(serde_json::to_string_pretty(&doc)? + "\n"))
+    json_write(&doc)
 }
 
 fn json_remove(existing: Option<&str>, table: &[&str], ours: fn(&Value) -> bool) -> Result<Merge> {
@@ -306,7 +311,7 @@ fn json_remove(existing: Option<&str>, table: &[&str], ours: fn(&Value) -> bool)
         Some(current) if !ours(current) => Ok(Merge::Foreign),
         Some(_) => {
             servers.remove(SERVER);
-            Ok(Merge::Write(serde_json::to_string_pretty(&doc)? + "\n"))
+            json_write(&doc)
         }
     }
 }
@@ -435,6 +440,14 @@ fn our_status_line(command: &str) -> Option<Option<String>> {
     }
 }
 
+/// Whether the settings `text` geleider wrote keep a status line of the user's.
+fn wraps_a_status_line(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|doc| our_status_line(doc["statusLine"]["command"].as_str()?))
+        .is_some_and(|wrapped| wrapped.is_some())
+}
+
 fn statusline_add(existing: Option<&str>, ours: &str) -> Result<Merge> {
     let mut doc = parse_json(existing)?;
     let settings = doc
@@ -464,7 +477,7 @@ fn statusline_add(existing: Option<&str>, ours: &str) -> Result<Merge> {
         return Ok(Merge::Unchanged);
     }
     settings.insert("statusLine".into(), entry);
-    Ok(Merge::Write(serde_json::to_string_pretty(&doc)? + "\n"))
+    json_write(&doc)
 }
 
 fn statusline_remove(existing: Option<&str>) -> Result<Merge> {
@@ -494,26 +507,53 @@ fn statusline_remove(existing: Option<&str>) -> Result<Merge> {
             settings.remove("statusLine");
         }
     }
-    Ok(Merge::Write(serde_json::to_string_pretty(&doc)? + "\n"))
+    json_write(&doc)
 }
 
+/// Replaces `path` with `text` in one step, keeping a backup of the old file.
+/// These files can hold credentials (`~/.claude.json` can hold an API key), so
+/// the new file and the backup are created with the original's permissions, or
+/// owner-only for a new file, never briefly readable by others. A leftover temp
+/// or backup file, or a symlink planted at its name, is removed rather than
+/// written through.
 fn write_atomically(path: &Path, text: &str, keep_backup: bool) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    let mode = std::fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
     if keep_backup {
-        let mut backup = path.as_os_str().to_owned();
-        backup.push(".geleider-backup");
-        std::fs::copy(path, &backup)?;
+        let original = std::fs::read(path)?;
+        write_new(&sibling(path, ".geleider-backup"), &original, mode)?;
     }
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(".geleider-tmp");
-    let temp = PathBuf::from(temp);
-    std::fs::write(&temp, text)?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        std::fs::set_permissions(&temp, meta.permissions())?;
-    }
+    let temp = sibling(path, ".geleider-tmp");
+    write_new(&temp, text.as_bytes(), mode)?;
     std::fs::rename(&temp, path).with_context(|| format!("writing {}", path.display()))
+}
+
+/// `path` with `suffix` added to its file name.
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Writes a fresh file with `mode`, replacing whatever was at `path`.
+fn write_new(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+            return Err(err).with_context(|| format!("removing {}", path.display()));
+        }
+        _ => {}
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 // launchd
@@ -523,7 +563,9 @@ fn plist_path(home: &Path) -> PathBuf {
 }
 
 fn domain() -> String {
-    // SAFETY: getuid has no preconditions and cannot fail.
+    // The standard library has no way to ask for the user id, and `getuid` is the
+    // smallest unsafe block that does.
+    // SAFETY: getuid takes no arguments, has no preconditions and cannot fail.
     format!("gui/{}", unsafe { libc::getuid() })
 }
 
@@ -556,7 +598,9 @@ fn install_service(home: &Path, exe: &Path) -> Result<()> {
         }
     }
     let plist = plist_path(home);
-    std::fs::create_dir_all(plist.parent().expect("has parent"))?;
+    if let Some(dir) = plist.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     std::fs::write(&plist, plist_xml(exe, &env, &logs.join("daemon.log")))?;
 
     let _ = launchctl(&["bootout", &format!("{}/{LABEL}", domain())]);
@@ -864,6 +908,44 @@ mod tests {
             our_status_line("/x/geleider statusline --wrap 'echo hi'"),
             Some(Some("echo hi".into()))
         );
+    }
+
+    #[test]
+    fn writes_keep_permissions_and_never_follow_planted_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".claude.json");
+        std::fs::write(&path, "{\"primaryApiKey\": \"secret\"}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Symlinks at the temp and backup names, aimed at a file elsewhere.
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, sibling(&path, ".geleider-tmp")).unwrap();
+        std::os::unix::fs::symlink(&target, sibling(&path, ".geleider-backup")).unwrap();
+
+        write_atomically(&path, "{}\n", true).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+        for file in [path.clone(), sibling(&path, ".geleider-backup")] {
+            let meta = std::fs::symlink_metadata(&file).unwrap();
+            assert!(meta.is_file());
+            assert_eq!(
+                meta.permissions().mode() & 0o777,
+                0o600,
+                "{}",
+                file.display()
+            );
+        }
+        assert!(
+            std::fs::read_to_string(sibling(&path, ".geleider-backup"))
+                .unwrap()
+                .contains("secret")
+        );
+
+        let fresh = dir.path().join("new.json");
+        write_atomically(&fresh, "{}", false).unwrap();
+        let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

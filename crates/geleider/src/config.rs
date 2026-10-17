@@ -243,18 +243,15 @@ impl ConfigCache {
             .ok();
         if self.current.is_none() || modified != self.modified {
             match Config::load(&self.path) {
-                Ok(config) => {
-                    self.current = Some(config);
-                    self.modified = modified;
-                }
+                Ok(config) => self.current = Some(config),
                 Err(err) if self.current.is_some() => {
                     eprintln!("geleider: keeping previous config: {err:#}");
-                    self.modified = modified;
                 }
                 Err(err) => return Err(err),
             }
+            self.modified = modified;
         }
-        Ok(self.current.as_ref().expect("loaded above"))
+        self.current.as_ref().context("no config loaded")
     }
 }
 

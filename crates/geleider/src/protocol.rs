@@ -93,7 +93,10 @@ pub fn encode_reply(reply: Result<Reply>) -> String {
         Ok(reply) => Envelope::Ok(reply),
         Err(err) => Envelope::Error(format!("{err:#}")),
     };
-    serde_json::to_string(&envelope).expect("replies serialize")
+    serde_json::to_string(&envelope).unwrap_or_else(|err| {
+        let error = Envelope::Error(format!("encoding the reply: {err}"));
+        serde_json::to_string(&error).unwrap_or_default()
+    })
 }
 
 /// Sends one request to the background process and waits for its reply.
@@ -133,28 +136,38 @@ impl Reply {
     pub fn into_run(self) -> Result<RunInfo> {
         match self {
             Reply::Run(run) => Ok(*run),
-            _ => bail!("unexpected reply from the background process"),
+            other => other.unexpected(),
         }
     }
 
     pub fn into_runs(self) -> Result<Vec<RunInfo>> {
         match self {
             Reply::Runs { runs } => Ok(runs),
-            _ => bail!("unexpected reply from the background process"),
+            other => other.unexpected(),
         }
     }
 
     pub fn into_usage(self) -> Result<Vec<SubscriptionUsage>> {
         match self {
             Reply::Usage { subscriptions } => Ok(subscriptions),
-            _ => bail!("unexpected reply from the background process"),
+            other => other.unexpected(),
         }
     }
 
     pub fn into_status(self) -> Result<Status> {
         match self {
             Reply::Status(status) => Ok(status),
-            _ => bail!("unexpected reply from the background process"),
+            other => other.unexpected(),
         }
+    }
+
+    fn unexpected<T>(&self) -> Result<T> {
+        let kind = match self {
+            Reply::Run(_) => "run",
+            Reply::Runs { .. } => "runs",
+            Reply::Status(_) => "status",
+            Reply::Usage { .. } => "usage",
+        };
+        bail!("unexpected `{kind}` reply from the background process")
     }
 }

@@ -173,7 +173,7 @@ impl Store {
             "UPDATE runs SET log_path = ?1 WHERE id = ?2",
             params![log_path.display().to_string(), id],
         )?;
-        self.get(id)?.context("run vanished after insert")
+        self.require(id)
     }
 
     pub fn get(&self, id: i64) -> Result<Option<Run>> {
@@ -185,6 +185,11 @@ impl Store {
             )
             .optional()?
             .transpose()
+    }
+
+    /// Run `id`, which must exist.
+    pub fn require(&self, id: i64) -> Result<Run> {
+        self.get(id)?.with_context(|| format!("no run #{id}"))
     }
 
     pub fn with_state(&self, state: RunState) -> Result<Vec<Run>> {

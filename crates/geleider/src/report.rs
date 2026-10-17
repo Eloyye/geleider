@@ -50,7 +50,10 @@ pub fn clock(ms: i64, now: i64) -> String {
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    let (at, today) = (local_time(ms), local_time(now));
+    let (Some(at), Some(today)) = (local_time(ms), local_time(now)) else {
+        let secs = ms.div_euclid(1000).rem_euclid(86_400);
+        return format!("{:02}:{:02} UTC", secs / 3600, secs % 3600 / 60);
+    };
     let time = format!("{:02}:{:02}", at.tm_hour, at.tm_min);
     if (at.tm_year, at.tm_yday) == (today.tm_year, today.tm_yday) {
         time
@@ -61,14 +64,17 @@ pub fn clock(ms: i64, now: i64) -> String {
     }
 }
 
-fn local_time(ms: i64) -> libc::tm {
-    let secs = ms.div_euclid(1000) as libc::time_t;
-    // SAFETY: localtime_r only writes the `tm` it is given; a zeroed `tm` is valid.
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&secs, &mut tm);
-        tm
-    }
+/// The local calendar time at `ms`, or `None` if the C library cannot represent
+/// it. The standard library has no time zones, and pulling in a date crate for
+/// one `localtime_r` call is not worth it.
+fn local_time(ms: i64) -> Option<libc::tm> {
+    let secs = libc::time_t::try_from(ms.div_euclid(1000)).ok()?;
+    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: both pointers are valid for the call; localtime_r fills `tm` and
+    // returns it, or returns null and leaves it unspecified.
+    let filled = unsafe { libc::localtime_r(&secs, tm.as_mut_ptr()) };
+    // SAFETY: a non-null return means `tm` was fully written.
+    (!filled.is_null()).then(|| unsafe { tm.assume_init() })
 }
 
 /// e.g. `ck3-test events`.
