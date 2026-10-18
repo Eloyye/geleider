@@ -16,6 +16,7 @@ mod import;
 mod install;
 mod lease;
 mod mcp;
+mod panel;
 mod paths;
 mod procs;
 mod protocol;
@@ -75,9 +76,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Sessions by Project, Claims, Resources and their holders, running and queued
-    /// Runs, how much of each Subscription is used in each Limit window, and
-    /// Finished worktrees.
+    /// Panels for Subscription usage, Sessions and their Claims, Resources and their
+    /// Runs, and Claims and Finished worktrees.
     Status {
         #[arg(long)]
         json: bool,

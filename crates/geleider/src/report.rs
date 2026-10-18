@@ -44,6 +44,17 @@ pub fn duration(ms: i64) -> String {
     }
 }
 
+/// How long ago, in its largest unit only: `40s`, `4m`, `2h`, `3d`.
+pub fn age(ms: i64) -> String {
+    let secs = ms.max(0) / 1000;
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
 /// A local time such as `14:05`, with the weekday when it is not today and the
 /// date when it is not within a week: `Fri 09:00`, `Oct 21 09:00`.
 pub fn clock(ms: i64, now: i64) -> String {
@@ -175,6 +186,15 @@ mod tests {
         assert_eq!(duration(192_000), "3m 12s");
         assert_eq!(duration(3_723_000), "1h 02m");
         assert_eq!(duration(273_600_000), "3d 04h");
+    }
+
+    #[test]
+    fn ages_show_one_unit() {
+        assert_eq!(age(4_200), "4s");
+        assert_eq!(age(192_000), "3m");
+        assert_eq!(age(3_723_000), "1h");
+        assert_eq!(age(273_600_000), "3d");
+        assert_eq!(age(-5), "0s");
     }
 
     #[test]

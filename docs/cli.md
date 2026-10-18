@@ -17,8 +17,38 @@ See [Jobs and Resources](jobs.md).
 
 | Command | What it does |
 | --- | --- |
-| `geleider status [--json]` | Sessions by Project (waiting first), Claims, Resources and their holders, running and queued Runs, Subscription usage and Finished worktrees. |
+| `geleider status [--json]` | Panels for Subscription usage, live Sessions (waiting first) with their Claims, Resources with their running and queued Runs and any process holding them, and Claims and Finished worktrees, with the command to release a quiet Claim or clean up. Two columns from 110 columns wide, stacked below that. Coloured on a terminal unless `NO_COLOR` is set. |
 | `geleider usage [--json]` | How much of each Subscription is used in each Limit window, and when each resets. See [Subscription usage](subscription-usage.md). |
+
+```text
+╭─ Usage ──────────────────────────────────────────────────────────────────────╮
+│ Claude Max    5h ██░░░░░░░░ 23%  ↺ 14:53                                     │
+│               7d ████░░░░░░ 41%  ↺ Thu 12:43                                 │
+│ ChatGPT Plus  5h █████████░ 87%  ↺ 13:24                                     │
+│               7d ██████░░░░ 62%  ↺ Sat 12:43, 25m old                        │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭─ Sessions · 3 ───────────────────────────────────────────────────────────────╮
+│ ◐ lanternfall   claude    #42  claude/issue-42                               │
+│   waiting for 4m · 7f3a1c2e                                                  │
+│ ● lanternfall   codex     #38  codex/issue-38                                │
+│   working for 20s · 019a2b3c                                                 │
+│ ○ geleider      opencode       feat/colors                                   │
+│   idle for 42m · ses_01JB                                                    │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭─ Resources & Runs ───────────────────────────────────────────────────────────╮
+│ unity  ■ 1/1                                                                 │
+│   ▶ #57   playmode-test combat     3m 12s     lanternfall                    │
+│   ⋯ #58   playmode-test save-load  next       lanternfall                    │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭─ Claims & cleanup ───────────────────────────────────────────────────────────╮
+│   lanternfall#42          claude 7f3a1c2e   4m ago                           │
+│   lanternfall#38          codex 019a2b3c    20s ago                          │
+│ ! geleider#18             codex 019a0000    quiet 1d, Session ended          │
+│   geleider release Eloyye/geleider#18 --force                                │
+│ ✓ lanternfall #33 merged  codex/issue-31                                     │
+│   geleider clean removes Finished worktrees after asking                     │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
 
 ## Issues, PRs and worktrees
 
