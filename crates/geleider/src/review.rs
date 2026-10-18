@@ -20,7 +20,7 @@ use crate::paths::Paths;
 use crate::protocol::{self, Reply, Request};
 use crate::session::{Activity, Harness, Session, SessionKey, SessionState};
 use crate::store::now_ms;
-use crate::usage::{Subscription, SubscriptionUsage};
+use crate::usage::Subscription;
 use crate::{cli, command, git, text};
 
 /// How long a reviewing Harness may run before it is killed.
@@ -170,7 +170,7 @@ pub fn run(paths: &Paths, input: &str, explicit: Option<Reviewer>, yes: bool) ->
         pr.number,
         reviewer.harness().name()
     );
-    print_usage(&config, status.subscriptions, reviewer.subscription());
+    cli::print_usage(&config, &status.subscriptions, reviewer.subscription());
     if !yes {
         print!("Start this review and post its result on the PR? [y/N] ");
         std::io::stdout().flush()?;
@@ -204,26 +204,6 @@ pub fn run(paths: &Paths, input: &str, explicit: Option<Reviewer>, yes: bool) ->
         pr.number
     );
     Ok(0)
-}
-
-/// Shows the reviewing Subscription's Limit windows, including missing ones.
-fn print_usage(config: &Config, usage: Vec<SubscriptionUsage>, subscription: Subscription) {
-    let usage = usage
-        .into_iter()
-        .find(|u| u.subscription == subscription)
-        .unwrap_or_else(|| SubscriptionUsage {
-            subscription,
-            plan: config.subscriptions.plan(subscription),
-            source: subscription.source().into(),
-            windows: Vec::new(),
-        });
-    print!(
-        "{}",
-        text::printable(&cli::render_usage(&[usage], now_ms()))
-    );
-    if !config.subscriptions.get(subscription).enabled {
-        println!("  Usage tracking is disabled for this Subscription.");
-    }
 }
 
 /// One Cross-review: its Session and the private directory that keeps its
@@ -368,7 +348,7 @@ impl<'a> Review<'a> {
 }
 
 /// A random UUID, as Claude's `--session-id` requires; hooks report under it too.
-fn session_id() -> Result<String> {
+pub fn session_id() -> Result<String> {
     let hex: String = Nonce::generate()
         .context("generating review Session id")?
         .into();

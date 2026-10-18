@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::{ATTESTATION_WAIT, Daemon, env_ms, lock};
+use super::{ATTESTATION_WAIT, Core, Daemon, env_ms, lock};
 use crate::attest::Destination;
 use crate::claim::{self, Claim, IssueRef};
 use crate::git;
@@ -22,7 +22,7 @@ const CLAIM_CHECK_INTERVAL: Duration = Duration::from_secs(120);
 /// An issue held for a claim that is under way on GitHub, so a second claim
 /// fails at once instead of racing it. Dropping it ends the hold, whether the
 /// claim succeeded, failed or panicked.
-struct Reservation<'a> {
+pub(super) struct Reservation<'a> {
     daemon: &'a Daemon,
     key: (String, u64),
 }
@@ -76,6 +76,21 @@ impl Daemon {
         }
     }
 
+    /// Holds `repo#number` for a claim about to go to GitHub, or fails if
+    /// another claim of it is under way.
+    pub(super) fn reserve(
+        &self,
+        core: &mut Core,
+        repo: &str,
+        number: u64,
+    ) -> Result<Reservation<'_>> {
+        let key = (repo.to_string(), number);
+        if !core.claiming.insert(key.clone()) {
+            bail!("{repo}#{number} is being claimed by another Session right now");
+        }
+        Ok(Reservation { daemon: self, key })
+    }
+
     pub(super) fn claim(
         &self,
         cwd: &Path,
@@ -124,14 +139,7 @@ impl Daemon {
                 }
                 bail!(claim::held_by(&held));
             }
-            let key = (repo, issue.number);
-            if !core.claiming.insert(key.clone()) {
-                bail!(
-                    "{} is being claimed by another Session right now",
-                    new.name()
-                );
-            }
-            Reservation { daemon: self, key }
+            self.reserve(&mut core, &repo, issue.number)?
         };
         // `gh` is slow, so it runs without holding the lock; the reservation
         // keeps the issue to this claim meanwhile, and ends however it ends.

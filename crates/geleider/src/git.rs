@@ -317,6 +317,136 @@ pub fn pr_diff(worktree: &Path, base: &str, head: &str) -> Result<String> {
     checked(git_within(worktree, &args, CHECKOUT_TIMEOUT)?)
 }
 
+/// Fetches `branch` from the clone's `origin` into `refs/remotes/origin/<branch>`
+/// and returns that ref. `branch` must have passed [`check_branch`].
+pub fn fetch_branch(clone: &Path, branch: &str) -> Result<String> {
+    let remote = format!("refs/remotes/origin/{branch}");
+    let refspec = format!("+refs/heads/{branch}:{remote}");
+    let fetch = [
+        "fetch",
+        "--no-tags",
+        "--no-write-fetch-head",
+        "origin",
+        &refspec,
+    ];
+    checked(git_within(clone, &fetch, CHECKOUT_TIMEOUT)?)
+        .with_context(|| format!("fetching `{branch}` from origin"))?;
+    Ok(remote)
+}
+
+/// Refuses names git would not take as a branch, or could read as an option.
+pub fn check_branch(clone: &Path, branch: &str) -> Result<()> {
+    if branch.starts_with('-')
+        || crate::text::has_hidden(branch)
+        || git(clone, &["check-ref-format", "--branch", branch])
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+    {
+        bail!(
+            "`{}` is not a valid branch name",
+            crate::text::one_line(branch)
+        );
+    }
+    Ok(())
+}
+
+/// Whether the clone has a local branch named `branch`.
+pub fn has_branch(clone: &Path, branch: &str) -> bool {
+    let name = format!("refs/heads/{branch}");
+    git(clone, &["show-ref", "--verify", "--quiet", &name]).is_ok_and(|o| o.status.success())
+}
+
+/// Whether `ancestor` is reachable from `descendant`.
+pub fn is_ancestor(clone: &Path, ancestor: &str, descendant: &str) -> bool {
+    git(
+        clone,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+    )
+    .is_ok_and(|o| o.status.success())
+}
+
+/// Moves local `branch` to `target`, which it must not be checked out anywhere.
+pub fn reset_branch(clone: &Path, branch: &str, target: &str) -> Result<()> {
+    git_stdout(clone, &["branch", "-f", "--", branch, target])?;
+    Ok(())
+}
+
+/// Adds a worktree at `path` on a new `branch` started from `start`, with no
+/// upstream, so its Session pushes it under its own name.
+pub fn add_worktree_new_branch(clone: &Path, path: &Path, branch: &str, start: &str) -> Result<()> {
+    let path = path.to_str().context("worktree path is not UTF-8")?;
+    let add = [
+        "worktree",
+        "add",
+        "--no-track",
+        "-b",
+        branch,
+        "--",
+        path,
+        start,
+    ];
+    checked(git_within(clone, &add, CHECKOUT_TIMEOUT)?)?;
+    Ok(())
+}
+
+/// Adds a worktree at `path` on the existing local `branch`, tracking
+/// `origin/<branch>` so its Session pushes to the PR.
+pub fn add_worktree_on_branch(clone: &Path, path: &Path, branch: &str) -> Result<()> {
+    let path_text = path.to_str().context("worktree path is not UTF-8")?;
+    let add = ["worktree", "add", "--", path_text, branch];
+    checked(git_within(clone, &add, CHECKOUT_TIMEOUT)?)?;
+    let upstream = format!("origin/{branch}");
+    git_stdout(
+        clone,
+        &["branch", "--set-upstream-to", &upstream, "--", branch],
+    )?;
+    Ok(())
+}
+
+/// Removes a worktree a Dispatch just created, with whatever its Setup wrote.
+pub fn discard_new_worktree(clone: &Path, path: &Path) -> Result<()> {
+    let path = path.to_str().context("worktree path is not UTF-8")?;
+    git_stdout(clone, &["worktree", "remove", "--force", "--", path])?;
+    Ok(())
+}
+
+pub fn delete_branch(clone: &Path, branch: &str) -> Result<()> {
+    git_stdout(clone, &["branch", "-D", "--", branch])?;
+    Ok(())
+}
+
+/// The gitignored files in the clone's own checkout that `.worktreeinclude`,
+/// read from the checkout too, lists. Paths are relative to the clone.
+pub fn worktree_includes(clone: &Path) -> Result<Vec<PathBuf>> {
+    let include = clone.join(".worktreeinclude");
+    if !include.is_file() {
+        return Ok(Vec::new());
+    }
+    let list = |extra: &[&OsStr]| -> Result<Vec<String>> {
+        let mut args: Vec<&OsStr> = ["ls-files", "--others", "--ignored", "-z"]
+            .into_iter()
+            .map(OsStr::new)
+            .collect();
+        args.extend_from_slice(extra);
+        Ok(git_stdout(clone, &args)?
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect())
+    };
+    let mut exclude_from = OsString::from("--exclude-from=");
+    exclude_from.push(&include);
+    let listed = list(&[&exclude_from])?;
+    let ignored: std::collections::BTreeSet<String> = list(&[OsStr::new("--exclude-standard")])?
+        .into_iter()
+        .collect();
+    Ok(listed
+        .into_iter()
+        .filter(|p| ignored.contains(p))
+        .map(PathBuf::from)
+        .collect())
+}
+
 /// The branch checked out in `worktree`, or `None` on a detached HEAD.
 pub fn branch(worktree: &Path) -> Option<String> {
     let name = git_stdout(worktree, &["symbolic-ref", "--short", "-q", "HEAD"]).ok()?;

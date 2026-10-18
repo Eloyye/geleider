@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::claim::Claim;
+use crate::dispatch::Dispatched;
 use crate::session::{Harness, Session, SessionKey, SessionState};
 use crate::usage::{Subscription, Window};
 
@@ -178,6 +179,10 @@ impl Store {
         CREATE TABLE IF NOT EXISTS claims (
             repo TEXT NOT NULL, issue INTEGER NOT NULL, claimed_at INTEGER NOT NULL,
             record TEXT NOT NULL, PRIMARY KEY (repo, issue)
+        );
+        CREATE TABLE IF NOT EXISTS dispatches (
+            harness TEXT NOT NULL, id TEXT NOT NULL, record TEXT NOT NULL,
+            PRIMARY KEY (harness, id)
         );",
         )?;
         std::fs::create_dir_all(&logs)?;
@@ -369,6 +374,51 @@ impl Store {
             "DELETE FROM claims WHERE repo = ?1 AND issue = ?2 AND claimed_at = ?3",
             params![claim.repo, sql_issue(claim.issue)?, claim.claimed_at],
         )? > 0)
+    }
+
+    /// Moves `claim` to `session`, unless it ended meanwhile. Returns whether it moved.
+    pub fn move_claim(&self, claim: &Claim, session: &SessionKey) -> Result<bool> {
+        let moved = Claim {
+            session: session.clone(),
+            ..claim.clone()
+        };
+        Ok(self.conn.execute(
+            "UPDATE claims SET record = ?4 WHERE repo = ?1 AND issue = ?2 AND claimed_at = ?3",
+            params![
+                claim.repo,
+                sql_issue(claim.issue)?,
+                claim.claimed_at,
+                serde_json::to_string(&moved)?
+            ],
+        )? > 0)
+    }
+
+    /// Records or replaces what geleider knows about a Dispatched Session.
+    pub fn put_dispatch(&self, dispatch: &Dispatched) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO dispatches (harness, id, record) VALUES (?1, ?2, ?3)",
+            params![
+                dispatch.session.harness.as_str(),
+                dispatch.session.id,
+                serde_json::to_string(dispatch)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn dispatch(&self, key: &SessionKey) -> Result<Option<Dispatched>> {
+        self.record(
+            "SELECT record FROM dispatches WHERE harness = ?1 AND id = ?2",
+            params![key.harness.as_str(), key.id],
+        )
+    }
+
+    pub fn delete_dispatch(&self, key: &SessionKey) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM dispatches WHERE harness = ?1 AND id = ?2",
+            params![key.harness.as_str(), key.id],
+        )?;
+        Ok(())
     }
 
     /// Finished Runs whose result a `harness` Session has not acknowledged, oldest first.
