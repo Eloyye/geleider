@@ -241,9 +241,10 @@ fn worktree_stdout(wt: &Worktree, args: &[&str]) -> Result<String> {
     git_stdout(&wt.path, &full)
 }
 
-/// No staged, unstaged, untracked or ignored files to lose. Explicit options
-/// override repository settings that might otherwise hide untracked files.
-pub fn clean(wt: &Worktree) -> Result<bool> {
+/// No staged, unstaged, untracked or ignored files to lose, apart from ignored
+/// paths under one of `disposable` (worktree-relative, like `target/`). Explicit
+/// options override repository settings that might otherwise hide untracked files.
+pub fn clean(wt: &Worktree, disposable: &[String]) -> Result<bool> {
     // Index flags that let `status` hide local edits, sparse entries, and
     // gitlinks all keep the worktree. A gitlink's repository may sit inside the
     // worktree with config its Session wrote, so it is never entered either.
@@ -258,7 +259,7 @@ pub fn clean(wt: &Worktree) -> Result<bool> {
     if hidden_or_gitlink {
         return Ok(false);
     }
-    Ok(worktree_stdout(
+    let status = worktree_stdout(
         wt,
         &[
             "status",
@@ -268,8 +269,24 @@ pub fn clean(wt: &Worktree) -> Result<bool> {
             "--ignored=matching",
             "--ignore-submodules=all",
         ],
-    )?
-    .is_empty())
+    )?;
+    // Any entry but an ignored one is dirty, so a rename's second path, which
+    // follows its own entry, is never reached.
+    Ok(status.split('\0').filter(|e| !e.is_empty()).all(|entry| {
+        entry
+            .strip_prefix("!! ")
+            .is_some_and(|path| is_disposable(path, disposable))
+    }))
+}
+
+/// `path` is, or lies under, one of `disposable`.
+fn is_disposable(path: &str, disposable: &[String]) -> bool {
+    let path = path.trim_end_matches('/');
+    disposable.iter().any(|d| {
+        let d = d.trim_end_matches('/');
+        path.strip_prefix(d)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
 }
 
 /// Never force removal: Git itself checks for changes, locks and submodules too.

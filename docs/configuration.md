@@ -18,6 +18,7 @@ path = "~/code/lanternfall"  # the clone; its worktrees belong to the Project to
 vars = { unity = "/Applications/Unity/Hub/Editor/6000.0.23f1/Unity.app/Contents/MacOS/Unity" }
 default_profile = "claude-xhigh"
 setup = "uv sync --frozen"  # run with /bin/sh in each new Dispatch worktree
+disposable = ["Library/"]   # ignored output a Finished worktree may still contain
 
 [projects.lanternfall.jobs.playmode-test]
 resource = "unity"
@@ -73,6 +74,7 @@ A Resource is something only so many Runs can use at once.
 | `vars` | table | Values usable as `{name}` in the Project's Job commands. |
 | `default_profile` | string | The Profile `geleider dispatch` uses without `--profile`. |
 | `setup` | string | Shell commands run with `/bin/sh` in each new Dispatch worktree before its Session starts, outside any sandbox. |
+| `disposable` | array of strings | Gitignored paths, relative to the worktree root, that don't stop a worktree being [Finished](ci-and-worktrees.md#finished-worktrees), such as `"target/"`. Removal deletes them. Any other ignored file keeps the worktree. Default empty. |
 
 ## `[projects.<name>.jobs.<job>]`
 

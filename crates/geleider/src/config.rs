@@ -271,6 +271,10 @@ pub struct Project {
     /// Shell commands run in each new Dispatch worktree before its Session
     /// starts, outside any sandbox. Only ever read from this file.
     pub setup: Option<String>,
+    /// Ignored paths, relative to the worktree root, that a Finished worktree
+    /// may still contain and that removal deletes, such as `target/`.
+    #[serde(default)]
+    pub disposable: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -343,6 +347,20 @@ impl Config {
                 && !self.profiles.contains_key(profile)
             {
                 bail!("project `{project_name}`: unknown default_profile `{profile}`");
+            }
+            for path in &project.disposable {
+                let trimmed = path.trim_end_matches('/');
+                if trimmed.is_empty()
+                    || trimmed.starts_with('/')
+                    || trimmed
+                        .split('/')
+                        .any(|c| matches!(c, "" | "." | ".." | ".git"))
+                {
+                    bail!(
+                        "project `{project_name}`: disposable path `{path}` must be relative \
+                         to the worktree root, without `.`, `..` or `.git`"
+                    );
+                }
             }
             for (job_name, job) in &project.jobs {
                 let at = || format!("job `{job_name}` in project `{project_name}`");
@@ -593,6 +611,22 @@ mod tests {
         for repo in ["../x", "o/r/x", "o/..", "o/r?x"] {
             let text = LANTERNFALL.replace("Eloyye/lanternfall", repo);
             assert!(Config::parse(&text).is_err(), "{repo}");
+        }
+    }
+
+    #[test]
+    fn disposable_paths_stay_inside_the_worktree() {
+        let with = |paths: &str| {
+            Config::parse(&format!(
+                "[projects.demo]\nrepo='o/r'\npath='/c'\ndisposable=[{paths}]"
+            ))
+        };
+        assert_eq!(
+            with("'target/', 'web/dist'").unwrap().projects["demo"].disposable,
+            ["target/", "web/dist"]
+        );
+        for path in ["", "/", "/tmp", "..", "a/../b", "./target", ".git", "a//b"] {
+            assert!(with(&format!("'{path}'")).is_err(), "{path}");
         }
     }
 

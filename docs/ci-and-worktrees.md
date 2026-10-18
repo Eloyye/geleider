@@ -16,7 +16,7 @@ geleider clean  # show the list, then ask "Remove these worktrees? [y/N]"
 
 Removal requires typing `y` or `yes`; an empty answer, EOF or anything else cancels. The command refreshes PR state after confirmation and rechecks the worktrees before removing them with `git worktree remove`, without forcing it. It never runs automatically and has no MCP tool.
 
-A Finished worktree has a closed or merged PR, no live Session or queued/running Run using it, and no staged, unstaged, untracked or ignored files. Its HEAD must equal GitHub's retained PR head, proving its commits were pushed even after a squash merge or deletion of the remote branch. A newer open PR on a reused branch prevents cleanup.
+A Finished worktree has a closed or merged PR, no live Session or queued/running Run using it, and no staged, unstaged, untracked or ignored files, except ignored files under the Project's `disposable` paths, such as `target/`, which removal deletes (see [ADR 0007](adr/0007-disposable-ignored-paths.md)). Its HEAD must equal GitHub's retained PR head, proving its commits were pushed even after a squash merge or deletion of the remote branch. A newer open PR on a reused branch prevents cleanup.
 
 These are always kept:
 

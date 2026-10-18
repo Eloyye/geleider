@@ -43,7 +43,7 @@ The commands a Project runs in each new Dispatch worktree before its Session sta
 _Avoid_: Environment, bootstrap, setup script (in prose)
 
 **Finished worktree**:
-A worktree whose PR is merged or closed, with no Session using it and no uncommitted changes, so it is safe to remove.
+A worktree whose PR is merged or closed, with no Session using it and no uncommitted changes, untracked files or ignored files other than its Project's disposable paths (such as `target/`), so it is safe to remove.
 _Avoid_: Stale worktree, dead worktree
 
 ### Scheduling
