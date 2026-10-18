@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use crate::claim::{ClaimStatus, IssueRef};
 use crate::cleanup::Inventory;
+use crate::config::Config;
 use crate::lease::Holder;
 use crate::paths::{self, Paths};
 use crate::protocol::{self, Request, RunInfo, Status};
@@ -16,7 +17,7 @@ use crate::report;
 use crate::session::{Harness, SessionKey, SessionState};
 use crate::store::{RunState, now_ms};
 use crate::text;
-use crate::usage::{SubscriptionUsage, WindowView};
+use crate::usage::{Subscription, SubscriptionUsage, WindowView};
 
 /// Finished Runs `geleider queue --all` shows.
 const RECENT: usize = 20;
@@ -153,7 +154,7 @@ pub fn clean(paths: &Paths) -> Result<i32> {
     Ok(i32::from(!cleaned.skipped.is_empty()))
 }
 
-fn confirmed(input: &mut impl BufRead) -> Result<bool> {
+pub fn confirmed(input: &mut impl BufRead) -> Result<bool> {
     let mut answer = String::new();
     input.read_line(&mut answer)?;
     Ok(matches!(
@@ -354,6 +355,24 @@ fn render_claims(claims: &[ClaimStatus], now: i64) -> String {
         ));
     }
     out
+}
+
+/// Shows a Subscription's Limit windows, including missing ones.
+pub fn print_usage(config: &Config, usage: &[SubscriptionUsage], subscription: Subscription) {
+    let usage = usage
+        .iter()
+        .find(|u| u.subscription == subscription)
+        .cloned()
+        .unwrap_or_else(|| SubscriptionUsage {
+            subscription,
+            plan: config.subscriptions.plan(subscription),
+            source: subscription.source().into(),
+            windows: Vec::new(),
+        });
+    print!("{}", text::printable(&render_usage(&[usage], now_ms())));
+    if !config.subscriptions.get(subscription).enabled {
+        println!("  Usage tracking is disabled for this Subscription.");
+    }
 }
 
 pub fn render_usage(subscriptions: &[SubscriptionUsage], now: i64) -> String {

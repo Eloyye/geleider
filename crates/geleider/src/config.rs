@@ -32,6 +32,145 @@ pub struct Config {
     pub resources: BTreeMap<String, Resource>,
     #[serde(default)]
     pub projects: BTreeMap<String, Project>,
+    /// Named ways of starting Dispatched Sessions. Never read from a Project.
+    #[serde(default)]
+    pub profiles: BTreeMap<String, Profile>,
+}
+
+/// Which Harnesses can be Dispatched. OpenCode cannot yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchHarness {
+    Claude,
+    Codex,
+}
+
+impl DispatchHarness {
+    pub fn harness(self) -> crate::session::Harness {
+        match self {
+            Self::Claude => crate::session::Harness::Claude,
+            Self::Codex => crate::session::Harness::Codex,
+        }
+    }
+
+    pub fn subscription(self) -> Subscription {
+        match self {
+            Self::Claude => Subscription::Claude,
+            Self::Codex => Subscription::Chatgpt,
+        }
+    }
+}
+
+/// How a Dispatched Session starts: its Harness, settings and prompt.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {
+    pub harness: DispatchHarness,
+    /// Claude Code: `--model`.
+    pub model: Option<String>,
+    /// Claude Code: `--effort`.
+    pub effort: Option<String>,
+    /// Claude Code: fast mode, which bills usage credits.
+    #[serde(default)]
+    pub fast: bool,
+    /// Claude Code: `--permission-mode`.
+    pub permission_mode: Option<String>,
+    /// Codex: the Codex profile to start with (`codex exec -p`), so Codex stays
+    /// the source of its model, effort and sandbox settings.
+    pub codex_profile: Option<String>,
+    /// Prompt templates. Placeholders: `{repo}`, `{number}` and `{kind}`.
+    pub issue_prompt: Option<String>,
+    pub pr_prompt: Option<String>,
+}
+
+/// Placeholders a Profile's prompt templates may use.
+pub const PROMPT_PLACEHOLDERS: &[&str] = &["repo", "number", "kind"];
+const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultracode"];
+const PERMISSION_MODES: &[&str] = &[
+    "default",
+    "manual",
+    "acceptEdits",
+    "plan",
+    "auto",
+    "dontAsk",
+    "bypassPermissions",
+];
+
+impl Profile {
+    fn validate(&self, name: &str) -> Result<()> {
+        let at = || format!("profile `{name}`");
+        let word = |value: &str| {
+            !value.starts_with('-')
+                && value.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'[' | b']')
+                })
+        };
+        match self.harness {
+            DispatchHarness::Claude => {
+                if self.codex_profile.is_some() {
+                    bail!("{}: codex_profile is only for Codex profiles", at());
+                }
+                if let Some(model) = nonempty(&self.model)
+                    && !word(model)
+                {
+                    bail!("{}: model `{model}` is not a model name", at());
+                }
+                if let Some(effort) = nonempty(&self.effort)
+                    && !EFFORTS.contains(&effort)
+                {
+                    bail!("{}: effort must be one of {}", at(), EFFORTS.join(", "));
+                }
+                if let Some(mode) = nonempty(&self.permission_mode)
+                    && !PERMISSION_MODES.contains(&mode)
+                {
+                    bail!(
+                        "{}: permission_mode must be one of {}",
+                        at(),
+                        PERMISSION_MODES.join(", ")
+                    );
+                }
+            }
+            DispatchHarness::Codex => {
+                if self.model.is_some()
+                    || self.effort.is_some()
+                    || self.fast
+                    || self.permission_mode.is_some()
+                {
+                    bail!(
+                        "{}: Codex takes its settings from a Codex profile; set codex_profile \
+                         instead of model, effort, fast or permission_mode",
+                        at()
+                    );
+                }
+                if let Some(profile) = nonempty(&self.codex_profile)
+                    && !word(profile)
+                {
+                    bail!("{}: codex_profile `{profile}` is not a profile name", at());
+                }
+            }
+        }
+        for template in [&self.issue_prompt, &self.pr_prompt].into_iter().flatten() {
+            for name in placeholders(template).with_context(at)? {
+                if !PROMPT_PLACEHOLDERS.contains(&name.as_str()) {
+                    bail!(
+                        "{}: unknown placeholder `{{{name}}}` (prompts may use {{repo}}, \
+                         {{number}} and {{kind}})",
+                        at()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn nonempty(value: &Option<String>) -> Option<&str> {
+    value.as_deref().filter(|v| !v.is_empty())
+}
+
+/// Fills a prompt template. `values` must cover [`PROMPT_PLACEHOLDERS`].
+pub fn fill_prompt(template: &str, values: &BTreeMap<&str, String>) -> Result<String> {
+    substitute(template, values)
 }
 
 /// Which Subscriptions `geleider status` shows, and when their resets notify.
@@ -127,6 +266,11 @@ pub struct Project {
     pub vars: BTreeMap<String, String>,
     #[serde(default)]
     pub jobs: BTreeMap<String, Job>,
+    /// The Profile `geleider dispatch` uses without `--profile`.
+    pub default_profile: Option<String>,
+    /// Shell commands run in each new Dispatch worktree before its Session
+    /// starts, outside any sandbox. Only ever read from this file.
+    pub setup: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -182,9 +326,24 @@ impl Config {
                 bail!("resource `{name}` needs a process name to watch");
             }
         }
+        for (name, profile) in &self.profiles {
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            {
+                bail!("profile `{name}`: names use letters, digits, `-`, `_` and `.`");
+            }
+            profile.validate(name)?;
+        }
         for (project_name, project) in &self.projects {
             crate::github::check_repo(&project.repo)
                 .with_context(|| format!("project `{project_name}`"))?;
+            if let Some(profile) = &project.default_profile
+                && !self.profiles.contains_key(profile)
+            {
+                bail!("project `{project_name}`: unknown default_profile `{profile}`");
+            }
             for (job_name, job) in &project.jobs {
                 let at = || format!("job `{job_name}` in project `{project_name}`");
                 if !self.resources.contains_key(&job.resource) {

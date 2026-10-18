@@ -109,6 +109,10 @@ pub struct Issue {
     pub assignees: Vec<String>,
     /// GitHub serves PRs as issues too.
     pub pull_request: bool,
+    /// The author's login. Shown to the user, never put in a prompt.
+    pub author: String,
+    /// Shown to the user in Dispatch's picker, never put in a prompt.
+    pub title: String,
 }
 
 impl Issue {
@@ -124,12 +128,18 @@ impl Issue {
             assignees: Vec<Login>,
             #[serde(default)]
             pull_request: Option<serde_json::Value>,
+            #[serde(default)]
+            user: Option<Login>,
+            #[serde(default)]
+            title: String,
         }
         let raw: Raw = serde_json::from_str(text).context("decoding the issue from gh")?;
         Ok(Self {
             open: raw.state == "open",
             assignees: raw.assignees.into_iter().map(|l| l.login).collect(),
             pull_request: raw.pull_request.is_some_and(|p| !p.is_null()),
+            author: raw.user.map(|u| u.login).unwrap_or_default(),
+            title: raw.title,
         })
     }
 }
@@ -242,6 +252,31 @@ impl PrCommits {
     }
 }
 
+/// An open issue or PR as `gh issue list` and `gh pr list` show it. Its text
+/// is shown to the user only, never put in a Session's prompt.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenItem {
+    pub number: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub author: Option<Login>,
+    #[serde(default)]
+    pub assignees: Vec<Login>,
+    #[serde(default)]
+    pub head_ref_name: Option<String>,
+    #[serde(default)]
+    pub is_cross_repository: bool,
+    #[serde(skip)]
+    pub pull_request: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Login {
+    pub login: String,
+}
+
 /// A full commit id, which git can never read as an option or a revision range.
 fn is_commit_id(oid: &str) -> bool {
     oid.len() == 40 && oid.bytes().all(|b| b.is_ascii_hexdigit())
@@ -270,6 +305,45 @@ impl Gh {
             bail!("GitHub returned a different PR");
         }
         Ok(pr)
+    }
+
+    /// The repository's default branch, as GitHub has it now.
+    pub fn default_branch(&self, repo: &str) -> Result<String> {
+        let branch = self.run(
+            &["api", &format!("repos/{repo}"), "--jq", ".default_branch"],
+            None,
+        )?;
+        if branch.is_empty() {
+            bail!("GitHub returned no default branch for {repo}");
+        }
+        Ok(branch)
+    }
+
+    /// Open issues, then open PRs, as Dispatch's picker lists them.
+    pub fn open_items(&self, repo: &str) -> Result<Vec<OpenItem>> {
+        let mut items: Vec<OpenItem> = Vec::new();
+        for (kind, fields) in [
+            ("issue", "number,title,author,assignees"),
+            (
+                "pr",
+                "number,title,author,assignees,headRefName,isCrossRepository",
+            ),
+        ] {
+            let out = self.run(
+                &[
+                    kind, "list", "--repo", repo, "--state", "open", "--limit", "200", "--json",
+                    fields,
+                ],
+                None,
+            )?;
+            let mut listed: Vec<OpenItem> =
+                serde_json::from_str(&out).with_context(|| format!("decoding open {kind}s"))?;
+            for item in &mut listed {
+                item.pull_request = kind == "pr";
+            }
+            items.extend(listed);
+        }
+        Ok(items)
     }
 
     /// Posts `body` as a comment review, which never approves or blocks the PR.
@@ -473,7 +547,9 @@ mod tests {
             Issue {
                 open: true,
                 assignees: vec!["me".into()],
-                pull_request: false
+                pull_request: false,
+                author: String::new(),
+                title: "x".into(),
             }
         );
         let pr = Issue::from_json(r#"{"state":"closed","pull_request":{"url":"u"}}"#).unwrap();

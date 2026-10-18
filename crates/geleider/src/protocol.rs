@@ -69,6 +69,28 @@ pub enum Request {
         #[serde(default)]
         session: Option<Destination>,
     },
+    /// Claim issue or PR `number` of the Project at `cwd` for the Session a
+    /// Dispatch is about to start in `worktree`, a new worktree under the
+    /// clone's `.claude/worktrees/` that nothing uses yet (ADRs 0004, 0005).
+    DispatchClaim {
+        cwd: PathBuf,
+        number: u64,
+        session: SessionKey,
+        worktree: PathBuf,
+        branch: String,
+        pull_request: bool,
+        profile: String,
+    },
+    /// The Dispatched Session started, as `actual` (Codex threads, and Claude
+    /// if it chose another id, only get their id once started).
+    DispatchStarted {
+        session: SessionKey,
+        actual: SessionKey,
+    },
+    /// The Dispatch failed before its Session started: release its Claim.
+    DispatchFailed {
+        session: SessionKey,
+    },
     /// End the Claim on `issue`. Only its holder may, unless `force`.
     Release {
         cwd: PathBuf,

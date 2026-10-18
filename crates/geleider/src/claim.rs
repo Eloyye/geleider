@@ -1,4 +1,4 @@
-//! Claims: a Session's exclusive hold on one issue, shown on GitHub as the issue
+//! Claims: a Session's exclusive hold on one issue or PR, shown on GitHub as the issue
 //! assigned to the user plus a comment naming the Session. A Claim ends when the
 //! issue closes or it is released, never by timing out.
 
@@ -105,7 +105,9 @@ impl IssueRef {
         // GitHub numbers fit in 32 bits, and SQLite stores them as i64.
         let number = match number.parse::<u32>() {
             Ok(n) if n > 0 => u64::from(n),
-            _ => bail!("`{text}` is not an issue: use a number such as 5, #5 or owner/name#5"),
+            _ => {
+                bail!("`{text}` is not an issue or PR: use a number such as 5, #5 or owner/name#5")
+            }
         };
         if let Some(repo) = repo {
             github::check_repo(repo)?;
@@ -120,7 +122,7 @@ impl IssueRef {
 /// Why another Session cannot claim the issue `claim` holds.
 pub fn held_by(claim: &Claim) -> String {
     format!(
-        "{} is already claimed by {} (since {}). Only one Session works on an issue at a time; \
+        "{} is already claimed by {} (since {}). Only one Session works on an issue or PR at a time; \
          ask the user before working on it.",
         claim.name(),
         claim.holder(),
@@ -128,14 +130,12 @@ pub fn held_by(claim: &Claim) -> String {
     )
 }
 
-/// Assigns the issue to the user and comments naming the Session. Fails, naming
-/// the assignees, if the issue is closed, a pull request, or assigned already.
+/// Assigns the issue or PR to the user and comments naming the Session. GitHub
+/// treats a PR as an issue for both. Fails, naming the assignees, if it is
+/// closed or assigned already.
 pub fn claim_on_github(github: &dyn GitHub, mut claim: Claim) -> Result<Claim> {
     let (repo, number) = (claim.repo.as_str(), claim.issue);
     let issue = github.issue(repo, number)?;
-    if issue.pull_request {
-        bail!("{repo}#{number} is a pull request, not an issue");
-    }
     if !issue.open {
         bail!("{repo}#{number} is closed");
     }
@@ -403,8 +403,7 @@ mod tests {
     fn open_issue() -> Issue {
         Issue {
             open: true,
-            assignees: Vec::new(),
-            pull_request: false,
+            ..Default::default()
         }
     }
 
@@ -453,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_issues_pull_requests_and_failed_comments_are_not_claimed() {
+    fn closed_issues_and_failed_comments_are_not_claimed_but_prs_are() {
         let new = claim(Path::new("/g"), 5, key(Harness::Codex, "abc"));
         let gh = |issue| FakeGitHub {
             issue: RefCell::new(issue),
@@ -470,7 +469,7 @@ mod tests {
             pull_request: true,
             ..open_issue()
         });
-        assert!(claim_on_github(&pr, new.clone()).is_err());
+        assert_eq!(claim_on_github(&pr, new.clone()).unwrap().assignee, "me");
         let failing = FakeGitHub {
             fail_comments: true,
             ..gh(open_issue())

@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 
 mod claims;
+mod dispatches;
 
 use crate::attest::{Attestations, Destination};
 use crate::claim::{self, ClaimStatus};
@@ -333,7 +334,7 @@ impl Daemon {
         }
     }
 
-    fn record_activity(&self, activity: Activity) -> Result<()> {
+    fn record_activity(self: &Arc<Self>, activity: Activity) -> Result<()> {
         // Dropped like a malformed datagram: logging each would let a flood fill the log.
         if !activity.cwd.is_absolute() {
             return Ok(());
@@ -343,10 +344,20 @@ impl Daemon {
         let next = locate_session(&config, &activity);
         let core = lock(&self.core);
         let previous = core.store.session(&activity.key)?;
-        match Session::after(previous, next, &activity) {
-            Some(session) => core.store.update_session(&session),
-            None => Ok(()),
+        let was = previous.as_ref().map(|s| s.state);
+        let Some(session) = Session::after(previous, next, &activity) else {
+            return Ok(());
+        };
+        core.store.update_session(&session)?;
+        // Only Dispatched Sessions notify; every other Session stays quiet.
+        let notice = self.dispatch_notice(&core.store, &session, was)?;
+        drop(core);
+        if let Some(notice) = notice
+            && config.notifications
+        {
+            self.announce_dispatch(notice);
         }
+        Ok(())
     }
 
     /// Offers finished Runs to the Codex threads that submitted them, until one
@@ -710,6 +721,28 @@ impl Daemon {
                 session,
                 force,
             } => self.release(&cwd, &issue, session, force),
+            Request::DispatchClaim {
+                cwd,
+                number,
+                session,
+                worktree,
+                branch,
+                pull_request,
+                profile,
+            } => self.dispatch_claim(dispatches::Planned {
+                cwd,
+                number,
+                session,
+                worktree,
+                branch,
+                pull_request,
+                profile,
+            }),
+            Request::DispatchStarted { session, actual } => {
+                self.dispatch_started(&session, &actual)?;
+                Ok(Reply::Recorded)
+            }
+            Request::DispatchFailed { session } => self.dispatch_failed(&session),
         }
     }
 

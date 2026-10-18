@@ -7,10 +7,12 @@ mod command;
 mod config;
 mod daemon;
 mod delivery;
+mod dispatch;
 mod git;
 mod github;
 mod hook;
 mod hooks_install;
+mod import;
 mod install;
 mod lease;
 mod mcp;
@@ -93,7 +95,32 @@ enum Cmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Claim an issue for the Session working in this worktree: assigns it to you
+    /// Start a new background Session on each of the Project's issues or PRs from a
+    /// Profile, each in a new worktree with the Project's Setup, after showing usage
+    /// and confirming. Without numbers, pick from the open ones.
+    Dispatch {
+        /// Issues or PRs: `12`, `#12` or `owner/name#12`.
+        numbers: Vec<String>,
+        /// A Profile from geleider's config; defaults to the Project's default_profile.
+        #[arg(long)]
+        profile: Option<String>,
+        /// Text added after the Profile's prompt template.
+        #[arg(long, conflicts_with = "prompt_file")]
+        prompt: Option<String>,
+        /// A file whose text is added after the Profile's prompt template.
+        #[arg(long)]
+        prompt_file: Option<std::path::PathBuf>,
+        /// Start with only the --prompt or --prompt-file text, without the template.
+        #[arg(long)]
+        no_template: bool,
+        /// Start after showing what will start, without waiting for a confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Turn Claude Desktop's session presets into Profiles and each Project's Codex
+    /// setup script into its Setup, after showing them and confirming.
+    Import,
+    /// Claim an issue or PR for the Session working in this worktree: assigns it to you
     /// on GitHub and comments naming the Session. Fails, naming the holder, if
     /// another Session holds it or it is assigned already.
     Claim {
@@ -180,6 +207,25 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Status { json } => cli::status(&paths, json),
         Cmd::Clean => cli::clean(&paths),
         Cmd::Review { pr, with, yes } => review::run(&paths, &pr, with, yes),
+        Cmd::Dispatch {
+            numbers,
+            profile,
+            prompt,
+            prompt_file,
+            no_template,
+            yes,
+        } => dispatch::run(
+            &paths,
+            dispatch::Options {
+                numbers,
+                profile,
+                prompt,
+                prompt_file,
+                no_template,
+                yes,
+            },
+        ),
+        Cmd::Import => import::run(&paths),
         Cmd::Claim { issue, json } => cli::claim(&paths, &issue, json),
         Cmd::Release { issue, force, json } => cli::release(&paths, &issue, force, json),
         // Handled above, before anything that can fail.
