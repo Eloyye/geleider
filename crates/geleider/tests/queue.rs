@@ -251,7 +251,9 @@ fn ms(run: &Value, key: &str) -> i64 {
 #[test]
 fn two_submissions_run_one_after_the_other() {
     let env = Env::new("fakegame-order");
-    let first = env.submit("play", "1");
+    // Long enough that the first Run is still playing when its Lease is checked,
+    // even on a slow machine.
+    let first = env.submit("play", "5");
     let second = env.submit("play", "1");
     assert_eq!(first["state"], "running");
     assert_eq!(second["state"], "queued");
@@ -266,11 +268,24 @@ fn two_submissions_run_one_after_the_other() {
     assert_eq!(first["branch"], "feat/x");
 
     // The game the first Run launched counts as that Run's Lease, not a second one.
-    std::thread::sleep(Duration::from_millis(500));
-    let status = env.geleider(&["status", "--json"]);
-    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    // Wait for the game itself, so the check sees it rather than only the Run.
+    wait_until(Duration::from_secs(10), || {
+        Command::new("pgrep")
+            .args(["-x", &env.game])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    });
+    let mut holders = Value::Null;
+    wait_until(Duration::from_secs(10), || {
+        let status = env.geleider(&["status", "--json"]);
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+        holders = status["resources"][0]["holders"].clone();
+        holders.as_array().is_some_and(|h| !h.is_empty())
+    });
     assert_eq!(
-        status["resources"][0]["holders"],
+        holders,
         serde_json::json!([{"kind": "run", "id": id(&first)}])
     );
 
