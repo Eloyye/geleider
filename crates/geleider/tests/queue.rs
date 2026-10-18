@@ -956,7 +956,17 @@ fn status_shows_both_subscriptions_with_their_age() {
         Some((now + 3600) * 1000)
     );
 
+    // Status shows each window, marking the last-known ones by their age.
     let text = String::from_utf8_lossy(&env.geleider(&["status"]).stdout).to_string();
+    assert!(
+        text.contains("Claude Pro") && text.contains(" 25% "),
+        "{text}"
+    );
+    assert!(
+        text.contains(" 31% ") && text.contains(", 2h old"),
+        "{text}"
+    );
+    let text = String::from_utf8_lossy(&env.geleider(&["usage"]).stdout).to_string();
     assert!(text.contains("Claude Pro"), "{text}");
     assert!(text.contains(" 25% used, resets "), "{text}");
     assert!(text.contains("updated "), "{text}");
@@ -1502,8 +1512,16 @@ fn one_session_claims_an_issue_across_harnesses_until_it_closes_or_is_released()
     assert_eq!(held[0]["session"]["id"], "claude-1");
     assert_eq!(held[0]["quiet"], true);
     let text = String::from_utf8(env.geleider(&["status"]).stdout).unwrap();
-    assert!(text.contains("example/demo#5  claude claude-1"), "{text}");
-    assert!(text.contains("QUIET for"), "{text}");
+    assert!(
+        text.lines().any(|l| l.contains("! demo#5 ")
+            && l.contains("claude claude-1")
+            && l.contains("quiet ")),
+        "{text}"
+    );
+    assert!(
+        text.contains("geleider release example/demo#5 --force"),
+        "{text}"
+    );
 
     // Closing the issue ends the Claim.
     let mut state = issues(&env);

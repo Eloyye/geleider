@@ -12,7 +12,7 @@ geleider release owner/name#5 --force # you, ending a Claim another Session hold
 
 ## Lifetime
 
-A Claim ends when its issue closes (geleider checks every 2 minutes) or when it is released, never by timing out. `geleider status` lists Claims and flags any whose Session has been quiet for more than 24 hours, so you can check on it; it is not released.
+A Claim ends when its issue closes (geleider checks every 2 minutes) or when it is released, never by timing out. `geleider status` shows each Claim beside the Session holding it, and flags any whose Session has been quiet for more than 24 hours with the command to release it, so you can check on it; it is not released.
 
 ## Branch warnings
 

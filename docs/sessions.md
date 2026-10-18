@@ -2,7 +2,7 @@
 
 `geleider install` merges lifecycle hooks into Claude Code's `~/.claude/settings.json` and Codex's `$CODEX_HOME/hooks.json` (normally `~/.codex/hooks.json`), and installs a thin OpenCode **2.x** plugin at `~/.config/opencode/plugins/geleider.ts`. Restart existing Sessions to load the new hooks. In Codex, review and trust them with `/hooks`; installation does not bypass the Harness's trust checks.
 
-`geleider status` groups live Sessions by Project, with waiting ones first. Each entry includes the Harness's Session id, worktree, branch, state and last activity. Permission requests and question tools mean **waiting**; finishing a turn means **idle**. Session changes never send geleider notifications, except for [Dispatched](dispatch.md#notifications) Sessions.
+`geleider status` lists live Sessions, waiting ones first, each with its Project (or worktree outside a Project), Harness, Claims, branch, state, last activity and the first 8 characters of its Session id. `geleider status --json` has every field, including full ids and worktrees. Permission requests and question tools mean **waiting**; finishing a turn means **idle**. Session changes never send geleider notifications, except for [Dispatched](dispatch.md#notifications) Sessions.
 
 Hooks report through a nonblocking local socket. They always exit successfully, even when the daemon is stopped or its socket is full. Run and Session history survive daemon restarts; a Session ends when its Harness reports it or its owning process exits.
 

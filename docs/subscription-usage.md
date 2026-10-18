@@ -1,6 +1,6 @@
 # Subscription usage
 
-`geleider status` (or `geleider usage`) shows how much of each Subscription is used in each Limit window and when each window resets, so you can see what is left before starting work. The [MCP tool](mcp.md) `usage` returns the same data. geleider only shows these numbers; it never routes work by them.
+`geleider usage` shows how much of each Subscription is used in each Limit window and when each window resets, so you can see what is left before starting work. `geleider status` shows each window as a gauge, yellow from 60% used and red from 85%. The [MCP tool](mcp.md) `usage` returns the same data. geleider only shows these numbers; it never routes work by them.
 
 ```text
 Subscriptions
