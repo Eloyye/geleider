@@ -83,8 +83,16 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// List Finished worktrees and remove them only after explicit confirmation.
-    Clean,
+    /// Choose which Finished worktrees to remove, then remove them only after
+    /// explicit confirmation.
+    Clean {
+        /// Finished worktrees to remove without choosing: a PR (`33`, `#33` or
+        /// `owner/name#33`) or a worktree path.
+        targets: Vec<String>,
+        /// Remove after showing them, without waiting for a confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Cross-review a PR with the other vendor, after showing usage and confirming.
     Review {
         /// PR number, #number, or a GitHub PR URL in the current Project.
@@ -221,7 +229,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Wait { id, json } => cli::wait_for(&paths, cli::parse_run_id(&id)?, json),
         Cmd::Queue { all, json } => cli::queue(&paths, all, json),
         Cmd::Status { json } => cli::status(&paths, json),
-        Cmd::Clean => cli::clean(&paths),
+        Cmd::Clean { targets, yes } => cli::clean(&paths, &targets, yes),
         Cmd::Review { pr, with, yes } => review::run(&paths, &pr, with, yes),
         Cmd::Dispatch {
             numbers,

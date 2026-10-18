@@ -46,7 +46,7 @@ See [Jobs and Resources](jobs.md).
 │ ! geleider#18             codex 019a0000    quiet 1d, Session ended          │
 │   geleider release Eloyye/geleider#18 --force                                │
 │ ✓ lanternfall #33 merged  codex/issue-31                                     │
-│   geleider clean removes Finished worktrees after asking                     │
+│   geleider clean lets you choose which Finished worktrees to remove          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -58,7 +58,7 @@ See [Jobs and Resources](jobs.md).
 | `geleider release <issue> [--force] [--json]` | End a Claim. `--force` releases a Claim another Session holds. |
 | `geleider dispatch [numbers…] [--profile P] [--prompt T \| --prompt-file F] [--no-template] [--yes]` | Start a background Session on each issue or PR. Without numbers, pick from the open ones. See [Dispatch](dispatch.md). |
 | `geleider review <pr> [--with claude\|codex] [--yes]` | Cross-review a PR with the other vendor. See [Cross-review](cross-review.md). |
-| `geleider clean` | List Finished worktrees and remove them only after confirmation. See [CI failures and Finished worktrees](ci-and-worktrees.md). |
+| `geleider clean [targets…] [--yes]` | Choose which Finished worktrees to remove (all start checked; uncheck the ones to keep), or name them as PRs or paths, then remove them after confirmation. See [CI failures and Finished worktrees](ci-and-worktrees.md). |
 | `geleider import` | Turn Claude Desktop's session presets into Profiles and each Project's Codex setup script into its Setup, after confirming. |
 
 ## Setup and internals
