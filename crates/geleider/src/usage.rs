@@ -261,11 +261,15 @@ const DAYS: usize = 8;
 const LOGS: usize = 5;
 
 pub fn codex_sessions_dir() -> Result<PathBuf> {
-    let home = match std::env::var_os("CODEX_HOME") {
+    Ok(codex_home()?.join("sessions"))
+}
+
+/// `$CODEX_HOME`, or `~/.codex` when it is unset or empty.
+pub fn codex_home() -> Result<PathBuf> {
+    Ok(match std::env::var_os("CODEX_HOME") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => paths::home_dir()?.join(".codex"),
-    };
-    Ok(home.join("sessions"))
+    })
 }
 
 /// The newest `rate_limits` entry in Codex's session logs and when it was written.

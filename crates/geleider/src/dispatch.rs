@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::attest::Nonce;
 use crate::claim::{ClaimStatus, IssueRef};
 use crate::config::{self, Config, DispatchHarness, Profile};
 use crate::github::{Gh, GitHub, OpenItem};
@@ -32,6 +31,8 @@ use crate::{cli, command, git, text};
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// How long `claude --bg` may take, including starting its background service.
 const CLAUDE_START_TIMEOUT: Duration = Duration::from_secs(3 * 60);
+/// How long `claude agents --json` may take to list the new Session.
+const AGENTS_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `codex exec` may take to report its thread id.
 const CODEX_START_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -164,16 +165,27 @@ pub fn run(paths: &Paths, options: Options) -> Result<i32> {
         .collect();
     let blocked = |item: &Item| blocked(item, repo, &status, &checkouts);
 
+    let mut unfetched = 0;
     let candidates = if options.numbers.is_empty() {
         pick(repo, &Gh.open_items(repo)?, &blocked, &mut stdin)?
     } else {
         let mut items = Vec::new();
         for input in &options.numbers {
-            items.push(fetch_item(repo, input)?);
+            match fetch_item(repo, input) {
+                Ok(item) => items.push(item),
+                Err(err) => {
+                    eprintln!(
+                        "Refused {}: {}",
+                        text::one_line(input),
+                        text::one_line(&format!("{err:#}"))
+                    );
+                    unfetched += 1;
+                }
+            }
         }
         items
     };
-    let mut refused = 0;
+    let mut refused = unfetched;
     let mut items = Vec::new();
     for item in candidates {
         match blocked(&item) {
@@ -447,8 +459,9 @@ fn pick(
     }
     let mut out = format!("Open issues and PRs in {repo}\n");
     for item in &items {
-        let mark = if blocked(item).is_some() { "-" } else { " " };
-        let detail = blocked(item).map_or(String::new(), |why| format!("  ({why})"));
+        let why = blocked(item);
+        let mark = if why.is_some() { "-" } else { " " };
+        let detail = why.map_or(String::new(), |why| format!("  ({why})"));
         out.push_str(&format!(
             "  {mark} {:<10} {}  @{}{detail}\n",
             item.label(),
@@ -496,7 +509,7 @@ fn confirmation(
     let harness = profile.harness.harness().name();
     let mut out = format!("Dispatch in {repo}\n");
     for item in items {
-        let author = if item.author.eq_ignore_ascii_case(viewer) {
+        let author = if item.author.is_empty() || item.author.eq_ignore_ascii_case(viewer) {
             String::new()
         } else {
             format!("  by @{} (not you)", item.author)
@@ -518,7 +531,7 @@ impl Dispatcher<'_> {
     /// the worktree and any new branch go, and the Claim is released.
     fn dispatch(&self, item: &Item) -> Result<String> {
         let harness = self.profile.harness;
-        let id = uuid()?;
+        let id = crate::review::session_id()?;
         let planned = match harness {
             DispatchHarness::Claude => id.clone(),
             // Codex names its thread only once it starts.
@@ -571,16 +584,27 @@ impl Dispatcher<'_> {
                 )));
             }
         };
-        protocol::call(
+        // The Session is running whatever happens here, so a failure to record
+        // it is a warning, never "did not start".
+        let recorded = protocol::call(
             self.paths,
             &Request::DispatchStarted {
                 session: planned,
                 actual: actual.clone(),
             },
         )
-        .context("recording the started Session")?;
+        .map_or_else(
+            |err| {
+                format!(
+                    " geleider could not record it ({}), so its Claim may name another id and \
+                     it may not notify.",
+                    text::one_line(&format!("{err:#}"))
+                )
+            },
+            |_| String::new(),
+        );
         Ok(format!(
-            "Started {} Session {} on {} for {} in {}.",
+            "Started {} Session {} on {} for {} in {}.{recorded}",
             harness.harness().name(),
             actual.id,
             text::branch(&branch),
@@ -757,11 +781,12 @@ fn start_claude(
     let short = background_id(&stdout).context("claude --bg printed no session id")?;
     // `--session-id` should hold, but the full id is checked where Claude
     // lists it, since the Claim must name the Session its hooks report.
-    let listed = Command::new("claude")
+    let mut agents = Command::new("claude");
+    agents
         .args(["agents", "--json", "--cwd"])
         .arg(worktree)
-        .current_dir(worktree)
-        .output();
+        .current_dir(worktree);
+    let listed = command::output_within(&mut agents, None, AGENTS_TIMEOUT);
     let actual = listed
         .ok()
         .filter(|o| o.status.success())
@@ -950,12 +975,8 @@ fn claude_trusts(clone: &Path) -> bool {
 
 /// `[projects."<clone>"] trust_level = "trusted"` in Codex's `config.toml`.
 fn codex_trusts(clone: &Path) -> bool {
-    let home = match std::env::var_os("CODEX_HOME") {
-        Some(dir) => PathBuf::from(dir),
-        None => match paths::home_dir() {
-            Ok(home) => home.join(".codex"),
-            Err(_) => return false,
-        },
+    let Ok(home) = crate::usage::codex_home() else {
+        return false;
     };
     let Ok(text) = std::fs::read_to_string(home.join("config.toml")) else {
         return false;
@@ -970,19 +991,6 @@ fn codex_trusts(clone: &Path) -> bool {
         .and_then(|p| p.get("trust_level"))
         .and_then(|t| t.as_str())
         == Some("trusted")
-}
-
-/// A random UUID, as Claude's `--session-id` requires.
-fn uuid() -> Result<String> {
-    let hex: String = Nonce::generate().context("generating a Session id")?.into();
-    Ok(format!(
-        "{}-{}-4{}-a{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[13..16],
-        &hex[17..20],
-        &hex[20..32]
-    ))
 }
 
 #[cfg(test)]

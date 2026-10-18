@@ -348,7 +348,7 @@ impl<'a> Review<'a> {
 }
 
 /// A random UUID, as Claude's `--session-id` requires; hooks report under it too.
-fn session_id() -> Result<String> {
+pub fn session_id() -> Result<String> {
     let hex: String = Nonce::generate()
         .context("generating review Session id")?
         .into();

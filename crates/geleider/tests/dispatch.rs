@@ -569,7 +569,16 @@ fn a_pr_is_dispatched_on_its_own_branch_and_forks_busy_and_assigned_items_are_re
     );
 
     let out = fixture.dispatch(
-        &["15", "16", "17", "13", "--profile", "claude-p", "--yes"],
+        &[
+            "15",
+            "16",
+            "17",
+            "13",
+            "99",
+            "--profile",
+            "claude-p",
+            "--yes",
+        ],
         "",
     );
     assert!(!out.status.success(), "refusals fail the command");

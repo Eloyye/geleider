@@ -181,7 +181,9 @@ impl Daemon {
         session: &Session,
         was: Option<SessionState>,
     ) -> Result<Option<Notice>> {
-        let Some(mut dispatch) = store.dispatch(&session.key)?.filter(|d| d.started) else {
+        // Not only started ones: a Session can wait or finish before the CLI
+        // has recorded its start. Provisional Codex ids never report activity.
+        let Some(mut dispatch) = store.dispatch(&session.key)? else {
             return Ok(None);
         };
         Ok(match session.state {
