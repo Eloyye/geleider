@@ -35,7 +35,7 @@ geleider install
 
 `geleider install` starts the background process at login and registers the MCP server, Session hooks and status line in Claude Code, Codex and OpenCode. Restart running Sessions to load them; in Codex, review and trust the hooks with `/hooks`. `geleider uninstall` reverses it and keeps your config and history.
 
-After updating with `cargo install`, run `geleider restart` so the background process runs the new binary, and restart Sessions so their MCP servers do too.
+To move to the latest `main`, run `geleider update`: it rebuilds with `cargo install`, re-runs `install` (which restarts the background process) and holds off while a Run is running. After updating with `cargo install` yourself, run `geleider restart` so the background process runs the new binary. Either way, restart Sessions so their MCP servers run it too.
 
 ## Quick start
 

@@ -26,6 +26,7 @@ mod session;
 mod statusline;
 mod store;
 mod text;
+mod update;
 mod usage;
 
 use anyhow::Result;
@@ -180,6 +181,14 @@ enum Cmd {
     Install,
     /// Undo `install`. Config and Run history are kept.
     Uninstall,
+    /// Build the latest `main` from GitHub with `cargo install` and run its `install`,
+    /// restarting the background process. Refuses while a Run is running, as it would
+    /// end as `lost`.
+    Update {
+        /// Update even though running Runs would end as `lost`.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() {
@@ -245,5 +254,6 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Mcp => mcp::serve(&paths).map(|()| 0),
         Cmd::Install => install::install(&paths).map(|()| 0),
         Cmd::Uninstall => install::uninstall().map(|()| 0),
+        Cmd::Update { force } => update::run(&paths, force),
     }
 }
