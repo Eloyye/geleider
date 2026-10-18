@@ -15,7 +15,7 @@ A coding-agent tool, including its desktop app: Claude Code, Codex or OpenCode.
 _Avoid_: Agent, tool, CLI
 
 **Session**:
-One conversation in one Harness, in one worktree of one Project, working on at most one issue. Subagents belong to the Session that started them.
+One conversation in one Harness, in one worktree of one Project, working on at most one issue or PR. Subagents belong to the Session that started them.
 _Avoid_: Agent, thread, chat
 
 **Waiting session**:
@@ -23,12 +23,24 @@ A Session stuck on a permission prompt or a direct question to you. A Session th
 _Avoid_: Blocked, needs attention
 
 **Claim**:
-A Session's exclusive hold on one issue, shown on GitHub as the issue assigned to you plus a comment naming the Session. It ends when the issue closes or you release it, never by timing out.
+A Session's exclusive hold on one issue or PR, shown on GitHub as the issue or PR assigned to you plus a comment naming the Session. It ends when the issue or PR closes or you release it, never by timing out.
 _Avoid_: Lock, assignment
 
 **Cross-review**:
 A one-off review of a PR by a Harness from a different vendor than the one whose Session wrote it.
 _Avoid_: Second opinion, audit
+
+**Profile**:
+A named, reusable way of starting Sessions in one Harness, such as `codex-xhigh`: the model, effort and settings each new Session gets, and the prompt it starts with. A Profile is never a Session itself.
+_Avoid_: Provider instance, preset, agent
+
+**Dispatch**:
+Starting a new Session from a Profile on one issue or PR of a Project, at your explicit request. geleider prepares a new worktree and starts the Session in it; the Harness hosts the Session from then on. Dispatching a PR continues it on its own branch.
+_Avoid_: Assign, launch, spawn
+
+**Setup**:
+The commands a Project runs in each new Dispatch worktree before its Session starts, such as `uv sync --frozen`. Like Jobs, it is declared in geleider's own config, never in the Project.
+_Avoid_: Environment, bootstrap, setup script (in prose)
 
 **Finished worktree**:
 A worktree whose PR is merged or closed, with no Session using it and no uncommitted changes, so it is safe to remove.
