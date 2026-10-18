@@ -1,322 +1,106 @@
 # geleider
 
-Coordinates coding-agent work on one Mac across Claude Code, Codex and OpenCode. See [CONTEXT.md](CONTEXT.md) for the vocabulary and [docs/adr](docs/adr) for the decisions behind it.
+[![CI](https://github.com/Eloyye/geleider/actions/workflows/ci.yml/badge.svg)](https://github.com/Eloyye/geleider/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Resource Leases and the Job queue
+Coordinates coding-agent work on one Mac across Claude Code, Codex and OpenCode.
 
-A Session in any Harness submits a Job that needs a Resource, such as Unity PlayMode tests that launch the Unity Editor. geleider queues each Run, starts it outside any sandbox once a slot is free, and reports the result. No two Runs share a one-slot Resource, and an Editor you open by hand holds a slot too.
+When several agent Sessions run at once, they compete for things only one of them should touch: a Unity Editor, an issue, your Subscription limits. geleider is a small background service plus an MCP server that keeps them out of each other's way and tells you what they are doing. It coordinates; it is not a front end for the agents ([ADR 0001](docs/adr/0001-coordinator-not-front-end.md)).
+
+## Features
+
+- **Job queue with Resource Leases.** Sessions submit Jobs, such as Unity PlayMode tests, that need a scarce Resource. geleider runs them outside the sandbox one slot at a time and reports results to the Session, a macOS notification and the PR.
+- **Session tracking.** Lifecycle hooks in every Harness show which Sessions are working, waiting or idle, in which worktree and branch.
+- **Issue Claims.** Only one Session works on an issue or PR at a time, across all Harnesses.
+- **Dispatch.** Start background Claude Code or Codex Sessions on issues and PRs, each in its own worktree with your Project's Setup.
+- **Cross-review.** Review a PR written with one vendor's model using the other's.
+- **CI failures and cleanup.** Notifications for failed checks on Session PRs, and confirmed removal of Finished worktrees.
+- **Subscription usage.** See how much of Claude Pro and ChatGPT Plus each Limit window has left.
+
+## Requirements
+
+- macOS (geleider uses launchd and macOS notifications)
+- Rust 1.99 or newer to build
+- [`gh`](https://cli.github.com/), signed in, for Claims, PR comments, CI, Dispatch and Cross-review
+- At least one Harness: [Claude Code](https://code.claude.com/), [Codex](https://developers.openai.com/codex/cli/) or [OpenCode](https://opencode.ai/) 2.x
+
+## Installation
 
 ```sh
+git clone https://github.com/Eloyye/geleider.git
+cd geleider
 cargo install --path crates/geleider
-geleider install      # launchd login service + MCP server in Claude Code, Codex, OpenCode
+geleider install
 ```
 
-Then declare Projects, Resources and Jobs in `~/.config/geleider/config.toml`. Jobs come only from this file, never from a Project's repo:
+`geleider install` starts the background process at login and registers the MCP server, Session hooks and status line in Claude Code, Codex and OpenCode. Restart running Sessions to load them; in Codex, review and trust the hooks with `/hooks`. `geleider uninstall` reverses it and keeps your config and history.
+
+## Quick start
+
+Declare a Resource, a Project and a Job in `~/.config/geleider/config.toml`:
 
 ```toml
 [resources.unity]
 slots = 1
-process = "Unity"         # every running process with this name holds a Lease
-
-[projects.lanternfall]
-repo = "Eloyye/lanternfall"
-path = "~/code/lanternfall"  # the clone; its worktrees belong to the Project too
-vars = { unity = "/Applications/Unity/Hub/Editor/6000.0.23f1/Unity.app/Contents/MacOS/Unity" }
-
-[projects.lanternfall.jobs.playmode-test]
-resource = "unity"
-args = ["suite"]
-# Split like a shell would but never run through one, so args cannot inject
-# commands. A relative program path is relative to the worktree. {worktree} is built in.
-command = "scripts/run-playmode.sh {suite} {unity}"
-```
-
-From any worktree of the Project:
-
-```sh
-geleider run playmode-test combat         # returns at once with the Run id and queue position
-geleider run playmode-test combat --wait  # blocks, then exits with the Run's exit code
-geleider show 12                          # state, exit code, duration, log path and tail
-geleider wait 12
-geleider queue [--all]
-geleider status                           # Sessions, Claims, Resources and their holders, Runs
-```
-
-The MCP server (`geleider mcp`) offers the same as the tools `submit_run`, `get_run`, `list_runs` and `status`, plus `claim`, `release` and `usage` (see below). In Codex, `geleider install` pre-approves these tools (`default_tools_approval_mode = "approve"`), since `codex exec` cannot ask. They can only queue Jobs from geleider's own config, and the Session itself stays in its sandbox, but see [Trust boundary](#trust-boundary). Set it to `"prompt"` in `~/.codex/config.toml` to be asked each time; reinstalling keeps your choice.
-
-When a Run finishes, geleider sends a macOS notification and, if the worktree's branch has an open PR, posts the result there through `gh`. Each Job gets one comment per PR, edited in place on later Runs. It also notifies you when a queued Run starts because a slot freed up. Set `notifications = false` or `pr_comments = false` at the top of the config to turn these off.
-
-State lives in `~/Library/Application Support/geleider/`: the SQLite database, the socket and each Run's full log under `runs/`. The background process logs to `~/Library/Logs/geleider/daemon.log`.
-
-### Trust boundary
-
-A Run executes outside any sandbox, in the submitting Session's worktree. geleider fixes *which* command runs, but the files it runs, such as `scripts/run-playmode.sh` and the tests it calls, come from that worktree, and a Session can edit them. So a Session that can submit a Job can run code outside its sandbox, with your network access and files. Only declare Jobs for Projects whose Sessions you would trust with that, and leave Codex's approval mode at `"prompt"` if you want to see each submission first. In addition:
-
-- A Run only starts in the Project's clone or in a worktree that clone has registered (`git worktree list`). A directory merely pointed at the clone's repository through a hand-written `.git` file is refused.
-- geleider runs git in the caller's directory with `core.fsmonitor` and hooks switched off, so repository settings an agent wrote cannot run commands.
-- geleider's state directory, socket and Run logs are readable only by you. `install` writes Harness configs, which can hold credentials, without ever making them readable by others, and never writes through a symlink planted at its temp or backup file.
-- When `pr_comments` is on, the last 40 lines of each Run's log are posted to the PR. Don't print secrets in Jobs on repositories others can read. Job args, errors and the log appear there only as code, so a Session cannot make them links, mentions or HTML posted as you.
-- Job args with control or invisible characters are refused, and `geleider status`, `queue`, `show` and error messages drop terminal escapes from paths, branches and logs, so a Session cannot write escape sequences into your terminal.
-- Every `git`, `gh` and `codex` call has a deadline (10 s, 30 s and 5 s), so one that hangs cannot stall Session tracking, Claims or delivery.
-
-If the background process restarts while a Run is running, the Run keeps its Lease until its process exits. It then ends as `lost`, since its exit code is unknown; its log is complete.
-
-## Sessions through Harness hooks
-
-`geleider install` also merges lifecycle hooks into Claude Code's
-`~/.claude/settings.json` and Codex's `$CODEX_HOME/hooks.json` (normally
-`~/.codex/hooks.json`), and installs a thin OpenCode **2.x** plugin at
-`~/.config/opencode/plugins/geleider.ts`. Restart existing Sessions to load the
-new hooks. In Codex, review and trust them with `/hooks`; installation does not
-bypass the Harness's trust checks.
-
-`geleider status` groups live Sessions by Project, with waiting ones first. Each
-entry includes the Harness's Session id, worktree, branch, state and last
-activity. Permission requests and question tools mean **waiting**; finishing a
-turn means **idle**. Session changes never send geleider notifications.
-
-Hooks report through a nonblocking local socket. They always exit successfully,
-even when the daemon is stopped or its socket is full. Run and Session history
-survive daemon restarts; a Session ends when its Harness reports it or its
-owning process exits.
-
-For `submit_run`, the Harness hook attaches the exact calling Session id and its
-working directory to that call. This supports MCP server processes shared by
-multiple Sessions. Codex receives completed Run results through `codex queue`;
-OpenCode receives queued messages through the plugin. Failed deliveries stay in
-SQLite for retry. Claude Code continues to use `geleider run … --wait`.
-
-`geleider uninstall` restores unchanged Harness files byte for byte (and removes
-files created during installation). If you edited a file after installation, it
-removes geleider's entries while preserving your edits. See
-[hook integration details and verification](docs/harness-hooks.md), including
-manual desktop checks and the fallback when a Harness doesn't run hooks.
-
-## Issue Claims
-
-Only one Session works on an issue or PR at a time, across all Harnesses. GitHub treats a PR as an issue for assignees and comments, so everything below applies to PRs too. Every Harness acts on GitHub as you, so an assignee alone can't show *which* Session has an issue; a Claim records that. A Session claims an issue as its first write, with the MCP tool `claim` or from a shell in its worktree:
-
-```sh
-geleider claim 5                      # or #5
-geleider release 5                    # by the Session holding it
-geleider release owner/name#5 --force # you, ending a Claim another Session holds
-```
-
-`claim` fails, naming the holder, if another Session holds the issue or it is already assigned on GitHub. On success it assigns the issue to you, so issue workflows that skip assigned issues keep working, and comments ``Claimed by <Harness> session <id> on `<branch>`.`` `release` (also an MCP tool) unassigns you and comments that the Claim was released. Claiming an issue you already hold changes nothing. The issue must be in a Project from geleider's config, and claiming goes through `gh`, signed in as you.
-
-A Claim ends when its issue closes (geleider checks every 2 minutes) or when it is released, never by timing out. `geleider status` lists Claims and flags any whose Session has been quiet for more than 24 hours, so you can check on it; it is not released.
-
-When a Session starts on a branch containing `issue-<n>`, such as `codex/issue-5-fix`, while another Session holds #n, the start hook adds a warning to that Session's context. It only warns; it never claims. Claude Code and Codex get it; OpenCode's plugin has no way to add start context, so its Sessions are not warned.
-
-**Which Session claims.** Through MCP, the Harness hook names the calling Session and attests it, as for `submit_run`. From a shell, or when no hook ran, the Claim goes to the only live Session in the caller's worktree; with none or several there, `claim` fails and asks for the MCP tool instead. In Codex, `geleider install` pre-approves `claim` and `release` along with geleider's other tools, so they comment on GitHub without asking. See [ADR 0004](docs/adr/0004-claim-holders.md).
-
-## CI failures and Finished worktrees
-
-The background process watches open PRs on branches recorded by Sessions in
-configured Projects, including recently ended Sessions. It queries one branch
-every 15 seconds, and each branch at most once every five minutes. More than
-20 branches take longer to revisit. Polls run separately from Job scheduling.
-A failed check sends a macOS notification only to you; it never messages a
-Session or starts a fix. Failure identities are kept in SQLite, so repeated
-polls and daemon restarts stay quiet. A new failing commit or failed rerun
-notifies again. `notifications = false` also disables CI notifications.
-
-`geleider status` lists Finished worktrees across every configured Project's
-`git worktree list`, whichever Harness created them. PR lookups are cached for
-five minutes; unavailable GitHub data is reported and never permits cleanup.
-The check runs in the background so `status` stays fast: it waits up to two
-seconds for it, then shows the previous result, or "still being checked" before
-the first one finishes. `geleider clean` always checks GitHub afresh.
-
-```sh
-geleider clean  # show the list, then ask "Remove these worktrees? [y/N]"
-```
-
-Removal requires typing `y` or `yes`; an empty answer, EOF or anything else
-cancels. The command refreshes PR state after confirmation and rechecks the
-worktrees before removing them with `git worktree remove`, without forcing it.
-It never runs automatically and has no MCP tool.
-
-A Finished worktree has a closed or merged PR, no live Session or queued/running
-Run using it, and no staged, unstaged, untracked or ignored files. Its HEAD must
-equal GitHub's retained PR head, proving its commits were pushed even after a
-squash merge or deletion of the remote branch. A newer open PR on a reused
-branch prevents cleanup. The primary clone, configured Project directory,
-locked worktrees, detached worktrees, and the directory invoking `clean` are
-kept. Worktrees with index flags that hide changes (including sparse checkouts)
-are kept too, as are worktrees containing submodules and worktrees whose `.git`
-file no longer points back to the clone. geleider reads each worktree through
-the clone's own record of it, so config a Session wrote never runs. Local
-branches are retained after worktree removal.
-
-## Cross-review on request
-
-From any worktree of a configured Project:
-
-```sh
-geleider review 17
-geleider review https://github.com/owner/project/pull/17
-geleider review 17 --with claude    # when the writing Session is unknown
-geleider review 17 --yes            # show usage, then start without a prompt
-```
-
-This is always an explicit request; geleider never starts a Cross-review while
-watching PRs. A PR whose recorded writing Sessions used Anthropic is reviewed
-through `codex review` on ChatGPT Plus. A PR written through Codex or OpenCode's
-`openai` provider is reviewed through `claude -p` on Claude Pro. OpenCode's
-provider comes from its root Session's model events; reinstall the plugin with
-`geleider install` to begin recording it. Old records remain readable.
-
-When the writer is unknown, uses another OpenCode provider, has records from
-both vendors, or is on a fork, supply `--with claude|codex`. For a known writer,
-selecting the same vendor is refused. Ended Sessions remain usable until the
-normal seven-day history retention expires. Cross-review Sessions never count
-as writing Sessions.
-
-Before starting, the command shows the reviewing Subscription's Limit windows,
-including missing or stale readings, and asks for `y` or `yes`. EOF or any other
-answer cancels. `--yes` skips this prompt but still prints usage. The reviewing
-Harness must already be installed and signed in to its Subscription.
-
-The review runs headlessly in a temporary detached worktree at the PR's exact
-head, with a read-only Codex sandbox or Claude's Read/Grep/Glob tools and no MCP
-servers. Claude loads only user settings so PR-supplied settings cannot install
-hooks, and its reads are confined to the review worktree. Commands Codex runs
-inherit only core environment variables, so no tokens. Codex's read-only
-sandbox can still read files outside the worktree: since a PR can try to
-instruct its reviewer and the output is posted, review untrusted PRs with
-Claude. Claude receives the committed diff on stdin. No current worktree edits
-enter the review. The process is tracked as a working Session and ends when the
-review finishes or its owning process exits; installed hooks use the same
-review Session id. Reviews have a 30-minute deadline.
-
-Successful output is posted as a comment review on the PR, with the base and
-head commits. If either commit changes during review, nothing is posted. Empty
-or failed reviews also post nothing. Output and diagnostics are saved privately
-under `~/Library/Application Support/geleider/reviews/<session-id>/`, including
-when posting fails. Temporary worktrees are removed without forcing; any that
-have changes are retained and reported. Reviews use the explicit request to
-post, independently of the `pr_comments` setting for Job results.
-
-The integration tests use fake Harness and GitHub commands; they do not spend
-Subscription usage. Command interfaces were checked against the
-[Codex CLI reference](https://developers.openai.com/codex/cli/reference) and
-[Claude Code permission modes](https://code.claude.com/docs/en/permission-modes).
-
-## Dispatching Sessions on issues and PRs
-
-`geleider dispatch` replaces opening Claude Code or Codex and typing "complete this issue and open a PR". From any worktree of a configured Project:
-
-```sh
-geleider dispatch 12 15 --profile claude-xhigh   # issue #12 and PR #15
-geleider dispatch                                # pick from the open issues and PRs
-geleider dispatch 12 --prompt "Keep the change small."
-geleider dispatch 12 --prompt-file notes.md --no-template
-geleider dispatch 12 --yes                       # show everything, then start without asking
-```
-
-Dispatch only runs on your command. Polling and labels never start a Dispatch, and there is no MCP tool for it. Without numbers, a picker lists the Project's open issues and PRs; Claimed and assigned ones are marked `-` and cannot be chosen. One Profile applies to everything in one command: `--profile`, else the Project's `default_profile`, else you are asked. Only Claude Code and Codex can be Dispatched; OpenCode cannot yet.
-
-Before anything starts, `dispatch` shows:
-- each item with its Profile and Harness, marking authors who are not you;
-- the Profile's Subscription's Limit windows, with missing or stale readings shown as such;
-- how many Sessions are live.
-
-It then asks `[y/N]`. Anything but `y` or `yes` cancels. `--yes` skips only the question.
-
-For each item, in order:
-
-1. **Claim.** It takes the Claim for the Session about to start. An item already Claimed or assigned is refused, naming the holder. Claims cover PRs too.
-2. **Worktree.** It creates `<clone>/.claude/worktrees/issue-<n>` or `pr-<n>`, adding `-2`, `-3` when the name is taken.
-   - An issue gets a new branch `claude/issue-<n>` or `codex/issue-<n>`, started from the remote default branch fetched just now.
-   - A PR is checked out on its own head branch, tracking `origin`.
-   - PRs from forks are refused, and so is a branch checked out in another worktree; the refusal names that worktree.
-3. **Copied files.** The gitignored files listed in the clone's `.worktreeinclude` are copied from the clone's checkout.
-4. **Setup.** The Project's Setup runs in the worktree, outside any sandbox. Its output is kept in `~/Library/Application Support/geleider/dispatches/<id>/setup.log`. If Setup fails, geleider:
-   - removes the worktree and the new branch (a PR's branch is never deleted);
-   - keeps the log;
-   - releases the Claim;
-   - goes on with the other items.
-
-   A Harness that fails to start is handled the same way.
-5. **Start.** It starts the Harness's own background Session in the worktree, then lets go:
-   - `claude --bg --session-id <id>`. Claude Code does not move a Session that is already in a linked worktree into one of its own; `worktree.bgIsolation: "none"` is passed too.
-   - `codex exec --json -C <worktree> [-p <codex_profile>]`, detached from the terminal. Its events go to `dispatches/<id>/codex.jsonl`.
-
-geleider never hosts, pushes for, or opens a PR for a Dispatched Session; the Session does that itself. Continue a Claude Session from `claude agents` (`claude attach <id>`), and a Codex one with `codex resume <thread id>`. Claude Desktop does not list `claude --bg` Sessions.
-
-**Prompts.** The prompt names only the repository, the number and whether it is an issue or a PR. Each Session reads the issue or PR itself with `gh`; no title, body or comment from GitHub is ever put in the prompt. `--prompt` or `--prompt-file` text goes after the Profile's template, and `--no-template` drops the template.
-
-**Trust.** A background Session cannot answer a trust prompt, and geleider never edits a Harness's trust settings. Claude Code and Codex both key a worktree's trust on its clone. If the Harness does not trust the clone, Dispatch refuses before claiming anything and tells you to run `claude` or `codex` there once to trust it.
-
-**Notifications.** Dispatched Sessions are tracked through the hooks `geleider install` set up, like any other Session. A Dispatched Session, and only a Dispatched Session, sends a macOS notification:
-- when it becomes waiting;
-- when it first goes idle or ends, naming its branch's open PR or saying none was opened.
-
-`notifications = false` turns these off.
-
-**Environment variables.** geleider stores none. Dispatched Sessions get the variables their Harness configures (`env` in Claude Code's `settings.json`, Codex's `shell_environment_policy`) and the `PATH` of the shell that ran `geleider dispatch`. Variables set only in Claude Desktop's environment editor do not reach them.
-
-### Profiles and Setup
-
-Profiles and Setup live only in geleider's config, never in a Project's repo:
-
-```toml
-[profiles.claude-xhigh]
-harness = "claude"
-model = "opus"             # --model
-effort = "xhigh"           # low, medium, high, xhigh, max or ultracode
-fast = false               # fast mode bills usage credits, not the Subscription
-permission_mode = "auto"   # --permission-mode
-# Optional; placeholders are {repo}, {number} and {kind} ("issue" or "PR").
-issue_prompt = "Fix {kind} #{number} in {repo}; read it with `gh issue view {number} --repo {repo}`."
-
-[profiles.codex-xhigh]
-harness = "codex"
-codex_profile = "xhigh"    # Codex stays the source of model, effort and sandbox
+process = "Unity"
 
 [projects.lanternfall]
 repo = "Eloyye/lanternfall"
 path = "~/code/lanternfall"
-default_profile = "claude-xhigh"
-setup = "uv sync --frozen"  # run with /bin/sh in each new Dispatch worktree
+
+[projects.lanternfall.jobs.playmode-test]
+resource = "unity"
+args = ["suite"]
+command = "scripts/run-playmode.sh {suite}"
 ```
 
-`geleider import` copies settings into geleider's config once, and only when you ask:
-- Claude Desktop's session presets (`~/Library/Application Support/Claude/ccd-session-presets.json`) become Profiles. That file is undocumented, so this is best effort.
-- Each Project's Codex setup script (`.codex/environments/environment.toml`, `[setup.darwin]` else `[setup]`) becomes its Setup.
+Then, from any worktree of the Project, or through the `submit_run` MCP tool from a Session:
 
-It shows everything it found and writes only after `y` or `yes`. geleider never reads a setup script from the repo at Dispatch time, since a Session could change it on a branch (ADR 0006). The integration tests use fake `gh`, `claude` and `codex` commands and spend no Subscription usage.
-
-## Subscription usage
-
-`geleider status` (or `geleider usage`) shows how much of each Subscription is used in each Limit window and when each window resets, so you can see what is left before starting work. The MCP tool `usage` returns the same data. geleider only shows these numbers; it never routes work by them.
-
-```text
-Subscriptions
-  Claude Pro  (from Claude Code's status line; CLI sessions only)
-    5h   23% used, resets 14:05 (in 2h 10m)  updated 3m ago
-    7d   41% used, resets Fri 09:00 (in 3d 04h)  updated 3m ago
-  ChatGPT Plus  (from Codex's session logs)
-    5h   12% used, resets 13:00 (in 1h 05m)  last known at 09:12 (2h 50m ago)
-    7d  reset at 11:00, no data since  last known at 09:12 (2h 50m ago)
+```sh
+geleider run playmode-test combat --wait  # queue, wait for a free slot, exit with the Run's code
+geleider status                           # Sessions, Claims, Resources, Runs and usage
 ```
 
-The numbers come only from what each Harness reports itself. geleider calls no usage endpoints, never reads or stores login tokens, and never estimates from token counts:
+## Documentation
 
-- **Claude Pro**: `geleider install` sets Claude Code's `statusLine` to `geleider statusline`, which passes `rate_limits.five_hour` and `rate_limits.seven_day` to geleider and prints a short status line. If you already had a status line, it is wrapped (`geleider statusline --wrap '<your command>'`) and its output is shown unchanged; `geleider uninstall` puts it back. Claude Code runs status lines only in interactive CLI sessions, not in the desktop app or `claude -p`, so these numbers update only while a CLI session runs.
-- **ChatGPT Plus** (shared by Codex and OpenCode's OpenAI login): the newest `rate_limits` entry in Codex's session logs under `~/.codex/sessions/` (or `$CODEX_HOME/sessions/`): a 300-minute and a 10,080-minute window.
-- **OpenCode Go** is not tracked. Its usage is shown only in the OpenCode console; the one usage endpoint, `/zen/go/v1/usage`, is undocumented and needs the Go API key.
+| Guide | |
+| --- | --- |
+| [Jobs and Resources](docs/jobs.md) | Queueing Runs, results, notifications and state files |
+| [Sessions](docs/sessions.md) | How hooks track Sessions in each Harness ([integration details](docs/harness-hooks.md)) |
+| [Issue Claims](docs/claims.md) | One Session per issue or PR |
+| [Dispatch](docs/dispatch.md) | Starting background Sessions on issues and PRs; Profiles and Setup |
+| [Cross-review](docs/cross-review.md) | Reviewing a PR with the other vendor |
+| [CI failures and Finished worktrees](docs/ci-and-worktrees.md) | CI notifications and `geleider clean` |
+| [Subscription usage](docs/subscription-usage.md) | Limit windows and reset notifications |
+| [Security model](docs/security.md) | **Read before declaring Jobs.** What runs outside the sandbox and the safeguards |
 
-Numbers more than ten minutes old are shown as "last known at", with their age. A window whose reset time has passed shows no percentage until the Harness reports again.
+| Reference | |
+| --- | --- |
+| [CLI](docs/cli.md) | Every `geleider` command |
+| [MCP tools](docs/mcp.md) | `submit_run`, `get_run`, `list_runs`, `claim`, `release`, `status`, `usage` |
+| [Configuration](docs/configuration.md) | Every key in `config.toml` |
+| [Glossary](CONTEXT.md) | The domain vocabulary: Session, Harness, Job, Run, Lease, Claim… |
+| [Architecture decisions](docs/adr) | Why geleider works the way it does |
 
-When a window resets after reaching 80% used, geleider sends a macOS notification. Windows used less reset quietly, so a lightly used 5-hour window does not notify every 5 hours. Configure it in `~/.config/geleider/config.toml`:
+## Security
 
-```toml
-[subscriptions]
-notify_resets = 80        # a percentage, or false for never
-[subscriptions.claude]
-plan = "Claude Max"       # the name shown; defaults to Claude Pro
-[subscriptions.chatgpt]
-enabled = false           # stop showing a Subscription
+A Run executes outside any sandbox, using files from the submitting Session's worktree, so a Session that can submit a Job can run code with your access. Only declare Jobs for Projects whose Sessions you would trust with that. See the [security model](docs/security.md).
+
+## Development
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+node --test crates/geleider/plugins/opencode.test.mjs
 ```
+
+The integration tests use fake `gh`, `claude` and `codex` commands and spend no Subscription usage.
+
+## Contributing
+
+Issues and pull requests are welcome on [GitHub](https://github.com/Eloyye/geleider/issues). Please use the vocabulary in [CONTEXT.md](CONTEXT.md), and record significant design decisions as an ADR in [docs/adr](docs/adr). Make sure the checks under [Development](#development) pass before opening a PR.
+
+## License
+
+[MIT](LICENSE) © 2026 Eloy Gustavo Ye Luo
