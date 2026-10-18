@@ -166,6 +166,13 @@ enum Cmd {
     },
     /// Run the background process in the foreground.
     Daemon,
+    /// Restart the installed background process so it runs the installed binary,
+    /// after listing the running Runs that would end as `lost` and confirming.
+    Restart {
+        /// Restart without waiting for a confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Serve MCP over stdio for a Harness.
     Mcp,
     /// Start the background process at login and register MCP and Session hooks in
@@ -234,6 +241,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Usage { json } => cli::usage(&paths, json),
         Cmd::Statusline { wrap } => statusline::run(&paths, wrap.as_deref()),
         Cmd::Daemon => daemon::run(paths).map(|()| 0),
+        Cmd::Restart { yes } => cli::restart(&paths, yes),
         Cmd::Mcp => mcp::serve(&paths).map(|()| 0),
         Cmd::Install => install::install(&paths).map(|()| 0),
         Cmd::Uninstall => install::uninstall().map(|()| 0),

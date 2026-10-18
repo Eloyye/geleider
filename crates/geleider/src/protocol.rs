@@ -1,5 +1,9 @@
 //! Messages between the CLI or MCP server and the background process: one JSON
 //! request and one JSON reply per connection, each on a line, over a Unix socket.
+//! Every request carries the sender's [`PROTOCOL`], and the background process
+//! refuses one from a client that speaks another, so a rebuilt CLI and a
+//! background process still running the old binary say so instead of misreading
+//! each other.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -17,6 +21,11 @@ use crate::paths::Paths;
 use crate::session::{Activity, Session, SessionKey};
 use crate::store::Run;
 use crate::usage::{Reading, Subscription, SubscriptionUsage};
+
+/// The version of these messages. Bump it whenever a [`Request`] or [`Reply`]
+/// changes in a way an older peer would misread: a new op or reply, a field
+/// added, removed or renamed, or a field whose meaning changed.
+pub const PROTOCOL: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -166,6 +175,62 @@ enum Envelope {
     Error(String),
 }
 
+/// A request as sent: the op and its fields, plus the sender's protocol.
+#[derive(Serialize)]
+struct Versioned<'a> {
+    protocol: u32,
+    #[serde(flatten)]
+    request: &'a Request,
+}
+
+/// Only the protocol, read before the op so a client from another version gets
+/// told so rather than a parse error.
+#[derive(Deserialize)]
+struct Header {
+    protocol: Option<u32>,
+}
+
+fn encode_request(request: &Request) -> Result<String> {
+    Ok(serde_json::to_string(&Versioned {
+        protocol: PROTOCOL,
+        request,
+    })?)
+}
+
+/// Reads a request line in the background process.
+pub fn decode_request(line: &str) -> Result<Request> {
+    let header: Header = serde_json::from_str(line).map_err(|err| anyhow!("bad request: {err}"))?;
+    match header.protocol {
+        Some(PROTOCOL) => {}
+        Some(theirs) if theirs > PROTOCOL => bail!(
+            "the geleider background process is older than this client (protocol {PROTOCOL}, \
+             client {theirs}). Run `geleider restart` to start the installed binary."
+        ),
+        theirs => bail!(
+            "this geleider client is older than the background process (protocol {}, \
+             background process {PROTOCOL}). Use the installed `geleider`; an MCP server \
+             is updated by restarting its Session.",
+            theirs.map_or("none".to_string(), |v| v.to_string())
+        ),
+    }
+    serde_json::from_str(line).map_err(|err| anyhow!("bad request: {err}"))
+}
+
+/// A background process from before [`PROTOCOL`] ignores it and fails on an op
+/// it doesn't know, or replies in a shape this client can't read.
+fn explain_old_daemon(err: anyhow::Error) -> anyhow::Error {
+    let message = format!("{err:#}");
+    if message.starts_with("bad request: unknown variant") || message.starts_with("decoding reply")
+    {
+        anyhow!(
+            "{message}\nThe geleider background process is likely running an older binary. \
+             Run `geleider restart` to start the installed one."
+        )
+    } else {
+        err
+    }
+}
+
 pub fn encode_reply(reply: Result<Reply>) -> String {
     let envelope = match reply {
         Ok(reply) => Envelope::Ok(reply),
@@ -193,7 +258,7 @@ pub fn call_within(paths: &Paths, request: &Request, timeout: Duration) -> Resul
     })?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    let mut line = serde_json::to_string(request)?;
+    let mut line = encode_request(request)?;
     line.push('\n');
     stream.write_all(line.as_bytes())?;
 
@@ -204,9 +269,12 @@ pub fn call_within(paths: &Paths, request: &Request, timeout: Duration) -> Resul
     if reply.is_empty() {
         bail!("the background process closed the connection without replying");
     }
-    match serde_json::from_str(&reply).context("decoding reply")? {
+    let envelope = serde_json::from_str(&reply)
+        .context("decoding reply")
+        .map_err(explain_old_daemon)?;
+    match envelope {
         Envelope::Ok(reply) => Ok(reply),
-        Envelope::Error(message) => Err(anyhow!(message)),
+        Envelope::Error(message) => Err(explain_old_daemon(anyhow!(message))),
     }
 }
 
@@ -271,5 +339,60 @@ impl Reply {
             Reply::Claim { .. } => "claim",
         };
         bail!("unexpected `{kind}` reply from the background process")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requests_carry_the_protocol_and_round_trip() {
+        let line = encode_request(&Request::GetRun { id: 7 }).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["protocol"], PROTOCOL);
+        assert_eq!(value["op"], "get_run");
+        assert!(matches!(
+            decode_request(&line),
+            Ok(Request::GetRun { id: 7 })
+        ));
+    }
+
+    #[test]
+    fn a_client_from_another_protocol_is_told_which_side_is_older() {
+        let old = decode_request(r#"{"op":"status"}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(old.contains("client is older"), "{old}");
+        assert!(old.contains("protocol none"), "{old}");
+
+        let newer = format!(r#"{{"protocol":{},"op":"status"}}"#, PROTOCOL + 1);
+        let newer = decode_request(&newer).unwrap_err().to_string();
+        assert!(newer.contains("background process is older"), "{newer}");
+        assert!(newer.contains("geleider restart"), "{newer}");
+    }
+
+    #[test]
+    fn an_unknown_op_in_this_protocol_is_still_a_bad_request() {
+        let line = format!(r#"{{"protocol":{PROTOCOL},"op":"nope"}}"#);
+        let err = decode_request(&line).unwrap_err().to_string();
+        assert!(
+            err.starts_with("bad request: unknown variant `nope`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn errors_from_a_background_process_before_versioning_suggest_a_restart() {
+        // What a background process from before `finished_worktrees` replied.
+        let err = anyhow!(
+            "bad request: unknown variant `finished_worktrees`, expected one of `submit`, \
+             `get_run` at line 1 column 39"
+        );
+        let explained = format!("{:#}", explain_old_daemon(err));
+        assert!(explained.contains("geleider restart"), "{explained}");
+
+        let other = format!("{:#}", explain_old_daemon(anyhow!("no such run #3")));
+        assert_eq!(other, "no such run #3");
     }
 }
