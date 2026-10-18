@@ -1107,11 +1107,12 @@ print((root / 'branch-pr.json').read_text())
     pr
 }
 
-fn clean_input(env: &Env, input: &str) -> Output {
+fn clean_input(env: &Env, args: &[&str], input: &str) -> Output {
     use std::io::Write;
     let mut child = env
         .command()
         .arg("clean")
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1156,7 +1157,7 @@ fn finished_worktrees_are_listed_but_only_removed_after_explicit_confirmation() 
         1
     );
     for input in ["", "\n", "no\n"] {
-        let out = clean_input(&env, input);
+        let out = clean_input(&env, &[], input);
         assert!(
             out.status.success(),
             "{}",
@@ -1164,7 +1165,7 @@ fn finished_worktrees_are_listed_but_only_removed_after_explicit_confirmation() 
         );
         assert!(wt.exists());
     }
-    let out = clean_input(&env, "yes\n");
+    let out = clean_input(&env, &[], "yes\n");
     assert!(
         out.status.success(),
         "{}",
@@ -1172,6 +1173,45 @@ fn finished_worktrees_are_listed_but_only_removed_after_explicit_confirmation() 
     );
     assert!(!wt.exists());
     assert!(env.repo().exists());
+}
+
+#[test]
+fn clean_removes_only_the_named_finished_worktrees() {
+    let env = Env::new("fakegame-clean-targets");
+    fake_branch_pr(&env, "MERGED");
+    let [one, two, three] = ["one", "two", "three"].map(|b| {
+        let wt = env.root().join(b);
+        git(
+            &env.repo(),
+            &["worktree", "add", "-qb", b, wt.to_str().unwrap()],
+        );
+        wt
+    });
+    // Every fake worktree has PR #6, so the bare number is ambiguous.
+    for bad in [&["6"][..], &[one.to_str().unwrap(), "nowhere"][..]] {
+        let out = clean_input(&env, bad, "yes\n");
+        assert!(!out.status.success());
+        assert!(one.exists() && two.exists() && three.exists());
+    }
+    let out = clean_input(&env, &[one.to_str().unwrap()], "no\n");
+    assert!(out.status.success());
+    assert!(one.exists());
+    let out = clean_input(&env, &[one.to_str().unwrap()], "yes\n");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("Remove this worktree?"), "{stdout}");
+    assert!(!one.exists() && two.exists() && three.exists());
+    let out = clean_input(&env, &[two.to_str().unwrap(), "--yes"], "");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!two.exists() && three.exists());
 }
 
 #[test]
@@ -1208,7 +1248,7 @@ fn build_output_does_not_keep_a_finished_worktree_but_other_ignored_files_do() {
     let listed = status["finished_worktrees"].as_array().unwrap();
     assert_eq!(listed.len(), 1, "{status}");
     assert_eq!(listed[0]["branch"], "built", "{status}");
-    let out = clean_input(&env, "yes\n");
+    let out = clean_input(&env, &[], "yes\n");
     assert!(
         out.status.success(),
         "{}",
@@ -1289,7 +1329,7 @@ fn cleanup_rechecks_pr_and_session_state_after_the_confirmation_prompt() {
         loop {
             line.clear();
             assert!(stdout.read_line(&mut line).unwrap() > 0);
-            if line.contains("PR #6") {
+            if line.contains("#6 merged") {
                 break;
             }
         }

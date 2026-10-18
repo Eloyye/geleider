@@ -1,6 +1,6 @@
 //! The command-line side of submitting and checking Runs, and of Claims.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::claim::IssueRef;
-use crate::cleanup::Inventory;
+use crate::cleanup::{FinishedWorktree, Inventory};
 use crate::config::Config;
 use crate::install;
 use crate::lease::Holder;
@@ -126,7 +126,7 @@ pub fn status(paths: &Paths, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-pub fn clean(paths: &Paths) -> Result<i32> {
+pub fn clean(paths: &Paths, targets: &[String], yes: bool) -> Result<i32> {
     // A fresh scan may query several Projects; leave time for those network calls.
     let timeout = Duration::from_secs(300);
     let mut inventory =
@@ -135,23 +135,57 @@ pub fn clean(paths: &Paths) -> Result<i32> {
     inventory
         .finished_worktrees
         .retain(|w| !cwd.starts_with(&w.worktree));
-    print!("{}", render_finished(&inventory));
-    if inventory.finished_worktrees.is_empty() {
+    let finished = std::mem::take(&mut inventory.finished_worktrees);
+    let chosen = if !targets.is_empty() {
+        inventory.finished_worktrees = resolve_targets(&finished, targets, &cwd)?;
+        print!("{}", render_finished(&inventory));
+        inventory.finished_worktrees
+    } else if finished.len() > 1
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal()
+    {
+        for warning in &inventory.cleanup_warnings {
+            println!("Could not check {}", text::one_line(warning));
+        }
+        // Every row starts checked; uncheck the worktrees to keep.
+        let rows: Vec<String> = finished.iter().map(finished_row).collect();
+        let Some(checked) = dialoguer::MultiSelect::new()
+            .with_prompt("Uncheck worktrees to keep (space toggles, enter accepts, esc cancels)")
+            .items(&rows)
+            .defaults(&vec![true; rows.len()])
+            .interact_opt()?
+        else {
+            println!("Cancelled; no worktrees removed.");
+            return Ok(0);
+        };
+        if checked.len() < finished.len() {
+            println!("To keep a worktree for good, run `git worktree lock <path>`.");
+        }
+        checked.into_iter().map(|i| finished[i].clone()).collect()
+    } else {
+        inventory.finished_worktrees = finished;
+        print!("{}", render_finished(&inventory));
+        if inventory.finished_worktrees.is_empty() {
+            return Ok(0);
+        }
+        inventory.finished_worktrees
+    };
+    let Some(question) = removal_question(chosen.len()) else {
+        println!("Nothing selected; no worktrees removed.");
         return Ok(0);
-    }
-    print!(
-        "\nRemove these {} worktrees? [y/N] ",
-        inventory.finished_worktrees.len()
-    );
-    std::io::stdout().flush()?;
-    if !confirmed(&mut std::io::stdin().lock())? {
-        println!("Cancelled; no worktrees removed.");
-        return Ok(0);
+    };
+    if !yes {
+        print!("\n{question}");
+        std::io::stdout().flush()?;
+        if !confirmed(&mut std::io::stdin().lock())? {
+            println!("Cancelled; no worktrees removed.");
+            return Ok(0);
+        }
     }
     let cleaned = protocol::call_within(
         paths,
         &Request::Clean {
-            worktrees: inventory.finished_worktrees,
+            worktrees: chosen,
             cwd,
         },
         timeout,
@@ -164,6 +198,68 @@ pub fn clean(paths: &Paths) -> Result<i32> {
         eprintln!("Skipped {}", text::one_line(reason));
     }
     Ok(i32::from(!cleaned.skipped.is_empty()))
+}
+
+/// The Finished worktrees that `clean <target>…` names, each by its PR
+/// (`owner/name#N`, or `#N` when only one Project has it) or its worktree path.
+/// A target that matches none, or several, is an error, so nothing is removed.
+fn resolve_targets(
+    finished: &[FinishedWorktree],
+    targets: &[String],
+    cwd: &Path,
+) -> Result<Vec<FinishedWorktree>> {
+    let mut chosen: Vec<FinishedWorktree> = Vec::new();
+    for target in targets {
+        let matches: Vec<&FinishedWorktree> = match IssueRef::parse(target) {
+            Ok(pr) => finished
+                .iter()
+                .filter(|w| {
+                    w.pr == pr.number
+                        && pr
+                            .repo
+                            .as_ref()
+                            .is_none_or(|repo| repo.eq_ignore_ascii_case(pr_repo(w)))
+                })
+                .collect(),
+            Err(_) => {
+                let path = cwd.join(target);
+                let path = path.canonicalize().unwrap_or(path);
+                finished.iter().filter(|w| w.worktree == path).collect()
+            }
+        };
+        let wt = match matches[..] {
+            [wt] => wt,
+            [] => bail!("{} is not a Finished worktree", text::one_line(target)),
+            _ => bail!(
+                "{} matches several Finished worktrees; name one: {}",
+                text::one_line(target),
+                matches
+                    .iter()
+                    .map(|w| format!("{}#{}", pr_repo(w), w.pr))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        if !chosen.contains(wt) {
+            chosen.push(wt.clone());
+        }
+    }
+    Ok(chosen)
+}
+
+/// The question asked about the chosen worktrees, or none when nothing is chosen.
+fn removal_question(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("Remove this worktree? [y/N] ".into()),
+        n => Some(format!("Remove these {n} worktrees? [y/N] ")),
+    }
+}
+
+/// `owner/name` from the PR's GitHub URL.
+fn pr_repo(wt: &FinishedWorktree) -> &str {
+    let path = wt.pr_url.trim_start_matches("https://github.com/");
+    path.rsplitn(3, '/').nth(2).unwrap_or(path)
 }
 
 /// Restarts the background process so it runs the installed binary. Running Runs
@@ -235,19 +331,23 @@ fn render_finished(inventory: &Inventory) -> String {
     // Worktree paths and branch names are chosen by Sessions and are shown before
     // a confirmation prompt, so each stays on its own line with no escapes.
     for wt in &inventory.finished_worktrees {
-        out.push_str(&format!(
-            "  {}  {}  PR #{} ({})  {}\n",
-            wt.project,
-            text::one_line(&wt.branch),
-            wt.pr,
-            wt.pr_state,
-            shown_path(&wt.worktree)
-        ));
+        out.push_str(&format!("  {}\n", finished_row(wt)));
     }
     for warning in &inventory.cleanup_warnings {
         out.push_str(&format!("  Could not check {}\n", text::one_line(warning)));
     }
     out
+}
+
+fn finished_row(wt: &FinishedWorktree) -> String {
+    format!(
+        "{}  #{} {}  {}  {}",
+        wt.project,
+        wt.pr,
+        wt.pr_state,
+        text::one_line(&wt.branch),
+        shown_path(&wt.worktree)
+    )
 }
 
 fn shown_path(path: &Path) -> String {
@@ -636,7 +736,10 @@ fn claims_panel(status: &Status, live: &[&Session], now: i64) -> Vec<Line> {
         lines.push(vec![
             Span::plain("  "),
             Span::styled(Style::Cyan, "geleider clean"),
-            Span::styled(Style::Dim, " removes Finished worktrees after asking"),
+            Span::styled(
+                Style::Dim,
+                " lets you choose which Finished worktrees to remove",
+            ),
         ]);
     }
     if finished.cleanup_pending {
@@ -829,6 +932,8 @@ pub fn parse_run_id(text: &str) -> Result<i64> {
 mod tests {
     use serde_json::{Value, json};
 
+    use crate::github::PrState;
+
     use super::*;
 
     const NOW: i64 = 1_800_000_000_000;
@@ -991,7 +1096,7 @@ mod tests {
             "geleider release Eloyye/geleider#18 --force".into(),
             "geleider#7 codex ended-se Session ended 2h ago".into(),
             "✓ lanternfall #33 merged codex/issue-31".into(),
-            "geleider clean removes Finished worktrees after asking".into(),
+            "geleider clean lets you choose which Finished worktrees to remove".into(),
         ];
         assert_eq!(contents(&text), expected, "{text}");
         assert!(!text.contains('\u{1b}'), "{text}");
@@ -1061,5 +1166,83 @@ mod tests {
         for answer in ["y\n", "yes\n", "YES\n"] {
             assert!(confirmed(&mut answer.as_bytes()).unwrap());
         }
+    }
+
+    fn finished(repo: &str, pr: u64, path: &str) -> FinishedWorktree {
+        FinishedWorktree {
+            project: repo.rsplit('/').next().unwrap().into(),
+            worktree: path.into(),
+            branch: format!("issue-{pr}"),
+            head: "abc".into(),
+            pr,
+            pr_state: PrState::Merged,
+            pr_url: format!("https://github.com/{repo}/pull/{pr}"),
+        }
+    }
+
+    fn targets(finished: &[FinishedWorktree], args: &[&str]) -> Result<Vec<PathBuf>> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        Ok(resolve_targets(finished, &args, Path::new("/work"))?
+            .into_iter()
+            .map(|w| w.worktree)
+            .collect())
+    }
+
+    #[test]
+    fn a_clean_target_names_a_finished_worktree_by_its_path() {
+        let all = [
+            finished("me/a", 3, "/work/a-3"),
+            finished("me/b", 4, "/work/b-4"),
+        ];
+        assert_eq!(
+            targets(&all, &["/work/b-4"]).unwrap(),
+            [PathBuf::from("/work/b-4")]
+        );
+        assert_eq!(
+            targets(&all, &["a-3/"]).unwrap(),
+            [PathBuf::from("/work/a-3")]
+        );
+        let err = targets(&all, &["/work/c-5"]).unwrap_err().to_string();
+        assert!(
+            err.contains("/work/c-5") && err.contains("not a Finished worktree"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_clean_target_names_a_finished_worktree_by_its_pr_unless_that_is_ambiguous() {
+        let all = [
+            finished("me/a", 3, "/work/a-3"),
+            finished("me/b", 3, "/work/b-3"),
+            finished("me/b", 4, "/work/b-4"),
+        ];
+        assert_eq!(
+            targets(&all, &["4", "#4", "me/b#4"]).unwrap(),
+            [PathBuf::from("/work/b-4")]
+        );
+        assert_eq!(
+            targets(&all, &["Me/A#3"]).unwrap(),
+            [PathBuf::from("/work/a-3")]
+        );
+        let err = targets(&all, &["#3"]).unwrap_err().to_string();
+        assert!(
+            err.contains("#3") && err.contains("me/a#3") && err.contains("me/b#3"),
+            "{err}"
+        );
+        let err = targets(&all, &["me/a#4"]).unwrap_err().to_string();
+        assert!(err.contains("not a Finished worktree"), "{err}");
+    }
+
+    #[test]
+    fn clean_asks_about_exactly_the_checked_worktrees() {
+        assert_eq!(removal_question(0), None);
+        assert_eq!(
+            removal_question(1).as_deref(),
+            Some("Remove this worktree? [y/N] ")
+        );
+        assert_eq!(
+            removal_question(3).as_deref(),
+            Some("Remove these 3 worktrees? [y/N] ")
+        );
     }
 }
