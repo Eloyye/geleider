@@ -73,6 +73,7 @@ process = "{game}"
 repo = "example/demo"
 path = "{repo}"
 vars = {{ game = "{game_path}" }}
+disposable = ["target/"]
 
 # The game runs as a child of a shell, like a test script launching it.
 [projects.demo.jobs.play]
@@ -1171,6 +1172,50 @@ fn finished_worktrees_are_listed_but_only_removed_after_explicit_confirmation() 
     );
     assert!(!wt.exists());
     assert!(env.repo().exists());
+}
+
+#[test]
+fn build_output_does_not_keep_a_finished_worktree_but_other_ignored_files_do() {
+    let env = Env::new("fakegame-clean-ignored");
+    std::fs::write(env.repo().join(".gitignore"), "target/\n.env\n").unwrap();
+    git(&env.repo(), &["add", ".gitignore"]);
+    git(
+        &env.repo(),
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "ignore",
+        ],
+    );
+    fake_branch_pr(&env, "MERGED");
+    let built = env.root().join("built");
+    let secret = env.root().join("secret");
+    for (branch, wt) in [("built", &built), ("secret", &secret)] {
+        git(
+            &env.repo(),
+            &["worktree", "add", "-qb", branch, wt.to_str().unwrap()],
+        );
+    }
+    std::fs::create_dir_all(built.join("target/debug")).unwrap();
+    std::fs::write(built.join("target/debug/demo"), "binary").unwrap();
+    std::fs::write(secret.join(".env"), "SECRET=1").unwrap();
+    let status: Value =
+        serde_json::from_slice(&env.geleider(&["status", "--json"]).stdout).unwrap();
+    let listed = status["finished_worktrees"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{status}");
+    assert_eq!(listed[0]["branch"], "built", "{status}");
+    let out = clean_input(&env, "yes\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!built.exists());
+    assert!(secret.join(".env").exists());
 }
 
 #[test]

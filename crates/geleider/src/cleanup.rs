@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::config::{Config, Project};
 use crate::git;
 use crate::github::{PrState, PullRequests};
 use crate::paths;
@@ -73,7 +73,7 @@ pub fn discover(
             }
         };
         for wt in worktrees {
-            match finished(name, &project.repo, wt, sessions, runs, github) {
+            match finished(name, project, wt, sessions, runs, github) {
                 Ok(Some(found)) => inventory.finished_worktrees.push(found),
                 Ok(None) => {}
                 Err(err) => inventory.cleanup_warnings.push(format!("{name} {err:#}")),
@@ -92,8 +92,8 @@ pub fn discover(
 /// `wt` as a Finished worktree, or `None` if anything may still need it. Local
 /// checks come first, so only idle, clean worktrees cost a GitHub query.
 fn finished(
-    project: &str,
-    repo: &str,
+    name: &str,
+    project: &Project,
     wt: git::Worktree,
     sessions: &[Session],
     runs: &[Run],
@@ -105,11 +105,11 @@ fn finished(
     let Some(branch) = wt.branch.clone() else {
         return Ok(None);
     };
-    if !git::clean(&wt).with_context(|| paths::display(&wt.path))? {
+    if !git::clean(&wt, &project.disposable).with_context(|| paths::display(&wt.path))? {
         return Ok(None);
     }
     let prs = github
-        .pull_requests(repo, &branch)
+        .pull_requests(&project.repo, &branch)
         .with_context(|| branch.clone())?;
     if prs.iter().any(|pr| pr.state == PrState::Open) {
         return Ok(None);
@@ -128,7 +128,7 @@ fn finished(
         return Ok(None);
     }
     Ok(Some(FinishedWorktree {
-        project: project.to_string(),
+        project: name.to_string(),
         worktree: wt.path,
         branch,
         head: wt.head,
@@ -176,7 +176,7 @@ pub fn validate(
     if wt.protected
         || wt.head != approved.head
         || wt.branch.as_ref() != Some(&approved.branch)
-        || !git::clean(wt)?
+        || !git::clean(wt, &project.disposable)?
     {
         bail!("worktree changed or is protected");
     }
@@ -221,7 +221,7 @@ mod tests {
             git(&clone, &["config", "user.name", "test"]);
             git(&clone, &["config", "user.email", "test@example.test"]);
             std::fs::write(clone.join("tracked"), "original").unwrap();
-            std::fs::write(clone.join(".gitignore"), "ignored\n").unwrap();
+            std::fs::write(clone.join(".gitignore"), "ignored\n.env\ntarget/\n").unwrap();
             git(&clone, &["add", "."]);
             git(&clone, &["commit", "-qm", "initial"]);
             let remote = dir.path().join("remote.git");
@@ -235,7 +235,7 @@ mod tests {
             );
             git(&clone, &["push", "-q", "origin", "main"]);
             let config = Config::parse(&format!(
-                "[projects.demo]\nrepo='o/r'\npath='{}'",
+                "[projects.demo]\nrepo='o/r'\npath='{}'\ndisposable=['target/', 'build']",
                 clone.display()
             ))
             .unwrap();
@@ -368,6 +368,52 @@ mod tests {
         }
         git(&wt, &["commit", "--allow-empty", "-qm", "unpushed"]);
         assert!(f.scan(&gh, &[]).finished_worktrees.is_empty());
+    }
+
+    #[test]
+    fn disposable_ignored_output_does_not_keep_a_worktree_and_is_removed_with_it() {
+        let f = Fixture::new();
+        let wt = f.worktree("done");
+        std::fs::create_dir_all(wt.join("target/debug/deps")).unwrap();
+        std::fs::write(wt.join("target/debug/deps/libx.rlib"), "build output").unwrap();
+        std::fs::write(wt.join("target/.rustc_info.json"), "{}").unwrap();
+        let found = f.scan(&f.pr(PrState::Merged), &[]);
+        assert_eq!(found.finished_worktrees.len(), 1, "{found:?}");
+        remove(&f.config, &[], &[], &found.finished_worktrees[0], &f.clone).unwrap();
+        assert!(!wt.exists());
+    }
+
+    #[test]
+    fn ignored_files_outside_disposable_paths_still_keep_a_worktree() {
+        let f = Fixture::new();
+        let wt = f.worktree("done");
+        let gh = f.pr(PrState::Merged);
+        std::fs::create_dir_all(wt.join("target")).unwrap();
+        std::fs::write(wt.join("target/out"), "build output").unwrap();
+        // A `.worktreeinclude` copy, ignored output below the Project root's
+        // `target/`, and an unignored file under a disposable path.
+        for (path, contents) in [
+            (".env", "SECRET=1"),
+            ("crates/a/target/out", "nested build output"),
+            ("build/notes", "a Session's work"),
+            ("targets", "not under target/"),
+        ] {
+            let path = wt.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, contents).unwrap();
+            assert!(f.scan(&gh, &[]).finished_worktrees.is_empty(), "{path:?}");
+            std::fs::remove_file(&path).unwrap();
+        }
+        // Even an empty ignored directory outside `target/` keeps it.
+        assert!(f.scan(&gh, &[]).finished_worktrees.is_empty());
+        std::fs::remove_dir_all(wt.join("crates")).unwrap();
+        std::fs::remove_dir_all(wt.join("build")).unwrap();
+        let found = f.scan(&gh, &[]);
+        assert_eq!(found.finished_worktrees.len(), 1);
+        // A file that appears after confirmation is caught by the final check.
+        std::fs::write(wt.join(".env"), "SECRET=1").unwrap();
+        assert!(remove(&f.config, &[], &[], &found.finished_worktrees[0], &f.clone).is_err());
+        assert!(wt.join(".env").exists());
     }
 
     #[test]
