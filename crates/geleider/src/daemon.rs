@@ -642,10 +642,7 @@ impl Daemon {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
         let mut line = String::new();
         let reply = match BufReader::new((&stream).take(MAX_REQUEST_BYTES)).read_line(&mut line) {
-            Ok(_) => match serde_json::from_str::<Request>(&line) {
-                Ok(request) => self.handle(request),
-                Err(err) => Err(anyhow::anyhow!("bad request: {err}")),
-            },
+            Ok(_) => protocol::decode_request(&line).and_then(|request| self.handle(request)),
             Err(err) => Err(anyhow::anyhow!("reading request: {err}")),
         };
         let mut out = protocol::encode_reply(reply);

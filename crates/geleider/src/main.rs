@@ -167,6 +167,13 @@ enum Cmd {
     },
     /// Run the background process in the foreground.
     Daemon,
+    /// Restart the installed background process so it runs the installed binary,
+    /// after listing the running Runs that would end as `lost` and confirming.
+    Restart {
+        /// Restart without waiting for a confirmation.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Serve MCP over stdio for a Harness.
     Mcp,
     /// Start the background process at login and register MCP and Session hooks in
@@ -175,9 +182,10 @@ enum Cmd {
     /// Undo `install`. Config and Run history are kept.
     Uninstall,
     /// Build the latest `main` from GitHub with `cargo install` and run its `install`,
-    /// restarting the background process. Refuses while a Run is running.
+    /// restarting the background process. Refuses while a Run is running, as it would
+    /// end as `lost`.
     Update {
-        /// Update even though restarting the background process ends running Runs.
+        /// Update even though running Runs would end as `lost`.
         #[arg(long)]
         force: bool,
     },
@@ -242,6 +250,7 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Usage { json } => cli::usage(&paths, json),
         Cmd::Statusline { wrap } => statusline::run(&paths, wrap.as_deref()),
         Cmd::Daemon => daemon::run(paths).map(|()| 0),
+        Cmd::Restart { yes } => cli::restart(&paths, yes),
         Cmd::Mcp => mcp::serve(&paths).map(|()| 0),
         Cmd::Install => install::install(&paths).map(|()| 0),
         Cmd::Uninstall => install::uninstall().map(|()| 0),

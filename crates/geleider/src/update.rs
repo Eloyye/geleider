@@ -1,7 +1,7 @@
 //! `geleider update`: build the latest `main` from GitHub with `cargo install`, then
 //! run the new binary's `install` so the background process, MCP entries and hooks
-//! move to it. Restarting the background process ends any Run it is running, so
-//! update refuses while one is, unless forced.
+//! move to it. A Run running across that restart keeps running but ends as `lost`,
+//! so update refuses while one is, unless forced.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -92,11 +92,11 @@ fn check_no_running_runs(paths: &Paths, force: bool, consequence: &str) -> Resul
         return Ok(());
     }
     if force {
-        eprintln!("Restarting the background process ends these Runs:\n{running}");
+        eprintln!("These Runs keep running but end as `lost`, with no exit code:\n{running}");
         return Ok(());
     }
     bail!(
-        "restarting the background process would end these Runs:\n{running}{consequence} \
+        "restarting the background process would leave these Runs to end as `lost`:\n{running}{consequence} \
          Wait for them, or pass --force."
     )
 }
