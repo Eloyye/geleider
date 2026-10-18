@@ -67,6 +67,7 @@ See [Jobs and Resources](jobs.md).
 | --- | --- |
 | `geleider install` | Start the background process at login and register the MCP server, Session hooks and status line in Claude Code, Codex and OpenCode. |
 | `geleider uninstall` | Undo `install`. Config and Run history are kept. |
+| `geleider update [--force]` | Build the latest `main` from GitHub with `cargo install --locked` into the directory this `geleider` was installed to, then run the new binary's `install`, which restarts the background process. Refuses while a Run is running, since the restart ends it; `--force` updates anyway. Restart running Sessions afterwards. |
 | `geleider daemon` | Run the background process in the foreground. |
 | `geleider mcp` | Serve MCP over stdio for a Harness. See [MCP tools](mcp.md). |
 | `geleider hook <harness> <event>` | Report a Harness lifecycle event from JSON on stdin. Always succeeds. Installed by `install`. |
