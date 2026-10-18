@@ -12,6 +12,7 @@ use crate::cli::one_line;
 use crate::paths::Paths;
 use crate::protocol::{self, Request, RunInfo};
 use crate::store::RunState;
+use crate::text;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const BRANCH: &str = "main";
@@ -83,11 +84,17 @@ fn cargo_args(root: &Path) -> Vec<String> {
 }
 
 fn check_no_running_runs(paths: &Paths, force: bool, consequence: &str) -> Result<()> {
-    // Without a background process there is nothing to restart a Run out of.
-    let Ok(reply) = protocol::call(paths, &Request::ListRuns { finished: 0 }) else {
-        return Ok(());
+    let runs = match protocol::call(paths, &Request::ListRuns { finished: 0 })
+        .and_then(|reply| reply.into_runs())
+    {
+        Ok(runs) => runs,
+        // An unreachable or mismatched background process is replaced by the update.
+        Err(err) => {
+            eprintln!("note: {}", text::one_line(&format!("{err:#}")));
+            return Ok(());
+        }
     };
-    let running = running(reply.into_runs()?);
+    let running = running(runs);
     if running.is_empty() {
         return Ok(());
     }
