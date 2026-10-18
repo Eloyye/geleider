@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::claim::IssueRef;
 use crate::cleanup::Inventory;
 use crate::config::Config;
+use crate::install;
 use crate::lease::Holder;
 use crate::panel::{self, Line, Span};
 use crate::paths::{self, Paths};
@@ -163,6 +164,56 @@ pub fn clean(paths: &Paths) -> Result<i32> {
         eprintln!("Skipped {}", text::one_line(reason));
     }
     Ok(i32::from(!cleaned.skipped.is_empty()))
+}
+
+/// Restarts the background process so it runs the installed binary. Running Runs
+/// keep running, but end as `lost`, so they are listed and confirmed first.
+pub fn restart(paths: &Paths, yes: bool) -> Result<i32> {
+    match protocol::call(paths, &Request::ListRuns { finished: 0 }).and_then(|r| r.into_runs()) {
+        Ok(runs) => {
+            let running: Vec<_> = runs
+                .iter()
+                .filter(|info| info.run.state == RunState::Running)
+                .collect();
+            if !running.is_empty() && !yes {
+                println!("Running Runs keep running but end as `lost`, with no exit code:");
+                for info in &running {
+                    println!("  {}", one_line(info));
+                }
+                print!("\nRestart the background process? [y/N] ");
+                std::io::stdout().flush()?;
+                if !confirmed(&mut std::io::stdin().lock())? {
+                    println!("Cancelled; the background process was not restarted.");
+                    return Ok(0);
+                }
+            }
+        }
+        // An unreachable or mismatched background process is why one restarts.
+        Err(err) => eprintln!("note: {}", text::one_line(&format!("{err:#}"))),
+    }
+
+    let exe = install::restart_service()?;
+    // The new process answers once it has the lock and the socket.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let answered = loop {
+        match protocol::call_within(
+            paths,
+            &Request::ListRuns { finished: 0 },
+            Duration::from_secs(2),
+        ) {
+            Ok(_) => break Ok(()),
+            Err(err) if Instant::now() >= deadline => break Err(err),
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    answered
+        .with_context(|| format!("the restarted background process ({exe}) is not answering"))?;
+    println!("Restarted the background process from {exe}.");
+    let current = std::env::current_exe().and_then(|p| p.canonicalize());
+    if current.is_ok_and(|current| current != Path::new(&exe)) {
+        println!("note: that is not this binary; `geleider install` points the service at it.");
+    }
+    Ok(0)
 }
 
 pub fn confirmed(input: &mut impl BufRead) -> Result<bool> {

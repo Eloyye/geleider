@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_geleider");
+/// `protocol::PROTOCOL`, which every request to the socket carries.
+const PROTOCOL: u32 = 1;
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -171,7 +173,8 @@ printf 'No actionable findings.\n'
         cmd
     }
 
-    fn request(&self, request: Value) {
+    fn request(&self, mut request: Value) {
+        request["protocol"] = PROTOCOL.into();
         let mut socket = UnixStream::connect(self.root().join("state/geleider.sock")).unwrap();
         writeln!(socket, "{request}").unwrap();
         let mut reply = String::new();

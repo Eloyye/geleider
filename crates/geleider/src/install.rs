@@ -79,6 +79,35 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// Restarts the installed background process, which launchd then starts from the
+/// binary its plist names. Returns that binary.
+pub fn restart_service() -> Result<String> {
+    let plist = plist_path(&paths::home_dir()?);
+    let text = std::fs::read_to_string(&plist).map_err(|err| {
+        anyhow::anyhow!(
+            "the background service is not installed ({}: {err}). Run `geleider install`, \
+             or restart `geleider daemon` by hand if you run it in a terminal.",
+            paths::display(&plist)
+        )
+    })?;
+    launchctl(&["kickstart", "-k", &format!("{}/{LABEL}", domain())])
+        .context("restarting the background service; `geleider install` reloads it")?;
+    service_exe(&text).context("reading the binary from the service's plist")
+}
+
+/// The binary in a plist [`plist_xml`] wrote.
+fn service_exe(plist: &str) -> Option<String> {
+    let args = &plist[plist.find("<key>ProgramArguments</key>")?..];
+    let start = args.find("<string>")? + "<string>".len();
+    let end = start + args[start..].find("</string>")?;
+    Some(
+        args[start..end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
 /// What a config file held before geleider first changed it, and what geleider
 /// last wrote there. Uninstall puts back a file the user has not edited since,
 /// byte for byte; an edited one only loses geleider's entries.
@@ -1193,6 +1222,17 @@ mod tests {
         write_atomically(&fresh, "{}", false).unwrap();
         let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn service_exe_is_read_back_from_the_plist() {
+        let exe = Path::new("/Users/a&b/<bin>/geleider");
+        let xml = plist_xml(exe, &[], Path::new("/tmp/log"));
+        assert_eq!(
+            service_exe(&xml).as_deref(),
+            Some("/Users/a&b/<bin>/geleider")
+        );
+        assert_eq!(service_exe("<plist/>"), None);
     }
 
     #[test]
