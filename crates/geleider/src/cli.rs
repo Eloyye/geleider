@@ -1,6 +1,5 @@
 //! The command-line side of submitting and checking Runs, and of Claims.
 
-use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -12,19 +11,20 @@ use crate::cleanup::{FinishedWorktree, Inventory};
 use crate::config::Config;
 use crate::install;
 use crate::lease::Holder;
-use crate::panel::{self, Line, Span};
 use crate::paths::{self, Paths};
 use crate::protocol::{self, Request, RunInfo, Status};
 use crate::report;
 use crate::session::{Harness, Session, SessionKey, SessionState};
 use crate::store::{RunState, now_ms};
-use crate::text::{self, Paint, Style};
+use crate::text;
+use crate::ui::{self, Line, Span, Style, Term};
 use crate::usage::{Subscription, SubscriptionUsage, WindowView};
 
 /// Finished Runs `geleider queue --all` shows.
 const RECENT: usize = 20;
 
 pub fn submit(
+    term: &mut Term,
     paths: &Paths,
     job: String,
     args: Vec<String>,
@@ -42,15 +42,19 @@ pub fn submit(
     };
     let info = protocol::call(paths, &request)?.into_run()?;
     if !wait {
-        print_as(json, &info, || one_line(&info) + "\n")?;
+        print_as(term, json, &info, || one_line(&info) + "\n")?;
         return Ok(0);
     }
-    eprintln!("{}", one_line(&info));
-    wait_for(paths, info.run.id, json)
+    term.say_err(&one_line(&info));
+    wait_for(term, paths, info.run.id, json)
 }
 
 /// The OpenCode plugin's result mailbox: at most one finished Run for `id` as
 /// `[{run_id, message}]`, after acknowledging `ack` if given.
+#[allow(
+    clippy::disallowed_macros,
+    reason = "the OpenCode plugin reads this JSON, not a person"
+)]
 pub fn session_results(paths: &Paths, harness: Harness, id: &str, ack: Option<i64>) -> Result<i32> {
     let session = SessionKey::new(harness, id).context("invalid Session id")?;
     let runs = protocol::call(paths, &Request::SessionResults { session, ack })?.into_runs()?;
@@ -64,7 +68,7 @@ pub fn session_results(paths: &Paths, harness: Harness, id: &str, ack: Option<i6
 
 /// Blocks until Run `id` ends, prints its result and returns its exit code, so a
 /// Harness can run this in the background and be woken when it finishes.
-pub fn wait_for(paths: &Paths, id: i64, json: bool) -> Result<i32> {
+pub fn wait_for(term: &mut Term, paths: &Paths, id: i64, json: bool) -> Result<i32> {
     let mut last_state = None;
     let mut unreachable_since: Option<Instant> = None;
     loop {
@@ -72,11 +76,11 @@ pub fn wait_for(paths: &Paths, id: i64, json: bool) -> Result<i32> {
             Ok(info) => {
                 unreachable_since = None;
                 if info.run.state.is_finished() {
-                    print_result(&info, json)?;
+                    print_result(term, &info, json)?;
                     return Ok(exit_code(&info));
                 }
                 if last_state.is_some_and(|s| s != info.run.state) {
-                    eprintln!("{}", one_line(&info));
+                    term.say_err(&one_line(&info));
                 }
                 last_state = Some(info.run.state);
             }
@@ -92,16 +96,16 @@ pub fn wait_for(paths: &Paths, id: i64, json: bool) -> Result<i32> {
     }
 }
 
-pub fn show(paths: &Paths, id: i64, json: bool) -> Result<i32> {
+pub fn show(term: &mut Term, paths: &Paths, id: i64, json: bool) -> Result<i32> {
     let info = protocol::call(paths, &Request::GetRun { id })?.into_run()?;
-    print_result(&info, json)?;
+    print_result(term, &info, json)?;
     Ok(0)
 }
 
-pub fn queue(paths: &Paths, all: bool, json: bool) -> Result<i32> {
+pub fn queue(term: &mut Term, paths: &Paths, all: bool, json: bool) -> Result<i32> {
     let finished = if all { RECENT } else { 0 };
     let runs = protocol::call(paths, &Request::ListRuns { finished })?.into_runs()?;
-    print_as(json, &runs, || {
+    print_as(term, json, &runs, || {
         if runs.is_empty() {
             return "No runs queued or running.\n".into();
         }
@@ -110,23 +114,17 @@ pub fn queue(paths: &Paths, all: bool, json: bool) -> Result<i32> {
     Ok(0)
 }
 
-pub fn status(paths: &Paths, json: bool) -> Result<i32> {
+pub fn status(term: &mut Term, paths: &Paths, json: bool) -> Result<i32> {
     let status = protocol::call(paths, &Request::Status)?.into_status()?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&status)?);
+        print_json(&status)?;
     } else {
-        let shown = render_status(
-            &status,
-            now_ms(),
-            panel::terminal_width(),
-            Paint::for_stdout(),
-        );
-        print!("{}", text::printable_styled(&shown));
+        term.show(&render_status(&status, now_ms(), term.width()));
     }
     Ok(0)
 }
 
-pub fn clean(paths: &Paths, targets: &[String], yes: bool) -> Result<i32> {
+pub fn clean(term: &mut Term, paths: &Paths, targets: &[String], yes: bool) -> Result<i32> {
     // A fresh scan may query several Projects; leave time for those network calls.
     let timeout = Duration::from_secs(300);
     let mut inventory =
@@ -138,49 +136,44 @@ pub fn clean(paths: &Paths, targets: &[String], yes: bool) -> Result<i32> {
     let finished = std::mem::take(&mut inventory.finished_worktrees);
     let chosen = if !targets.is_empty() {
         inventory.finished_worktrees = resolve_targets(&finished, targets, &cwd)?;
-        print!("{}", render_finished(&inventory));
+        term.say(&render_finished(&inventory));
         inventory.finished_worktrees
-    } else if finished.len() > 1
-        && std::io::stdin().is_terminal()
-        && std::io::stderr().is_terminal()
-    {
+    } else if finished.len() > 1 {
+        term.say("Finished worktrees");
         for warning in &inventory.cleanup_warnings {
-            println!("Could not check {}", text::one_line(warning));
+            term.say(&format!("  Could not check {}", text::one_line(warning)));
         }
-        // Every row starts checked; uncheck the worktrees to keep.
-        let rows: Vec<String> = finished.iter().map(finished_row).collect();
-        let Some(checked) = dialoguer::MultiSelect::new()
-            .with_prompt("Uncheck worktrees to keep (space toggles, enter accepts, esc cancels)")
-            .items(&rows)
-            .defaults(&vec![true; rows.len()])
-            .interact_opt()?
+        // Every row starts checked; uncheck the worktrees to keep. Without a
+        // terminal nothing is asked, and the confirmation below decides.
+        let rows: Vec<Line> = finished
+            .iter()
+            .map(|wt| vec![Span::plain(finished_row(wt))])
+            .collect();
+        let Some(checked) =
+            term.pick_many("Uncheck worktrees to keep", &rows, &vec![true; rows.len()])?
         else {
-            println!("Cancelled; no worktrees removed.");
+            term.say("Cancelled; no worktrees removed.");
             return Ok(0);
         };
         if checked.len() < finished.len() {
-            println!("To keep a worktree for good, run `git worktree lock <path>`.");
+            term.say("To keep a worktree for good, run `git worktree lock <path>`.");
         }
         checked.into_iter().map(|i| finished[i].clone()).collect()
     } else {
         inventory.finished_worktrees = finished;
-        print!("{}", render_finished(&inventory));
+        term.say(&render_finished(&inventory));
         if inventory.finished_worktrees.is_empty() {
             return Ok(0);
         }
         inventory.finished_worktrees
     };
     let Some(question) = removal_question(chosen.len()) else {
-        println!("Nothing selected; no worktrees removed.");
+        term.say("Nothing selected; no worktrees removed.");
         return Ok(0);
     };
-    if !yes {
-        print!("\n{question}");
-        std::io::stdout().flush()?;
-        if !confirmed(&mut std::io::stdin().lock())? {
-            println!("Cancelled; no worktrees removed.");
-            return Ok(0);
-        }
+    if !yes && !term.confirm(&question)? {
+        term.say("Cancelled; no worktrees removed.");
+        return Ok(0);
     }
     let cleaned = protocol::call_within(
         paths,
@@ -192,10 +185,10 @@ pub fn clean(paths: &Paths, targets: &[String], yes: bool) -> Result<i32> {
     )?
     .into_cleaned()?;
     for path in &cleaned.removed {
-        println!("Removed {}", shown_path(path));
+        term.say(&format!("Removed {}", shown_path(path)));
     }
     for reason in &cleaned.skipped {
-        eprintln!("Skipped {}", text::one_line(reason));
+        term.say_err(&format!("Skipped {}", text::one_line(reason)));
     }
     Ok(i32::from(!cleaned.skipped.is_empty()))
 }
@@ -251,8 +244,8 @@ fn resolve_targets(
 fn removal_question(count: usize) -> Option<String> {
     match count {
         0 => None,
-        1 => Some("Remove this worktree? [y/N] ".into()),
-        n => Some(format!("Remove these {n} worktrees? [y/N] ")),
+        1 => Some("Remove this worktree?".into()),
+        n => Some(format!("Remove these {n} worktrees?")),
     }
 }
 
@@ -264,7 +257,7 @@ fn pr_repo(wt: &FinishedWorktree) -> &str {
 
 /// Restarts the background process so it runs the installed binary. Running Runs
 /// keep running, but end as `lost`, so they are listed and confirmed first.
-pub fn restart(paths: &Paths, yes: bool) -> Result<i32> {
+pub fn restart(term: &mut Term, paths: &Paths, yes: bool) -> Result<i32> {
     match protocol::call(paths, &Request::ListRuns { finished: 0 }).and_then(|r| r.into_runs()) {
         Ok(runs) => {
             let running: Vec<_> = runs
@@ -272,20 +265,18 @@ pub fn restart(paths: &Paths, yes: bool) -> Result<i32> {
                 .filter(|info| info.run.state == RunState::Running)
                 .collect();
             if !running.is_empty() && !yes {
-                println!("Running Runs keep running but end as `lost`, with no exit code:");
+                term.say("Running Runs keep running but end as `lost`, with no exit code:");
                 for info in &running {
-                    println!("  {}", one_line(info));
+                    term.say(&format!("  {}", one_line(info)));
                 }
-                print!("\nRestart the background process? [y/N] ");
-                std::io::stdout().flush()?;
-                if !confirmed(&mut std::io::stdin().lock())? {
-                    println!("Cancelled; the background process was not restarted.");
+                if !term.confirm("Restart the background process?")? {
+                    term.say("Cancelled; the background process was not restarted.");
                     return Ok(0);
                 }
             }
         }
         // An unreachable or mismatched background process is why one restarts.
-        Err(err) => eprintln!("note: {}", text::one_line(&format!("{err:#}"))),
+        Err(err) => term.say_err(&format!("note: {}", text::one_line(&format!("{err:#}")))),
     }
 
     let exe = install::restart_service()?;
@@ -304,21 +295,12 @@ pub fn restart(paths: &Paths, yes: bool) -> Result<i32> {
     };
     answered
         .with_context(|| format!("the restarted background process ({exe}) is not answering"))?;
-    println!("Restarted the background process from {exe}.");
+    term.say(&format!("Restarted the background process from {exe}."));
     let current = std::env::current_exe().and_then(|p| p.canonicalize());
     if current.is_ok_and(|current| current != Path::new(&exe)) {
-        println!("note: that is not this binary; `geleider install` points the service at it.");
+        term.say("note: that is not this binary; `geleider install` points the service at it.");
     }
     Ok(0)
-}
-
-pub fn confirmed(input: &mut impl BufRead) -> Result<bool> {
-    let mut answer = String::new();
-    input.read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
 }
 
 fn render_finished(inventory: &Inventory) -> String {
@@ -356,49 +338,69 @@ fn shown_path(path: &Path) -> String {
 
 /// Claims `issue` for the Session working in this worktree. The CLI names no
 /// Session: the daemon takes the only live one in the worktree.
-pub fn claim(paths: &Paths, issue: &str, json: bool) -> Result<i32> {
+pub fn claim(term: &mut Term, paths: &Paths, issue: &str, json: bool) -> Result<i32> {
     let request = Request::Claim {
         cwd: std::env::current_dir()?,
         issue: IssueRef::parse(issue)?,
         session: None,
     };
-    claim_reply(paths, &request, json)
+    claim_reply(term, paths, &request, json)
 }
 
-pub fn release(paths: &Paths, issue: &str, force: bool, json: bool) -> Result<i32> {
+pub fn release(
+    term: &mut Term,
+    paths: &Paths,
+    issue: &str,
+    force: bool,
+    json: bool,
+) -> Result<i32> {
     let request = Request::Release {
         cwd: std::env::current_dir()?,
         issue: IssueRef::parse(issue)?,
         session: None,
         force,
     };
-    claim_reply(paths, &request, json)
+    claim_reply(term, paths, &request, json)
 }
 
-fn claim_reply(paths: &Paths, request: &Request, json: bool) -> Result<i32> {
+fn claim_reply(term: &mut Term, paths: &Paths, request: &Request, json: bool) -> Result<i32> {
     let (claim, message) = protocol::call(paths, request)?.into_claim()?;
     let value = serde_json::json!({ "claim": claim, "message": message });
-    print_as(json, &value, || format!("{message}\n"))?;
+    print_as(term, json, &value, || format!("{message}\n"))?;
     Ok(0)
 }
 
-pub fn usage(paths: &Paths, json: bool) -> Result<i32> {
+pub fn usage(term: &mut Term, paths: &Paths, json: bool) -> Result<i32> {
     let subscriptions = protocol::call(paths, &Request::Usage)?.into_usage()?;
-    print_as(json, &subscriptions, || {
+    print_as(term, json, &subscriptions, || {
         render_usage(&subscriptions, now_ms())
     })?;
     Ok(0)
 }
 
 /// Prints `value` as JSON for scripts, or `text` for people. Branches, paths,
-/// args and logs in `text` come from Sessions, so terminal escapes in them are
-/// dropped; JSON escapes them itself.
-fn print_as(json: bool, value: &impl Serialize, text: impl FnOnce() -> String) -> Result<()> {
+/// args and logs in `text` come from Sessions, so [`Term`] drops terminal
+/// escapes in them; JSON escapes them itself.
+fn print_as(
+    term: &mut Term,
+    json: bool,
+    value: &impl Serialize,
+    text: impl FnOnce() -> String,
+) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        print_json(value)
     } else {
-        print!("{}", text::printable(&text()));
+        term.say(&text());
+        Ok(())
     }
+}
+
+#[allow(
+    clippy::disallowed_macros,
+    reason = "`--json` is read by programs, and serde escapes what Sessions wrote"
+)]
+fn print_json(value: &impl Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 
@@ -417,7 +419,7 @@ const MIN_WIDTH: usize = 60;
 /// Resources and Runs and Claims and cleanup, stacked when narrower than
 /// [`TWO_COLUMNS`]. Branches, paths, args and process names come from Sessions,
 /// so each is put on one line before it is shown.
-fn render_status(status: &Status, now: i64, width: usize, paint: Paint) -> String {
+fn render_status(status: &Status, now: i64, width: usize) -> Vec<Line> {
     let width = width.max(MIN_WIDTH);
     let two = width >= TWO_COLUMNS;
     let left_width = if two { width * 11 / 20 } else { width };
@@ -425,27 +427,27 @@ fn render_status(status: &Status, now: i64, width: usize, paint: Paint) -> Strin
 
     let mut out = Vec::new();
     if !status.subscriptions.is_empty() {
-        out.extend(panel::boxed("Usage", &usage_panel(status, now, two), width));
+        out.extend(ui::boxed("Usage", &usage_panel(status, now, two), width));
     }
     let live = live_sessions(status);
-    let sessions = panel::boxed(
+    let sessions = ui::boxed(
         &format!("Sessions · {}", live.len()),
         &sessions_panel(status, &live, now),
         left_width,
     );
-    let mut right = panel::boxed("Resources & Runs", &runs_panel(status, now), right_width);
-    right.extend(panel::boxed(
+    let mut right = ui::boxed("Resources & Runs", &runs_panel(status, now), right_width);
+    right.extend(ui::boxed(
         "Claims & cleanup",
         &claims_panel(status, &live, now),
         right_width,
     ));
     if two {
-        out.extend(panel::beside(&sessions, &right, left_width));
+        out.extend(ui::beside(&sessions, &right, left_width));
     } else {
         out.extend(sessions);
         out.extend(right);
     }
-    panel::render(&out, paint)
+    out
 }
 
 /// Waiting Sessions first, then working, then idle; the most recent first in each.
@@ -504,7 +506,7 @@ fn usage_panel(status: &Status, now: i64, wide: bool) -> Vec<Line> {
                 ));
             }
             line.push(Span::plain(format!("{} ", window.window)));
-            line.extend(panel::gauge(
+            line.extend(ui::gauge(
                 window.used_percent,
                 cells,
                 BUSY_PERCENT,
@@ -799,7 +801,12 @@ fn shown_branch(branch: Option<&str>) -> String {
 }
 
 /// Shows a Subscription's Limit windows, including missing ones.
-pub fn print_usage(config: &Config, usage: &[SubscriptionUsage], subscription: Subscription) {
+pub fn print_usage(
+    term: &mut Term,
+    config: &Config,
+    usage: &[SubscriptionUsage],
+    subscription: Subscription,
+) {
     let usage = usage
         .iter()
         .find(|u| u.subscription == subscription)
@@ -810,9 +817,9 @@ pub fn print_usage(config: &Config, usage: &[SubscriptionUsage], subscription: S
             source: subscription.source().into(),
             windows: Vec::new(),
         });
-    print!("{}", text::printable(&render_usage(&[usage], now_ms())));
+    term.say(&render_usage(&[usage], now_ms()));
     if !config.subscriptions.get(subscription).enabled {
-        println!("  Usage tracking is disabled for this Subscription.");
+        term.say("  Usage tracking is disabled for this Subscription.");
     }
 }
 
@@ -884,8 +891,8 @@ pub fn one_line(info: &RunInfo) -> String {
     )
 }
 
-fn print_result(info: &RunInfo, json: bool) -> Result<()> {
-    print_as(json, info, || render_result(info))
+fn print_result(term: &mut Term, info: &RunInfo, json: bool) -> Result<()> {
+    print_as(term, json, info, || render_result(info))
 }
 
 /// A Run's one-line summary, its details and, once it has finished, its log tail.
@@ -1048,6 +1055,17 @@ mod tests {
             .collect()
     }
 
+    /// `status` as `geleider status` shows it on a `width`-column terminal.
+    fn shown(status: &Status, width: usize, term: Term) -> String {
+        let mut term = term;
+        term.show(&render_status(status, NOW, width));
+        term.stdout().to_string()
+    }
+
+    fn plain(status: &Status, width: usize) -> String {
+        shown(status, width, Term::scripted([], width))
+    }
+
     fn titles(text: &str) -> Vec<String> {
         text.split("╭─ ")
             .skip(1)
@@ -1057,7 +1075,7 @@ mod tests {
 
     #[test]
     fn status_panels_stack_on_narrow_terminals() {
-        let text = render_status(&busy(), NOW, 80, Paint::PLAIN);
+        let text = plain(&busy(), 80);
         for line in text.lines() {
             assert_eq!(line.chars().count(), 80, "{line:?} in\n{text}");
         }
@@ -1104,7 +1122,7 @@ mod tests {
 
     #[test]
     fn status_panels_sit_side_by_side_on_wide_terminals() {
-        let text = render_status(&busy(), NOW, 120, Paint::PLAIN);
+        let text = plain(&busy(), 120);
         for line in text.lines() {
             assert!(line.chars().count() <= 120, "{line:?} in\n{text}");
         }
@@ -1126,7 +1144,7 @@ mod tests {
     #[test]
     fn quiet_status_has_empty_panels() {
         let status: Status = serde_json::from_value(json!({"resources": [], "runs": []})).unwrap();
-        let text = render_status(&status, NOW, 20, Paint::PLAIN);
+        let text = plain(&status, 20);
         assert_eq!(
             titles(&text),
             ["Sessions · 0", "Resources & Runs", "Claims & cleanup"]
@@ -1146,7 +1164,7 @@ mod tests {
     fn status_colours_only_its_own_words() {
         let mut status = busy();
         status.sessions[0].branch = Some("x\u{1b}]52;c;aGk=\u{7}\u{1b}[8mhidden\nfake line".into());
-        let shown = text::printable_styled(&render_status(&status, NOW, 80, Paint::COLOR));
+        let shown = shown(&status, 80, Term::scripted([], 80).colored());
         assert!(shown.contains("\u{1b}[33m◐\u{1b}[0m"), "{shown}");
         assert!(
             !shown.contains("\u{1b}]") && !shown.contains("\u{1b}[8m"),
@@ -1156,16 +1174,6 @@ mod tests {
             shown.contains("x ]52;c;aGk=  [8mhidden fake line"),
             "{shown}"
         );
-    }
-
-    #[test]
-    fn cleanup_requires_an_explicit_yes() {
-        for answer in ["", "\n", "no\n", "maybe\n", "true\n"] {
-            assert!(!confirmed(&mut answer.as_bytes()).unwrap());
-        }
-        for answer in ["y\n", "yes\n", "YES\n"] {
-            assert!(confirmed(&mut answer.as_bytes()).unwrap());
-        }
     }
 
     fn finished(repo: &str, pr: u64, path: &str) -> FinishedWorktree {
@@ -1238,11 +1246,11 @@ mod tests {
         assert_eq!(removal_question(0), None);
         assert_eq!(
             removal_question(1).as_deref(),
-            Some("Remove this worktree? [y/N] ")
+            Some("Remove this worktree?")
         );
         assert_eq!(
             removal_question(3).as_deref(),
-            Some("Remove these 3 worktrees? [y/N] ")
+            Some("Remove these 3 worktrees?")
         );
     }
 }

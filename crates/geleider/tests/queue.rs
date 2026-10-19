@@ -1198,12 +1198,14 @@ fn clean_removes_only_the_named_finished_worktrees() {
     assert!(one.exists());
     let out = clean_input(&env, &[one.to_str().unwrap()], "yes\n");
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    // The question goes to stderr, so stdout keeps only what was done.
+    assert!(stderr.contains("Remove this worktree? [y/N]"), "{stderr}");
     assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        !stdout.contains("[y/N]") && stdout.contains("Removed "),
+        "{stdout}"
     );
-    assert!(stdout.contains("Remove this worktree?"), "{stdout}");
     assert!(!one.exists() && two.exists() && three.exists());
     let out = clean_input(&env, &[two.to_str().unwrap(), "--yes"], "");
     assert!(
@@ -1212,6 +1214,36 @@ fn clean_removes_only_the_named_finished_worktrees() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(!two.exists() && three.exists());
+}
+
+#[test]
+fn without_a_terminal_clean_offers_every_finished_worktree_and_a_piped_yes_removes_them() {
+    let env = Env::new("fakegame-clean-several");
+    fake_branch_pr(&env, "MERGED");
+    let [one, two] = ["one", "two"].map(|b| {
+        let wt = env.root().join(b);
+        git(
+            &env.repo(),
+            &["worktree", "add", "-qb", b, wt.to_str().unwrap()],
+        );
+        wt
+    });
+    let out = clean_input(&env, &[], "no\n");
+    assert!(out.status.success());
+    assert!(one.exists() && two.exists());
+    let out = clean_input(&env, &[], "y\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    // The checkboxes all start checked, so nothing is asked before the confirmation.
+    assert!(
+        stderr.contains("#6 merged  one") && stderr.contains("#6 merged  two"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Remove these 2 worktrees? [y/N]"),
+        "{stderr}"
+    );
+    assert!(!one.exists() && !two.exists());
 }
 
 #[test]

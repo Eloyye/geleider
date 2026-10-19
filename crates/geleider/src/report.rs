@@ -149,6 +149,10 @@ pub trait Notifier: Send + Sync {
 pub struct MacNotifier;
 
 impl Notifier for MacNotifier {
+    #[allow(
+        clippy::disallowed_macros,
+        reason = "the background process notifies; it logs to stderr"
+    )]
     fn notify(&self, title: &str, message: &str) {
         let script = format!(
             "display notification {} with title {}",

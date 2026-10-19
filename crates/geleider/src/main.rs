@@ -16,7 +16,6 @@ mod import;
 mod install;
 mod lease;
 mod mcp;
-mod panel;
 mod paths;
 mod procs;
 mod protocol;
@@ -26,6 +25,7 @@ mod session;
 mod statusline;
 mod store;
 mod text;
+mod ui;
 mod update;
 mod usage;
 
@@ -33,6 +33,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::paths::Paths;
+use crate::ui::Term;
 
 /// Coordinates coding-agent work across Claude Code, Codex and OpenCode on one Mac.
 #[derive(Parser)]
@@ -199,8 +200,14 @@ enum Cmd {
     },
 }
 
+#[allow(
+    clippy::disallowed_macros,
+    reason = "the last error goes to stderr even when ui cannot be built"
+)]
 fn main() {
-    let code = match run(Cli::parse()) {
+    let cli = Cli::parse();
+    let mut term = Term::detect();
+    let code = match run(cli, &mut term) {
         Ok(code) => code,
         Err(err) => {
             // Errors can quote paths and branches a Session chose.
@@ -211,7 +218,7 @@ fn main() {
     std::process::exit(code);
 }
 
-fn run(cli: Cli) -> Result<i32> {
+fn run(cli: Cli, term: &mut Term) -> Result<i32> {
     // Hook failures, including a missing HOME/state directory, never escape to a Harness.
     if let Cmd::Hook { harness, ref event } = cli.command {
         hook::run(harness, event);
@@ -224,13 +231,13 @@ fn run(cli: Cli) -> Result<i32> {
             args,
             wait,
             json,
-        } => cli::submit(&paths, job, args, wait, json),
-        Cmd::Show { id, json } => cli::show(&paths, cli::parse_run_id(&id)?, json),
-        Cmd::Wait { id, json } => cli::wait_for(&paths, cli::parse_run_id(&id)?, json),
-        Cmd::Queue { all, json } => cli::queue(&paths, all, json),
-        Cmd::Status { json } => cli::status(&paths, json),
-        Cmd::Clean { targets, yes } => cli::clean(&paths, &targets, yes),
-        Cmd::Review { pr, with, yes } => review::run(&paths, &pr, with, yes),
+        } => cli::submit(term, &paths, job, args, wait, json),
+        Cmd::Show { id, json } => cli::show(term, &paths, cli::parse_run_id(&id)?, json),
+        Cmd::Wait { id, json } => cli::wait_for(term, &paths, cli::parse_run_id(&id)?, json),
+        Cmd::Queue { all, json } => cli::queue(term, &paths, all, json),
+        Cmd::Status { json } => cli::status(term, &paths, json),
+        Cmd::Clean { targets, yes } => cli::clean(term, &paths, &targets, yes),
+        Cmd::Review { pr, with, yes } => review::run(term, &paths, &pr, with, yes),
         Cmd::Dispatch {
             numbers,
             profile,
@@ -239,6 +246,7 @@ fn run(cli: Cli) -> Result<i32> {
             no_template,
             yes,
         } => dispatch::run(
+            term,
             &paths,
             dispatch::Options {
                 numbers,
@@ -249,19 +257,19 @@ fn run(cli: Cli) -> Result<i32> {
                 yes,
             },
         ),
-        Cmd::Import => import::run(&paths),
-        Cmd::Claim { issue, json } => cli::claim(&paths, &issue, json),
-        Cmd::Release { issue, force, json } => cli::release(&paths, &issue, force, json),
+        Cmd::Import => import::run(term, &paths),
+        Cmd::Claim { issue, json } => cli::claim(term, &paths, &issue, json),
+        Cmd::Release { issue, force, json } => cli::release(term, &paths, &issue, force, json),
         // Handled above, before anything that can fail.
         Cmd::Hook { .. } => Ok(0),
         Cmd::SessionResults { harness, id, ack } => cli::session_results(&paths, harness, &id, ack),
-        Cmd::Usage { json } => cli::usage(&paths, json),
+        Cmd::Usage { json } => cli::usage(term, &paths, json),
         Cmd::Statusline { wrap } => statusline::run(&paths, wrap.as_deref()),
         Cmd::Daemon => daemon::run(paths).map(|()| 0),
-        Cmd::Restart { yes } => cli::restart(&paths, yes),
+        Cmd::Restart { yes } => cli::restart(term, &paths, yes),
         Cmd::Mcp => mcp::serve(&paths).map(|()| 0),
-        Cmd::Install => install::install(&paths).map(|()| 0),
-        Cmd::Uninstall => install::uninstall().map(|()| 0),
-        Cmd::Update { force } => update::run(&paths, force),
+        Cmd::Install => install::install(term, &paths).map(|()| 0),
+        Cmd::Uninstall => install::uninstall(term).map(|()| 0),
+        Cmd::Update { force } => update::run(term, &paths, force),
     }
 }

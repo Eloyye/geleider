@@ -6,7 +6,7 @@
 //! reviewing Harness can only read the review worktree (Claude) or runs in a
 //! read-only sandbox without credentials in its shell (Codex).
 
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -20,6 +20,7 @@ use crate::paths::Paths;
 use crate::protocol::{self, Reply, Request};
 use crate::session::{Activity, Harness, Session, SessionKey, SessionState};
 use crate::store::now_ms;
+use crate::ui::Term;
 use crate::usage::Subscription;
 use crate::{cli, command, git, text};
 
@@ -140,15 +141,6 @@ fn pr_number(input: &str, repo: &str) -> Result<u64> {
     Ok(number)
 }
 
-fn approved(input: &mut impl BufRead) -> Result<bool> {
-    let mut answer = String::new();
-    input.read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
 /// Fails unless PR `pr.number` still has the commits in `pr`.
 fn ensure_unchanged(repo: &str, pr: &PrCommits, when: &str) -> Result<()> {
     if !Gh.pr_commits(repo, pr.number)?.same_commits(pr) {
@@ -157,7 +149,13 @@ fn ensure_unchanged(repo: &str, pr: &PrCommits, when: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn run(paths: &Paths, input: &str, explicit: Option<Reviewer>, yes: bool) -> Result<i32> {
+pub fn run(
+    term: &mut Term,
+    paths: &Paths,
+    input: &str,
+    explicit: Option<Reviewer>,
+    yes: bool,
+) -> Result<i32> {
     let config = Config::load(&paths.config)?;
     let cwd = std::env::current_dir()?;
     let location = git::locate(&config, &cwd)?;
@@ -165,27 +163,29 @@ pub fn run(paths: &Paths, input: &str, explicit: Option<Reviewer>, yes: bool) ->
     let pr = Gh.pr_commits(repo, pr_number(input, repo)?)?;
     let status = protocol::call(paths, &Request::Status)?.into_status()?;
     let reviewer = choose(&status.sessions, location.project_name, &pr, explicit)?;
-    println!(
+    term.say(&format!(
         "Cross-review of {repo}#{} through {}",
         pr.number,
         reviewer.harness().name()
+    ));
+    cli::print_usage(
+        term,
+        &config,
+        &status.subscriptions,
+        reviewer.subscription(),
     );
-    cli::print_usage(&config, &status.subscriptions, reviewer.subscription());
     if !yes {
-        print!("Start this review and post its result on the PR? [y/N] ");
-        std::io::stdout().flush()?;
-        if !approved(&mut std::io::stdin().lock())? {
-            println!("Cancelled; no review started.");
+        if !term.confirm("Start this review and post its result on the PR?")? {
+            term.say("Cancelled; no review started.");
             return Ok(0);
         }
         // A confirmation can be left open for hours. Review exactly the commits
         // whose selection the user just saw, or ask them to retry.
         ensure_unchanged(repo, &pr, "while awaiting confirmation; run review again")?;
     }
-    std::io::stdout().flush()?;
 
     let review = Review::new(paths, reviewer, &pr)?;
-    let output = review.in_worktree(&location.project.clone_path()?, repo)?;
+    let output = review.in_worktree(term, &location.project.clone_path()?, repo)?;
     // A force-push during review must not make findings look current.
     let saved = review.directory.display();
     ensure_unchanged(
@@ -199,10 +199,10 @@ pub fn run(paths: &Paths, input: &str, explicit: Option<Reviewer>, yes: bool) ->
     }
     Gh.comment_review(repo, pr.number, &body)
         .with_context(|| format!("posting review; result saved in {saved}"))?;
-    println!(
+    term.say(&format!(
         "Posted Cross-review on https://github.com/{repo}/pull/{}",
         pr.number
-    );
+    ));
     Ok(0)
 }
 
@@ -234,7 +234,7 @@ impl<'a> Review<'a> {
 
     /// Reviews the PR in a temporary detached worktree of `clone`, so no
     /// uncommitted edits of the caller enter the review.
-    fn in_worktree(&self, clone: &Path, repo: &str) -> Result<String> {
+    fn in_worktree(&self, term: &mut Term, clone: &Path, repo: &str) -> Result<String> {
         let worktree = self.directory.join("worktree");
         let (base, head) = (&self.pr.base_ref_oid, &self.pr.head_ref_oid);
         git::add_detached_worktree(
@@ -248,11 +248,11 @@ impl<'a> Review<'a> {
         let result = self.execute(&worktree);
         // Never force removal: if something changed files, retain the worktree.
         if let Err(err) = git::remove_worktree(clone, &worktree) {
-            eprintln!(
+            term.say_err(&format!(
                 "Kept review worktree {}: {}",
                 text::one_line(&worktree.display().to_string()),
                 text::one_line(&err.to_string())
-            );
+            ));
         }
         result
     }
@@ -516,11 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_requires_yes_and_pr_input_cannot_be_an_option_or_another_project() {
-        for input in ["", "no\n", "maybe\n"] {
-            assert!(!approved(&mut std::io::Cursor::new(input)).unwrap());
-        }
-        assert!(approved(&mut std::io::Cursor::new("YES\n")).unwrap());
+    fn pr_input_cannot_be_an_option_or_another_project() {
         for input in [
             "7",
             "#7",

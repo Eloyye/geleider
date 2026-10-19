@@ -10,7 +10,7 @@ geleider dispatch 12 --prompt-file notes.md --no-template
 geleider dispatch 12 --yes                       # show everything, then start without asking
 ```
 
-Dispatch only runs on your command. Polling and labels never start a Dispatch, and there is no MCP tool for it. Without numbers, a picker lists the Project's open issues and PRs; Claimed and assigned ones are marked `-` and cannot be chosen. One Profile applies to everything in one command: `--profile`, else the Project's `default_profile`, else you are asked. Only Claude Code and Codex can be Dispatched; OpenCode cannot yet. See [ADR 0005](adr/0005-dispatch-through-harness-background-mode.md).
+Dispatch only runs on your command. Polling and labels never start a Dispatch, and there is no MCP tool for it. Without numbers, `dispatch` lists the Project's Claimed and assigned issues and PRs, marked `-`, which cannot be chosen, then offers the others as checkboxes, none checked. Without a terminal, such as with piped input, the others are numbered and you type their row numbers (`1 3`), not issue numbers; Enter alone picks none. One Profile applies to everything in one command: `--profile`, else the Project's `default_profile`, else you pick one from a list; without a terminal, type its number or name, and Enter alone cancels. Only Claude Code and Codex can be Dispatched; OpenCode cannot yet. See [ADR 0005](adr/0005-dispatch-through-harness-background-mode.md).
 
 ## Confirmation
 
@@ -19,7 +19,7 @@ Before anything starts, `dispatch` shows:
 - the Profile's Subscription's Limit windows, with missing or stale readings shown as such;
 - how many Sessions are live.
 
-It then asks `[y/N]`. Anything but `y` or `yes` cancels. `--yes` skips only the question.
+It then asks `[y/N]` on stderr. Anything but `y` or `yes` cancels. `--yes` skips only the question.
 
 ## What happens for each item
 

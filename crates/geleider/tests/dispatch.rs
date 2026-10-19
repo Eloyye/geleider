@@ -450,7 +450,7 @@ fn a_claude_dispatch_claims_prepares_a_fresh_worktree_and_starts_a_background_se
         "{text}"
     );
     assert!(text.contains("Live Sessions: 0"), "{text}");
-    assert!(!text.contains("[y/N]"), "{text}");
+    assert!(!stderr(&out).contains("[y/N]"), "{}", stderr(&out));
 
     let worktree = fixture.repo().join(".claude/worktrees/issue-12");
     assert_eq!(
@@ -625,7 +625,14 @@ fn a_pr_is_dispatched_on_its_own_branch_and_forks_busy_and_assigned_items_are_re
 fn the_picker_lists_open_items_and_claimed_or_assigned_ones_cannot_be_chosen() {
     let fixture = Fixture::new(false);
     checked(fixture.dispatch(&["14", "--profile", "claude-p", "--yes"], ""));
-    let out = fixture.dispatch(&["--profile", "claude-p"], "12 13 14\ny\n");
+    // Enter alone picks nothing.
+    let out = checked(fixture.dispatch(&["--profile", "claude-p"], "\n"));
+    assert!(
+        stdout(&out).contains("Nothing to Dispatch."),
+        "{}",
+        stdout(&out)
+    );
+    let out = fixture.dispatch(&["--profile", "claude-p"], "1\ny\n");
     let text = stdout(&out);
     assert!(
         text.contains("Open issues and PRs in example/demo"),
@@ -634,12 +641,15 @@ fn the_picker_lists_open_items_and_claimed_or_assigned_ones_cannot_be_chosen() {
     assert!(text.contains("- issue #13"), "{text}");
     assert!(text.contains("assigned to @bob"), "{text}");
     assert!(text.contains("- issue #14"), "{text}");
-    assert!(text.contains("  issue #12"), "{text}");
+    assert!(text.contains("claimed by"), "{text}");
     assert!(text.contains("- PR #16"), "{text}");
-    let errors = stderr(&out);
-    assert!(errors.contains("Refused issue #13"), "{errors}");
-    assert!(errors.contains("Refused issue #14: claimed by"), "{errors}");
-    assert!(text.contains("Start 1 Session? [y/N]"), "{text}");
+    // Only the others are offered, by row number, and prompts go to stderr.
+    let asked = stderr(&out);
+    assert!(asked.contains("  1. issue #12"), "{asked}");
+    assert!(asked.contains("  2. PR #15"), "{asked}");
+    assert!(!asked.contains("#13") && !asked.contains("#14"), "{asked}");
+    assert!(asked.contains("Start 1 Session? [y/N]"), "{asked}");
+    assert!(!text.contains("[y/N]"), "{text}");
     let numbers: Vec<_> = fixture
         .claims()
         .iter()

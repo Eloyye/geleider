@@ -2,6 +2,8 @@
 
 Run `geleider <command> --help` for the exact flags of your version. Commands that take `--json` print machine-readable output instead of text.
 
+Questions and pickers go to stderr, so stdout carries only results. On a terminal, pickers are checkboxes or a select list; without one, such as with piped input, they list numbered rows and read numbers, and `[y/N]` questions read a line where only `y` or `yes` means yes. Text that Sessions chose, such as branches, paths and logs, is shown without terminal escapes.
+
 ## Jobs and Runs
 
 See [Jobs and Resources](jobs.md).

@@ -9,7 +9,7 @@
 //! users wrote reaches the prompt.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, Read, Write};
+use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ use crate::github::{Gh, GitHub, OpenItem};
 use crate::paths::{self, Paths};
 use crate::protocol::{self, Request, Status};
 use crate::session::{Harness, SessionKey, SessionState};
+use crate::ui::{Line, Span, Term};
 use crate::{cli, command, git, text};
 
 /// How long a Project's Setup may run in a new worktree.
@@ -136,22 +137,25 @@ struct Dispatcher<'a> {
     prompt: Prompt,
 }
 
-pub fn run(paths: &Paths, options: Options) -> Result<i32> {
+pub fn run(term: &mut Term, paths: &Paths, options: Options) -> Result<i32> {
     let config = Config::load(&paths.config)?;
     let cwd = std::env::current_dir()?;
     let location = git::locate(&config, &cwd)?;
     let project = location.project;
     let repo = project.repo.as_str();
     let clone = project.clone_path()?.canonicalize()?;
-    let mut stdin = std::io::stdin().lock();
 
-    let (profile_name, profile) = choose_profile(
+    let Some((profile_name, profile)) = choose_profile(
+        term,
         &config,
         options.profile.as_deref(),
         project.default_profile.as_deref(),
         options.yes,
-        &mut stdin,
-    )?;
+    )?
+    else {
+        term.say("Cancelled; no Sessions started.");
+        return Ok(0);
+    };
     let prompt = Prompt::new(profile, &options)?;
     // A background Session cannot answer a trust prompt, and geleider never
     // edits a Harness's trust settings.
@@ -167,18 +171,22 @@ pub fn run(paths: &Paths, options: Options) -> Result<i32> {
 
     let mut unfetched = 0;
     let candidates = if options.numbers.is_empty() {
-        pick(repo, &Gh.open_items(repo)?, &blocked, &mut stdin)?
+        let Some(chosen) = pick(term, repo, &Gh.open_items(repo)?, &blocked)? else {
+            term.say("Cancelled; no Sessions started.");
+            return Ok(0);
+        };
+        chosen
     } else {
         let mut items = Vec::new();
         for input in &options.numbers {
             match fetch_item(repo, input) {
                 Ok(item) => items.push(item),
                 Err(err) => {
-                    eprintln!(
+                    term.say_err(&format!(
                         "Refused {}: {}",
                         text::one_line(input),
                         text::one_line(&format!("{err:#}"))
-                    );
+                    ));
                     unfetched += 1;
                 }
             }
@@ -190,7 +198,11 @@ pub fn run(paths: &Paths, options: Options) -> Result<i32> {
     for item in candidates {
         match blocked(&item) {
             Some(why) => {
-                eprintln!("Refused {}: {}", item.label(), text::one_line(&why));
+                term.say_err(&format!(
+                    "Refused {}: {}",
+                    item.label(),
+                    text::one_line(&why)
+                ));
                 refused += 1;
             }
             None if !items.iter().any(|i: &Item| i.number == item.number) => items.push(item),
@@ -198,15 +210,13 @@ pub fn run(paths: &Paths, options: Options) -> Result<i32> {
         }
     }
     if items.is_empty() {
-        println!("Nothing to Dispatch.");
+        term.say("Nothing to Dispatch.");
         return Ok(i32::from(refused > 0));
     }
 
-    print!(
-        "{}",
-        text::printable(&confirmation(repo, profile_name, profile, &items, &viewer,))
-    );
+    term.say(&confirmation(repo, profile_name, profile, &items, &viewer));
     cli::print_usage(
+        term,
         &config,
         &status.subscriptions,
         profile.harness.subscription(),
@@ -216,18 +226,15 @@ pub fn run(paths: &Paths, options: Options) -> Result<i32> {
         .iter()
         .filter(|s| s.state != SessionState::Ended)
         .count();
-    println!("Live Sessions: {live}");
-    if !options.yes {
-        print!(
-            "Start {} Session{}? [y/N] ",
-            items.len(),
-            if items.len() == 1 { "" } else { "s" }
-        );
-        std::io::stdout().flush()?;
-        if !cli::confirmed(&mut stdin)? {
-            println!("Cancelled; no Sessions started.");
-            return Ok(0);
-        }
+    term.say(&format!("Live Sessions: {live}"));
+    let question = format!(
+        "Start {} Session{}?",
+        items.len(),
+        if items.len() == 1 { "" } else { "s" }
+    );
+    if !options.yes && !term.confirm(&question)? {
+        term.say("Cancelled; no Sessions started.");
+        return Ok(0);
     }
 
     let context = Dispatcher {
@@ -242,14 +249,10 @@ pub fn run(paths: &Paths, options: Options) -> Result<i32> {
     };
     let mut failed = refused;
     for item in &items {
-        match context.dispatch(item) {
-            Ok(message) => println!("{}", text::printable(&message)),
+        match context.dispatch(term, item) {
+            Ok(message) => term.say(&message),
             Err(err) => {
-                eprintln!(
-                    "Did not start {}: {}",
-                    item.label(),
-                    text::printable(&format!("{err:#}"))
-                );
+                term.say_err(&format!("Did not start {}: {err:#}", item.label()));
                 failed += 1;
             }
         }
@@ -257,14 +260,15 @@ pub fn run(paths: &Paths, options: Options) -> Result<i32> {
     Ok(i32::from(failed > 0))
 }
 
-/// `--profile`, else the Project's default Profile, else the one the user picks.
+/// `--profile`, else the Project's default Profile, else the one the user
+/// picks; `None` if they pick none.
 fn choose_profile<'a>(
+    term: &mut Term,
     config: &'a Config,
     named: Option<&str>,
     default: Option<&str>,
     yes: bool,
-    input: &mut impl BufRead,
-) -> Result<(&'a str, &'a Profile)> {
+) -> Result<Option<(&'a str, &'a Profile)>> {
     if config.profiles.is_empty() {
         bail!(
             "geleider's config has no Profiles; add one under [profiles.<name>] or run \
@@ -289,24 +293,26 @@ fn choose_profile<'a>(
             })
     };
     if let Some(name) = named.or(default) {
-        return find(name);
+        return find(name).map(Some);
     }
     if yes {
         bail!("this Project has no default_profile; pass --profile");
     }
-    println!("Profiles");
-    for (name, profile) in &config.profiles {
-        println!("  {name}  ({})", profile.harness.harness().name());
+    let names: Vec<&String> = config.profiles.keys().collect();
+    let rows: Vec<Line> = config
+        .profiles
+        .iter()
+        .map(|(name, profile)| {
+            vec![
+                Span::shown(name),
+                Span::plain(format!("  ({})", profile.harness.harness().name())),
+            ]
+        })
+        .collect();
+    match term.pick_one("Profile to use", &rows)? {
+        Some(i) => find(names[i]).map(Some),
+        None => Ok(None),
     }
-    print!("Profile to use: ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    input.read_line(&mut answer)?;
-    let answer = answer.trim();
-    if answer.is_empty() {
-        bail!("no Profile chosen");
-    }
-    find(answer)
 }
 
 /// The text a Dispatched Session starts with: the Profile's template, then
@@ -444,49 +450,49 @@ fn fetch_item(repo: &str, input: &str) -> Result<Item> {
     Ok(item)
 }
 
-/// Lists the Project's open issues and PRs, Claimed and assigned ones marked
-/// and not selectable, and reads which to Dispatch.
+/// Lists the Project's Claimed and assigned issues and PRs, which cannot be
+/// Dispatched, and lets the user pick from the others; `None` if they cancel.
 fn pick(
+    term: &mut Term,
     repo: &str,
     open: &[OpenItem],
     blocked: &dyn Fn(&Item) -> Option<String>,
-    input: &mut impl BufRead,
-) -> Result<Vec<Item>> {
+) -> Result<Option<Vec<Item>>> {
     let items: Vec<Item> = open.iter().cloned().map(Item::from_open).collect();
     if items.is_empty() {
-        println!("{repo} has no open issues or PRs.");
-        return Ok(Vec::new());
+        term.say(&format!("{repo} has no open issues or PRs."));
+        return Ok(Some(Vec::new()));
     }
-    let mut out = format!("Open issues and PRs in {repo}\n");
-    for item in &items {
-        let why = blocked(item);
-        let mark = if why.is_some() { "-" } else { " " };
-        let detail = why.map_or(String::new(), |why| format!("  ({why})"));
-        out.push_str(&format!(
-            "  {mark} {:<10} {}  @{}{detail}\n",
+    let row = |item: &Item| {
+        format!(
+            "{:<10} {}  @{}",
             item.label(),
             shorten(&item.title, 60),
-            item.author,
-        ));
-    }
-    out.push_str("Items marked - cannot be Dispatched.\n");
-    print!("{}", text::printable(&out));
-    print!("Numbers to Dispatch (e.g. 12 15), or Enter to cancel: ");
-    std::io::stdout().flush()?;
-    let mut answer = String::new();
-    input.read_line(&mut answer)?;
-    let mut chosen = Vec::new();
-    for word in answer
-        .split([' ', ',', '\t', '\n'])
-        .filter(|w| !w.is_empty())
-    {
-        let number = IssueRef::parse(word)?.number;
-        match items.iter().find(|i| i.number == number) {
-            Some(item) => chosen.push(item.clone()),
-            None => bail!("#{number} is not an open issue or PR listed above"),
+            text::one_line(&item.author),
+        )
+    };
+    let mut out = format!("Open issues and PRs in {repo}\n");
+    let mut free = Vec::new();
+    for item in &items {
+        match blocked(item) {
+            Some(why) => out.push_str(&format!("  - {}  ({why})\n", row(item))),
+            None => free.push(item),
         }
     }
-    Ok(chosen)
+    if free.len() < items.len() {
+        out.push_str("Items marked - cannot be Dispatched.\n");
+    }
+    term.say(&out);
+    let rows: Vec<Line> = free
+        .iter()
+        .map(|item| vec![Span::shown(&row(item))])
+        .collect();
+    let chosen = term.pick_many(
+        "Issues and PRs to Dispatch",
+        &rows,
+        &vec![false; rows.len()],
+    )?;
+    Ok(chosen.map(|chosen| chosen.into_iter().map(|i| free[i].clone()).collect()))
 }
 
 fn shorten(title: &str, max: usize) -> String {
@@ -529,7 +535,7 @@ fn confirmation(
 impl Dispatcher<'_> {
     /// Claims, prepares and starts one Session. On any failure after the Claim
     /// the worktree and any new branch go, and the Claim is released.
-    fn dispatch(&self, item: &Item) -> Result<String> {
+    fn dispatch(&self, term: &mut Term, item: &Item) -> Result<String> {
         let harness = self.profile.harness;
         let id = crate::review::session_id()?;
         let planned = match harness {
@@ -573,7 +579,7 @@ impl Dispatcher<'_> {
         let actual = match started {
             Ok(actual) => actual,
             Err(err) => {
-                self.undo(item, &branch, &worktree);
+                self.undo(term, item, &branch, &worktree);
                 let released =
                     protocol::call(self.paths, &Request::DispatchFailed { session: planned })
                         .and_then(|r| r.into_claim())
@@ -672,25 +678,25 @@ impl Dispatcher<'_> {
     }
 
     /// Removes what [`Self::prepare`] made. A PR's branch is never deleted.
-    fn undo(&self, item: &Item, branch: &str, worktree: &Path) {
+    fn undo(&self, term: &mut Term, item: &Item, branch: &str, worktree: &Path) {
         if worktree.exists()
             && let Err(err) = git::discard_new_worktree(&self.clone, worktree)
         {
-            eprintln!(
+            term.say_err(&format!(
                 "Could not remove {}: {}",
                 paths::display(worktree),
                 text::one_line(&format!("{err:#}"))
-            );
+            ));
         }
         if !item.pull_request
             && git::has_branch(&self.clone, branch)
             && let Err(err) = git::delete_branch(&self.clone, branch)
         {
-            eprintln!(
+            term.say_err(&format!(
                 "Could not delete branch {}: {}",
                 text::branch(branch),
                 text::one_line(&format!("{err:#}"))
-            );
+            ));
         }
     }
 

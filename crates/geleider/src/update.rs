@@ -13,19 +13,20 @@ use crate::paths::Paths;
 use crate::protocol::{self, Request, RunInfo};
 use crate::store::RunState;
 use crate::text;
+use crate::ui::Term;
 
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
 const BRANCH: &str = "main";
 
-pub fn run(paths: &Paths, force: bool) -> Result<i32> {
+pub fn run(term: &mut Term, paths: &Paths, force: bool) -> Result<i32> {
     let exe = std::env::current_exe()?.canonicalize()?;
     let root = install_root(&exe)?;
-    check_no_running_runs(paths, force, "Nothing was built.")?;
+    check_no_running_runs(term, paths, force, "Nothing was built.")?;
 
-    println!(
+    term.say(&format!(
         "Building geleider from {REPOSITORY} ({BRANCH}) into {}",
         root.display()
-    );
+    ));
     let status = Command::new("cargo")
         .args(cargo_args(&root))
         .status()
@@ -36,6 +37,7 @@ pub fn run(paths: &Paths, force: bool) -> Result<i32> {
 
     // The build takes minutes; a Run may have started meanwhile.
     check_no_running_runs(
+        term,
         paths,
         force,
         "The new binary is installed but not yet in use; run `geleider install` once the Run ends.",
@@ -47,7 +49,7 @@ pub fn run(paths: &Paths, force: bool) -> Result<i32> {
     if !status.success() {
         bail!("the new geleider's install failed.");
     }
-    println!("\nRestart running Sessions to load updated hooks and MCP tools.");
+    term.say("\nRestart running Sessions to load updated hooks and MCP tools.");
     Ok(0)
 }
 
@@ -83,14 +85,19 @@ fn cargo_args(root: &Path) -> Vec<String> {
     .to_vec()
 }
 
-fn check_no_running_runs(paths: &Paths, force: bool, consequence: &str) -> Result<()> {
+fn check_no_running_runs(
+    term: &mut Term,
+    paths: &Paths,
+    force: bool,
+    consequence: &str,
+) -> Result<()> {
     let runs = match protocol::call(paths, &Request::ListRuns { finished: 0 })
         .and_then(|reply| reply.into_runs())
     {
         Ok(runs) => runs,
         // An unreachable or mismatched background process is replaced by the update.
         Err(err) => {
-            eprintln!("note: {}", text::one_line(&format!("{err:#}")));
+            term.say_err(&format!("note: {}", text::one_line(&format!("{err:#}"))));
             return Ok(());
         }
     };
@@ -99,7 +106,9 @@ fn check_no_running_runs(paths: &Paths, force: bool, consequence: &str) -> Resul
         return Ok(());
     }
     if force {
-        eprintln!("These Runs keep running but end as `lost`, with no exit code:\n{running}");
+        term.say_err(&format!(
+            "These Runs keep running but end as `lost`, with no exit code:\n{running}"
+        ));
         return Ok(());
     }
     bail!(

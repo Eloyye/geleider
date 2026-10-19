@@ -1,0 +1,19 @@
+# Human-facing output and prompts go through `ui` (ADR 0008). Modules whose
+# output programs read allow these with a one-line reason.
+disallowed-macros = [
+    { path = "std::print", reason = "write through ui::Term, which sanitizes (ADR 0008)" },
+    { path = "std::println", reason = "write through ui::Term, which sanitizes (ADR 0008)" },
+    { path = "std::eprint", reason = "write through ui::Term, which sanitizes (ADR 0008)" },
+    { path = "std::eprintln", reason = "write through ui::Term, which sanitizes (ADR 0008)" },
+]
+disallowed-methods = [
+    { path = "std::io::IsTerminal::is_terminal", reason = "ui::Term decides what a terminal can do (ADR 0008)" },
+    { path = "libc::isatty", reason = "ui::Term decides what a terminal can do (ADR 0008)" },
+]
+disallowed-types = [
+    { path = "dialoguer::Confirm", reason = "prompt through ui::Term (ADR 0008)" },
+    { path = "dialoguer::Input", reason = "prompt through ui::Term (ADR 0008)" },
+    { path = "dialoguer::MultiSelect", reason = "prompt through ui::Term (ADR 0008)" },
+    { path = "dialoguer::Select", reason = "prompt through ui::Term (ADR 0008)" },
+    { path = "dialoguer::Sort", reason = "prompt through ui::Term (ADR 0008)" },
+]
