@@ -17,7 +17,7 @@ geleider clean ~/worktrees/issue-31     # by worktree path
 geleider clean 33 --yes                 # show them, then remove without asking
 ```
 
-On a terminal, `clean` lists the Finished worktrees as checkboxes, all checked: uncheck the ones to keep with space and accept with enter; esc or `q` cancels. It then asks `Remove these N worktrees? [y/N]` about exactly the checked ones, or says nothing was selected if you unchecked them all. With a single Finished worktree it skips the checkboxes and asks `Remove this worktree? [y/N]`. Without a terminal, such as with piped input, it lists them all and asks about them all.
+On a terminal, `clean` lists the Finished worktrees as checkboxes, all checked: uncheck the ones to keep with space and accept with enter; esc or `q` cancels. It then asks `Remove these N worktrees? [y/N]` about exactly the checked ones, or says nothing was selected if you unchecked them all. With a single Finished worktree it skips the checkboxes and asks `Remove this worktree? [y/N]`. Without a terminal, such as with piped input, it lists them all and asks about them all, so piping `y` removes every one. The checkboxes and the question go to stderr; stdout says what was removed.
 
 Targets skip the checkboxes. A target is a PR, as `owner/name#33`, or as `33` or `#33` when only one Finished worktree has that number, or a worktree path. A target that names no Finished worktree, or several, is an error and nothing is removed.
 

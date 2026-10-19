@@ -6,7 +6,6 @@
 //! script runs outside any sandbox once imported, so it is shown in full and
 //! refused if it holds characters a terminal would not show (ADR 0006).
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -14,7 +13,8 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::paths::{self, Paths};
-use crate::{cli, text};
+use crate::text;
+use crate::ui::Term;
 
 /// A Profile found in Claude Desktop's presets.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,7 +32,7 @@ struct FoundSetup {
     script: String,
 }
 
-pub fn run(paths: &Paths) -> Result<i32> {
+pub fn run(term: &mut Term, paths: &Paths) -> Result<i32> {
     let existing = match std::fs::read_to_string(&paths.config) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -74,14 +74,15 @@ pub fn run(paths: &Paths) -> Result<i32> {
     }
     if profiles.is_empty() && setups.is_empty() {
         out.push_str("Nothing to import.\n");
-        print!("{}", text::printable(&out));
+        term.say(&out);
         return Ok(0);
     }
-    print!("{}", text::printable(&out));
-    print!("Write these to {}? [y/N] ", paths::display(&paths.config));
-    std::io::stdout().flush()?;
-    if !cli::confirmed(&mut std::io::stdin().lock())? {
-        println!("Cancelled; nothing written.");
+    term.say(&out);
+    if !term.confirm(&format!(
+        "Write these to {}?",
+        paths::display(&paths.config)
+    ))? {
+        term.say("Cancelled; nothing written.");
         return Ok(0);
     }
     let updated = write(&existing, &profiles, &setups)?;
@@ -91,7 +92,7 @@ pub fn run(paths: &Paths) -> Result<i32> {
     }
     std::fs::write(&paths.config, updated)
         .with_context(|| format!("writing {}", paths.config.display()))?;
-    println!("Wrote {}.", paths::display(&paths.config));
+    term.say(&format!("Wrote {}.", paths::display(&paths.config)));
     Ok(0)
 }
 

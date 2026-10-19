@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::hooks_install;
 use crate::paths::{self, Paths};
+use crate::ui::Term;
 
 const LABEL: &str = "com.github.eloyye.geleider";
 const SERVER: &str = "geleider";
@@ -34,39 +35,48 @@ pub enum Merge {
     Foreign,
 }
 
-pub fn install(paths: &Paths) -> Result<()> {
+pub fn install(term: &mut Term, paths: &Paths) -> Result<()> {
     let exe = std::env::current_exe()?.canonicalize()?;
     if exe.components().any(|c| c.as_os_str() == "target") {
-        eprintln!(
+        term.say_err(&format!(
             "note: registering {} from a build directory; `cargo install --path crates/geleider` \
              gives a stable path.",
             exe.display()
-        );
+        ));
     }
     let home = paths::home_dir()?;
 
-    write_starter_config(&paths.config)?;
-    install_service(&home, &exe)?;
+    write_starter_config(term, &paths.config)?;
+    install_service(term, &home, &exe)?;
     for integration in integrations(&home) {
         let outcome = integration.apply(false, |text| (integration.add)(text, &exe));
-        integration.report(outcome, false);
+        if outcome.is_ok()
+            && integration.path.ends_with(CLAUDE_SETTINGS)
+            && status_line_is_foreign(&integration.path, &exe)
+        {
+            term.say_err(
+                "Claude Code: existing statusLine cannot be wrapped; hooks installed, status line \
+                 left alone",
+            );
+        }
+        integration.report(term, outcome, false);
     }
-    println!(
-        "Codex: review and trust the installed hooks in /hooks before relying on Session tracking."
+    term.say(
+        "Codex: review and trust the installed hooks in /hooks before relying on Session tracking.",
     );
-    println!(
+    term.say(&format!(
         "\nDeclare Projects, Resources and Jobs in {} — Jobs come only from that file.",
         paths::display(&paths.config)
-    );
+    ));
     Ok(())
 }
 
-pub fn uninstall() -> Result<()> {
+pub fn uninstall(term: &mut Term) -> Result<()> {
     let home = paths::home_dir()?;
     for integration in integrations(&home) {
         if integration.path.exists() {
             let outcome = integration.apply(true, integration.remove);
-            integration.report(outcome, true);
+            integration.report(term, outcome, true);
         }
     }
     let plist = plist_path(&home);
@@ -74,8 +84,11 @@ pub fn uninstall() -> Result<()> {
     if plist.exists() {
         std::fs::remove_file(&plist)?;
     }
-    println!("background service: removed {}", paths::display(&plist));
-    println!("Config and Run history are kept; delete them by hand if you want them gone.");
+    term.say(&format!(
+        "background service: removed {}",
+        paths::display(&plist)
+    ));
+    term.say("Config and Run history are kept; delete them by hand if you want them gone.");
     Ok(())
 }
 
@@ -206,12 +219,15 @@ impl Integration {
         Ok(Some(merged))
     }
 
-    fn report(&self, outcome: Result<Option<Merge>>, removing: bool) {
-        if self.path.ends_with(CLAUDE_SETTINGS) {
-            report_status_line(&self.path, outcome, removing);
+    fn report(&self, term: &mut Term, outcome: Result<Option<Merge>>, removing: bool) {
+        let said = if self.path.ends_with(CLAUDE_SETTINGS) {
+            report_status_line(&self.path, outcome, removing)
         } else {
             let verb = if removing { "removed" } else { "registered" };
-            report(self.name, &self.path, outcome, verb);
+            Some(report(self.name, &self.path, outcome, verb))
+        };
+        if let Some(said) = said {
+            term.say(&said);
         }
     }
 }
@@ -290,13 +306,18 @@ fn integrations(home: &Path) -> Vec<Integration> {
     ]
 }
 
-fn report_status_line(path: &Path, outcome: Result<Option<Merge>>, removing: bool) {
+/// What install or uninstall did to Claude Code's settings, if worth saying.
+fn report_status_line(
+    path: &Path,
+    outcome: Result<Option<Merge>>,
+    removing: bool,
+) -> Option<String> {
     let path = paths::display(path);
-    match outcome {
-        Ok(None) => {}
+    let said = match outcome {
+        Ok(None) => return None,
         Ok(Some(Merge::Write(text))) => {
             let wrapping = !removing && wraps_a_status_line(&text);
-            println!(
+            format!(
                 "Claude Code: hooks and status line {} in {path}",
                 match (removing, wrapping) {
                     (true, _) => "restored",
@@ -306,38 +327,40 @@ fn report_status_line(path: &Path, outcome: Result<Option<Merge>>, removing: boo
             )
         }
         Ok(Some(Merge::RemoveFile)) => {
-            println!("Claude Code: hooks and status line removed in {path}")
+            format!("Claude Code: hooks and status line removed in {path}")
         }
         Ok(Some(Merge::Restored)) => {
-            println!("Claude Code: {path} restored to its state before install")
+            format!("Claude Code: {path} restored to its state before install")
         }
         Ok(Some(Merge::Unchanged)) if !removing => {
-            println!("Claude Code: hooks and status line in {path} already up to date")
+            format!("Claude Code: hooks and status line in {path} already up to date")
         }
-        Ok(Some(Merge::Unchanged)) => {}
-        Ok(Some(Merge::Foreign)) => println!(
+        Ok(Some(Merge::Unchanged)) => return None,
+        Ok(Some(Merge::Foreign)) => format!(
             "Claude Code: {path} has a `statusLine` geleider cannot wrap; left it alone, so \
              Claude usage will not update"
         ),
-        Err(err) => println!("Claude Code: {err:#}"),
-    }
+        Err(err) => format!("Claude Code: {err:#}"),
+    };
+    Some(said)
 }
 
-fn report(name: &str, path: &Path, outcome: Result<Option<Merge>>, verb: &str) {
+/// What install or uninstall did to one Harness's config file.
+fn report(name: &str, path: &Path, outcome: Result<Option<Merge>>, verb: &str) -> String {
     let path = paths::display(path);
     match outcome {
-        Ok(None) => println!("{name}: not installed, skipped"),
+        Ok(None) => format!("{name}: not installed, skipped"),
         Ok(Some(Merge::Write(_) | Merge::RemoveFile)) => {
-            println!("{name}: integration {verb} in {path}")
+            format!("{name}: integration {verb} in {path}")
         }
         Ok(Some(Merge::Restored)) => {
-            println!("{name}: {path} restored to its state before install")
+            format!("{name}: {path} restored to its state before install")
         }
-        Ok(Some(Merge::Unchanged)) => println!("{name}: {path} already up to date"),
+        Ok(Some(Merge::Unchanged)) => format!("{name}: {path} already up to date"),
         Ok(Some(Merge::Foreign)) => {
-            println!("{name}: {path} has an entry geleider did not write; left it alone")
+            format!("{name}: {path} has an entry geleider did not write; left it alone")
         }
-        Err(err) => println!("{name}: {err:#}"),
+        Err(err) => format!("{name}: {err:#}"),
     }
 }
 
@@ -552,14 +575,21 @@ fn claude_settings_add(existing: Option<&str>, exe: &Path) -> Result<Merge> {
     };
     match statusline_add(text, &status_line_command(exe)?)? {
         Merge::Unchanged => Ok(hooks),
-        Merge::Foreign => {
-            eprintln!(
-                "Claude Code: existing statusLine cannot be wrapped; hooks installed, status line left alone"
-            );
-            Ok(hooks)
-        }
+        // `install` says so; see [`status_line_is_foreign`].
+        Merge::Foreign => Ok(hooks),
         merged => Ok(merged),
     }
+}
+
+/// Whether the settings at `path` have a status line geleider cannot wrap, which
+/// [`claude_settings_add`] leaves alone.
+fn status_line_is_foreign(path: &Path, exe: &Path) -> bool {
+    let Ok(Some(text)) = read_optional(path) else {
+        return false;
+    };
+    status_line_command(exe)
+        .and_then(|ours| statusline_add(Some(&text), &ours))
+        .is_ok_and(|merged| merged == Merge::Foreign)
 }
 
 fn claude_settings_remove(existing: Option<&str>) -> Result<Merge> {
@@ -761,7 +791,7 @@ fn launchctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn install_service(home: &Path, exe: &Path) -> Result<()> {
+fn install_service(term: &mut Term, home: &Path, exe: &Path) -> Result<()> {
     let logs = home.join("Library/Logs/geleider");
     std::fs::create_dir_all(&logs)?;
     // launchd starts services with a bare PATH; Jobs and `gh` need the user's.
@@ -786,10 +816,10 @@ fn install_service(home: &Path, exe: &Path) -> Result<()> {
         &domain(),
         plist.to_str().context("non-UTF-8 path")?,
     ])?;
-    println!(
+    term.say(&format!(
         "background service: started at login via {}",
         paths::display(&plist)
-    );
+    ));
     Ok(())
 }
 
@@ -869,16 +899,16 @@ const STARTER_CONFIG: &str = r#"# geleider config. Jobs are declared only here, 
 # command = "scripts/run-playmode.sh {suite} {unity}"
 "#;
 
-fn write_starter_config(path: &Path) -> Result<()> {
+fn write_starter_config(term: &mut Term, path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
     }
     std::fs::create_dir_all(path.parent().context("config path has no parent")?)?;
     std::fs::write(path, STARTER_CONFIG)?;
-    println!(
+    term.say(&format!(
         "config: wrote a commented starter at {}",
         paths::display(path)
-    );
+    ));
     Ok(())
 }
 

@@ -1,5 +1,9 @@
 //! `geleider daemon`: the background process that owns the queue, starts Runs
 //! when their Resource has a free slot, reports their results, and keeps Claims.
+#![allow(
+    clippy::disallowed_macros,
+    reason = "the background process logs to stderr, which launchd keeps in a file"
+)]
 
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};

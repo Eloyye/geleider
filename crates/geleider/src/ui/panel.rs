@@ -1,15 +1,14 @@
-//! Boxed panels of styled text for the terminal, as `geleider status` draws them.
-//! Widths are counted in characters, which is what a terminal shows for the
-//! text geleider prints; text from Sessions is put on one line by [`Span::shown`].
+//! Lines of styled text, and the boxed panels `geleider status` builds from them.
+//! Nothing here writes: [`super::Term::show`] paints and sanitizes. Widths are
+//! counted in characters, which is what a terminal shows for the text geleider
+//! prints; text from Sessions is put on one line by [`Span::shown`].
 
-use crate::text::{self, Paint, Style};
-
-/// Columns assumed when stdout is not a terminal and `COLUMNS` is not set.
-const DEFAULT_WIDTH: usize = 80;
+use super::style::{Paint, Style};
+use crate::text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Span {
-    text: String,
+    pub(super) text: String,
     style: Option<Style>,
 }
 
@@ -149,7 +148,7 @@ pub fn gauge(used: Option<f64>, cells: usize, busy: f64, near: f64) -> Line {
 }
 
 /// The lines as text, styled by `paint`, without trailing spaces.
-pub fn render(lines: &[Line], paint: Paint) -> String {
+pub(super) fn render(lines: &[Line], paint: Paint) -> String {
     let mut out = String::new();
     for line in lines {
         let mut text = String::new();
@@ -172,26 +171,6 @@ pub fn render(lines: &[Line], paint: Paint) -> String {
         out.push('\n');
     }
     out
-}
-
-/// The terminal's width, else `COLUMNS`, else 80.
-pub fn terminal_width() -> usize {
-    let mut size = libc::winsize {
-        ws_row: 0,
-        ws_col: 0,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: TIOCGWINSZ writes a winsize through the valid pointer.
-    let ok = unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut size) } == 0;
-    if ok && size.ws_col > 0 {
-        return usize::from(size.ws_col);
-    }
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|c| c.parse().ok())
-        .filter(|c| *c > 0)
-        .unwrap_or(DEFAULT_WIDTH)
 }
 
 #[cfg(test)]

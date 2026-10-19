@@ -1,6 +1,10 @@
 //! `geleider statusline`: Claude Code's status-line command. It forwards the
 //! session's `rate_limits` to the background process, then prints either the
 //! status line it wraps, unchanged, or a line of its own.
+#![allow(
+    clippy::disallowed_macros,
+    reason = "Claude Code reads the status line from stdout"
+)]
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};

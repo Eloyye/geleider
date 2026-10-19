@@ -413,6 +413,10 @@ impl ConfigCache {
         }
     }
 
+    #[allow(
+        clippy::disallowed_macros,
+        reason = "only the background process caches config; it logs to stderr"
+    )]
     pub fn get(&mut self) -> Result<&Config> {
         let modified = std::fs::metadata(&self.path)
             .and_then(|m| m.modified())
